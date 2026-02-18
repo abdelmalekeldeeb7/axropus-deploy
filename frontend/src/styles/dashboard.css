@@ -1,0 +1,96 @@
+.dashboard-layout {
+  display: flex;
+  min-height: 100vh;
+}
+
+.dashboard-main {
+  flex: 1;
+  padding: 22px;
+}
+
+.dashboard-main h1 {
+  font-size: 2.4rem;
+  margin-bottom: 14px;
+}
+
+.stats-row {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(1, minmax(0, 1fr));
+}
+
+.charts-row {
+  margin-top: 16px;
+  display: grid;
+  gap: 12px;
+  grid-template-columns: 1fr;
+}
+
+.chart-card,
+.deploy-info {
+  background: white;
+  border: 1px solid var(--cream);
+  border-radius: 14px;
+  padding: 14px;
+}
+
+.chart-card h3,
+.deploy-info h3 {
+  margin-bottom: 8px;
+}
+
+.empty-chart {
+  color: var(--mid-gray);
+  font-size: 0.9rem;
+  margin: 8px 0 2px;
+}
+
+.status-row {
+  margin-top: 16px;
+  display: grid;
+  gap: 10px;
+  grid-template-columns: 1fr;
+}
+
+.deploy-grid {
+  display: grid;
+  gap: 8px;
+}
+
+.api-key-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.api-key-row button {
+  border: 1px solid var(--light-gray);
+  border-radius: 6px;
+  background: #fff;
+  min-height: 28px;
+  min-width: 28px;
+}
+
+.updated-at {
+  margin-top: 10px;
+  color: var(--mid-gray);
+  font-size: 0.82rem;
+}
+
+@media (min-width: 980px) {
+  .stats-row {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+
+  .charts-row {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .status-row {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .deploy-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}

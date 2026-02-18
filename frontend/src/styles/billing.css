@@ -1,0 +1,113 @@
+.billing-layout {
+  display: flex;
+  min-height: 100vh;
+}
+
+.billing-main {
+  flex: 1;
+  padding: 22px;
+  display: grid;
+  gap: 14px;
+}
+
+.billing-main h1 {
+  font-size: 2.4rem;
+}
+
+.period-card,
+.invoice-card,
+.payment-placeholder {
+  background: white;
+  border: 1px solid var(--cream);
+  border-radius: 14px;
+  padding: 14px;
+}
+
+.period-grid {
+  margin-top: 8px;
+  display: grid;
+  gap: 6px;
+}
+
+.settings-actions {
+  margin-top: 12px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.settings-actions select,
+.settings-actions button,
+.danger-btn {
+  min-height: 38px;
+  border-radius: 8px;
+  border: 1px solid var(--light-gray);
+  padding: 0 12px;
+  background: #fff;
+}
+
+.settings-actions button {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  cursor: pointer;
+}
+
+.settings-actions button:disabled,
+.danger-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.settings-success {
+  color: var(--green);
+  font-size: 0.9rem;
+}
+
+.roi-card {
+  background: var(--green-bg);
+  border: 1px solid #b8f2cb;
+  border-radius: 14px;
+  padding: 14px;
+}
+
+.invoice-card table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 8px;
+}
+
+.invoice-card th,
+.invoice-card td {
+  text-align: left;
+  border-top: 1px solid var(--cream);
+  padding: 10px 8px;
+  font-size: 0.92rem;
+}
+
+.invoice-card th {
+  border-top: none;
+  color: var(--mid-gray);
+  text-transform: uppercase;
+  font-size: 0.74rem;
+  letter-spacing: 0.08em;
+}
+
+.badge {
+  display: inline-block;
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-size: 0.74rem;
+  font-weight: 600;
+}
+
+.badge.paid { background: var(--green-bg); color: var(--green); }
+.badge.pending { background: #FEF9C3; color: #a16207; }
+.badge.overdue { background: var(--red-bg); color: var(--red); }
+
+.danger-btn {
+  border-color: #fecaca;
+  background: #fff5f5;
+  color: var(--red);
+  cursor: pointer;
+}
