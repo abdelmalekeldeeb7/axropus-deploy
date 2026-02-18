@@ -29,7 +29,7 @@ def _csv_env(name: str, default: str) -> list[str]:
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     return Settings(
-        database_url=str(os.getenv("AXROPUS_DATABASE_URL", "sqlite:///./axropus.db")),
+        database_url=str(os.getenv("AXROPUS_DATABASE_URL", "sqlite:////data/axropus.db")),
         jwt_secret=str(os.getenv("AXROPUS_JWT_SECRET", "change-me-in-production")),
         jwt_algorithm=str(os.getenv("AXROPUS_JWT_ALGORITHM", "HS256")),
         jwt_expire_minutes=int(str(os.getenv("AXROPUS_JWT_EXPIRE_MINUTES", "1440"))),
