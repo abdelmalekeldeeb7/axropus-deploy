@@ -4,7 +4,6 @@ import os
 from typing import Generator
 
 from sqlalchemy import create_engine, event
-from sqlalchemy.engine import Engine
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 Base = declarative_base()
@@ -22,11 +21,10 @@ def get_engine():
     if _engine is None:
         url = _get_url()
         sqlite_mode = url.startswith("sqlite")
-        _engine = create_engine(
-            url,
-            connect_args={"check_same_thread": False} if sqlite_mode else {},
-            future=True,
-        )
+        kwargs = {}
+        if sqlite_mode:
+            kwargs["connect_args"] = {"check_same_thread": False}
+        _engine = create_engine(url, future=True, **kwargs)
         if sqlite_mode:
             @event.listens_for(_engine, "connect")
             def _set_sqlite_pragma(dbapi_connection, _connection_record):
