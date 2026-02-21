@@ -6,14 +6,121 @@
 .dashboard-main {
   flex: 1;
   padding: 22px;
+  position: relative;
+}
+
+.dashboard-main-shell {
+  position: relative;
+  overflow: hidden;
+  border-radius: 22px;
+  border: 1px solid rgba(216, 213, 206, 0.55);
+  background: linear-gradient(160deg, rgba(255, 255, 255, 0.94), rgba(247, 246, 243, 0.98));
+  box-shadow: 0 20px 40px rgba(17, 24, 39, 0.04);
+  padding: 18px;
+}
+
+.dashboard-main-shell::before {
+  content: "";
+  position: absolute;
+  top: -120px;
+  right: -120px;
+  width: 260px;
+  height: 260px;
+  border-radius: 999px;
+  background: radial-gradient(circle, rgba(29, 78, 216, 0.14), transparent 70%);
+  pointer-events: none;
 }
 
 .dashboard-main h1 {
   font-size: 2.4rem;
-  margin-bottom: 14px;
+}
+
+.dashboard-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.dashboard-subtitle {
+  margin-top: 6px;
+  color: var(--mid-gray);
+  font-size: 0.92rem;
+}
+
+.dashboard-live {
+  align-self: center;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--light-gray);
+  border-radius: 999px;
+  padding: 7px 12px;
+  background: rgba(255, 255, 255, 0.86);
+  color: var(--dark-gray);
+  font-size: 0.82rem;
+  font-weight: 600;
+}
+
+.live-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--red);
+}
+
+.dashboard-live.active .live-dot {
+  background: var(--green);
+  box-shadow: 0 0 0 0 rgba(22, 163, 74, 0.5);
+  animation: livePulse 1.5s ease-in-out infinite;
+}
+
+.highlights-row {
+  margin-top: 14px;
+  display: grid;
+  gap: 10px;
+}
+
+.highlight-chip {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  border: 1px solid rgba(216, 213, 206, 0.7);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.9);
+  padding: 10px 12px;
+  transition: transform 180ms ease, border-color 180ms ease, box-shadow 180ms ease;
+}
+
+.highlight-chip:hover {
+  transform: translateY(-1px);
+  border-color: rgba(29, 78, 216, 0.35);
+  box-shadow: 0 8px 20px rgba(15, 23, 42, 0.06);
+}
+
+.highlight-chip svg {
+  color: var(--accent);
+}
+
+.highlight-chip div {
+  display: grid;
+  gap: 2px;
+}
+
+.highlight-label {
+  color: var(--mid-gray);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.highlight-chip strong {
+  font-size: 0.98rem;
+  color: var(--near-black);
 }
 
 .stats-row {
+  margin-top: 14px;
   display: grid;
   gap: 12px;
   grid-template-columns: repeat(1, minmax(0, 1fr));
@@ -32,6 +139,14 @@
   border: 1px solid var(--cream);
   border-radius: 14px;
   padding: 14px;
+  transition: transform 220ms ease, box-shadow 220ms ease, border-color 220ms ease;
+}
+
+.chart-card:hover,
+.deploy-info:hover {
+  transform: translateY(-2px);
+  border-color: rgba(29, 78, 216, 0.25);
+  box-shadow: 0 14px 28px rgba(15, 23, 42, 0.07);
 }
 
 .chart-card h3,
@@ -72,12 +187,46 @@
 }
 
 .updated-at {
-  margin-top: 10px;
+  margin-top: 12px;
   color: var(--mid-gray);
   font-size: 0.82rem;
 }
 
+.reveal {
+  opacity: 0;
+  transform: translateY(8px);
+  animation: dashboardReveal 520ms ease forwards;
+}
+
+.r1 { animation-delay: 20ms; }
+.r2 { animation-delay: 100ms; }
+.r3 { animation-delay: 180ms; }
+.r4 { animation-delay: 260ms; }
+.r5 { animation-delay: 340ms; }
+.r6 { animation-delay: 420ms; }
+
+@keyframes dashboardReveal {
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes livePulse {
+  0% { box-shadow: 0 0 0 0 rgba(22, 163, 74, 0.5); }
+  70% { box-shadow: 0 0 0 10px rgba(22, 163, 74, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(22, 163, 74, 0); }
+}
+
 @media (min-width: 980px) {
+  .dashboard-main-shell {
+    padding: 22px;
+  }
+
+  .highlights-row {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
   .stats-row {
     grid-template-columns: repeat(4, minmax(0, 1fr));
   }
@@ -90,7 +239,13 @@
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 
-  .deploy-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    .deploy-grid {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+}
+
+@media (max-width: 720px) {
+  .dashboard-top {
+    flex-direction: column;
   }
 }

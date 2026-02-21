@@ -3,7 +3,10 @@ export default function StatusBadge({ status = "inactive", label, detail = "" })
   const isGood = normalized === "active" || normalized === "enforced" || normalized === "success";
   return (
     <div className="status-card">
-      <div className={`status-pill ${isGood ? "ok" : "bad"}`}>{label || status}</div>
+      <div className="status-head">
+        <span className={`status-signal ${isGood ? "ok" : "bad"}`} />
+        <div className={`status-pill ${isGood ? "ok" : "bad"}`}>{label || status}</div>
+      </div>
       {detail ? <div className="status-detail">{detail}</div> : null}
     </div>
   );
