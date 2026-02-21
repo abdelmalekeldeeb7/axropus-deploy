@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
 from .auth import router as auth_router
+from .config import get_settings
 from .db import SessionLocal, init_db
 from .billing import router as billing_router
 from .dashboard import router as dashboard_router
@@ -24,18 +25,12 @@ async def lifespan(_app: FastAPI):
 
 
 def create_app() -> FastAPI:
+    settings = get_settings()
     app = FastAPI(title="Axropus Cloud Backend", version="0.1.0", lifespan=lifespan)
-
-    cors_origins = [
-        "http://localhost:5173",
-        "http://localhost:3000",
-        "https://axropus.com",
-        "https://www.axropus.com",
-    ]
 
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=cors_origins,
+        allow_origins=settings.cors_allow_origins,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
