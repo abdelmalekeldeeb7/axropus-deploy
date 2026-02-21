@@ -1,0 +1,11 @@
+{
+  "rewrites": [
+    { "source": "/signup", "destination": "/index.html" },
+    { "source": "/login", "destination": "/index.html" },
+    { "source": "/configure", "destination": "/index.html" },
+    { "source": "/deploy/:path*", "destination": "/index.html" },
+    { "source": "/dashboard", "destination": "/index.html" },
+    { "source": "/billing", "destination": "/index.html" },
+    { "source": "/settings", "destination": "/index.html" }
+  ]
+}
