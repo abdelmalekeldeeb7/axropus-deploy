@@ -1,0 +1,13 @@
+runtime:
+  backend_id: vllm_openai
+  scheduler:
+    hit_priority: 3
+    miss_priority: 1
+queue:
+  backend: redis
+ledger:
+  backend: postgres
+artifact:
+  backend: s3
+workers:
+  gpus: [0, 1, 2, 3]

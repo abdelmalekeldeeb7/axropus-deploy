@@ -1,0 +1,22 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: korith-gateway
+spec:
+  replicas: {{ .Values.gateway.replicas }}
+  selector:
+    matchLabels:
+      app: korith-gateway
+  template:
+    metadata:
+      labels:
+        app: korith-gateway
+    spec:
+      containers:
+        - name: gateway
+          image: {{ .Values.gateway.image }}
+          ports:
+            - containerPort: {{ .Values.gateway.port }}
+          env:
+            - name: KORITH_GATEWAY_ROUTER_URL
+              value: http://korith-router:{{ .Values.router.port }}

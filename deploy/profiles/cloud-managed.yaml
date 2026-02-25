@@ -1,0 +1,13 @@
+runtime:
+  backend_id: openai_compatible
+  scheduler:
+    hit_priority: 2
+    miss_priority: 1
+queue:
+  backend: sqs
+ledger:
+  backend: postgres
+artifact:
+  backend: s3
+workers:
+  gpus: [0, 1, 2, 3, 4, 5, 6, 7]

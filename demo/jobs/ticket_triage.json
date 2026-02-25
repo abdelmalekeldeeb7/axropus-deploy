@@ -1,0 +1,22 @@
+{
+  "schema_version": "korith.jobspec.v1",
+  "backend_id": "korith_local",
+  "model": {
+    "model_id": "llama-3.2-1b-q4_k_m",
+    "model_path": "models/llama-3.2-1b-q4_k_m.gguf"
+  },
+  "prompt_template": "SYSTEM: You are a deterministic assistant.\\nUSER: Classify priority, summarize, add tags, and suggest assignee.\\nINPUT:\\n{content}\\nOUTPUT FORMAT: priority, summary, tags, assignee.",
+  "input": {
+    "content": "Subject: Login failure\\nBody: User reports repeated login failures after password reset. Impact: blocked access to billing portal."
+  },
+  "deterministic_cfg": {
+    "seed": 1234,
+    "n_ctx": 8192,
+    "n_batch": 512,
+    "max_tokens": 256
+  },
+  "policy": {
+    "allow_amf_reuse": true,
+    "allow_spec": false
+  }
+}

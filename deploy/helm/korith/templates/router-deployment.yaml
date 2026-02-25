@@ -1,0 +1,36 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: korith-router
+spec:
+  replicas: {{ .Values.router.replicas }}
+  selector:
+    matchLabels:
+      app: korith-router
+  template:
+    metadata:
+      labels:
+        app: korith-router
+    spec:
+      containers:
+        - name: router
+          image: {{ .Values.router.image }}
+          ports:
+            - containerPort: {{ .Values.router.port }}
+          env:
+            - name: KORITH_QUEUE_BACKEND
+              value: {{ .Values.config.queueBackend }}
+            - name: KORITH_QUEUE_DB
+              value: {{ .Values.config.queueDb }}
+            - name: KORITH_LEDGER_BACKEND
+              value: {{ .Values.config.ledgerBackend }}
+            - name: KORITH_PLATFORM_DB
+              value: {{ .Values.config.ledgerDb }}
+            - name: KORITH_ARTIFACT_BACKEND
+              value: {{ .Values.config.artifactBackend }}
+            - name: KORITH_PLATFORM_ARTIFACTS
+              value: {{ .Values.config.artifactPath }}
+            - name: KORITH_REGISTRY_DB
+              value: {{ .Values.config.registryDb }}
+            - name: KORITH_RESTORE_DB
+              value: {{ .Values.config.restoreDb }}

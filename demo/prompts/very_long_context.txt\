@@ -1,0 +1,744 @@
+SYSTEM OVERVIEW
+You are an expert systems architect analyzing inference cost scaling.
+
+===========================================================
+ARCHITECTURE CONTEXT
+AMF (Adaptive Memory Fabric) is a deterministic inference memory system
+designed to eliminate redundant prompt computation by replaying previously
+computed prefix states. AMF operates below the model layer and above the
+kernel layer, enforcing strict determinism, ROI-based admission control,
+and monotonic policy updates.
+
+AMF stores:
+- KV cache states
+- Model execution metadata
+- Deterministic sampling context
+- Restore cost statistics
+- Saved compute estimates
+
+The system guarantees:
+- Replay only under deterministic sampling
+- ROI must exceed 1.0
+- Negative ROI disables replay
+- Fail-closed behavior on uncertainty
+
+===========================================================
+BLOCK START
+Explain in detail how inference cost scales with prompt length, why long
+contexts dominate compute cost in modern LLM workloads, and how systems
+that reuse prefix computation fundamentally change cost curves for
+enterprise inference.
+BLOCK END
+SYSTEM OVERVIEW
+You are an expert systems architect analyzing inference cost scaling.
+
+===========================================================
+ARCHITECTURE CONTEXT
+AMF (Adaptive Memory Fabric) is a deterministic inference memory system
+designed to eliminate redundant prompt computation by replaying previously
+computed prefix states. AMF operates below the model layer and above the
+kernel layer, enforcing strict determinism, ROI-based admission control,
+and monotonic policy updates.
+
+AMF stores:
+- KV cache states
+- Model execution metadata
+- Deterministic sampling context
+- Restore cost statistics
+- Saved compute estimates
+
+The system guarantees:
+- Replay only under deterministic sampling
+- ROI must exceed 1.0
+- Negative ROI disables replay
+- Fail-closed behavior on uncertainty
+
+===========================================================
+BLOCK START
+Explain in detail how inference cost scales with prompt length, why long
+contexts dominate compute cost in modern LLM workloads, and how systems
+that reuse prefix computation fundamentally change cost curves for
+enterprise inference.
+BLOCK END
+SYSTEM OVERVIEW
+You are an expert systems architect analyzing inference cost scaling.
+
+===========================================================
+ARCHITECTURE CONTEXT
+AMF (Adaptive Memory Fabric) is a deterministic inference memory system
+designed to eliminate redundant prompt computation by replaying previously
+computed prefix states. AMF operates below the model layer and above the
+kernel layer, enforcing strict determinism, ROI-based admission control,
+and monotonic policy updates.
+
+AMF stores:
+- KV cache states
+- Model execution metadata
+- Deterministic sampling context
+- Restore cost statistics
+- Saved compute estimates
+
+The system guarantees:
+- Replay only under deterministic sampling
+- ROI must exceed 1.0
+- Negative ROI disables replay
+- Fail-closed behavior on uncertainty
+
+===========================================================
+BLOCK START
+Explain in detail how inference cost scales with prompt length, why long
+contexts dominate compute cost in modern LLM workloads, and how systems
+that reuse prefix computation fundamentally change cost curves for
+enterprise inference.
+BLOCK END
+SYSTEM OVERVIEW
+You are an expert systems architect analyzing inference cost scaling.
+
+===========================================================
+ARCHITECTURE CONTEXT
+AMF (Adaptive Memory Fabric) is a deterministic inference memory system
+designed to eliminate redundant prompt computation by replaying previously
+computed prefix states. AMF operates below the model layer and above the
+kernel layer, enforcing strict determinism, ROI-based admission control,
+and monotonic policy updates.
+
+AMF stores:
+- KV cache states
+- Model execution metadata
+- Deterministic sampling context
+- Restore cost statistics
+- Saved compute estimates
+
+The system guarantees:
+- Replay only under deterministic sampling
+- ROI must exceed 1.0
+- Negative ROI disables replay
+- Fail-closed behavior on uncertainty
+
+===========================================================
+BLOCK START
+Explain in detail how inference cost scales with prompt length, why long
+contexts dominate compute cost in modern LLM workloads, and how systems
+that reuse prefix computation fundamentally change cost curves for
+enterprise inference.
+BLOCK END
+SYSTEM OVERVIEW
+You are an expert systems architect analyzing inference cost scaling.
+
+===========================================================
+ARCHITECTURE CONTEXT
+AMF (Adaptive Memory Fabric) is a deterministic inference memory system
+designed to eliminate redundant prompt computation by replaying previously
+computed prefix states. AMF operates below the model layer and above the
+kernel layer, enforcing strict determinism, ROI-based admission control,
+and monotonic policy updates.
+
+AMF stores:
+- KV cache states
+- Model execution metadata
+- Deterministic sampling context
+- Restore cost statistics
+- Saved compute estimates
+
+The system guarantees:
+- Replay only under deterministic sampling
+- ROI must exceed 1.0
+- Negative ROI disables replay
+- Fail-closed behavior on uncertainty
+
+===========================================================
+BLOCK START
+Explain in detail how inference cost scales with prompt length, why long
+contexts dominate compute cost in modern LLM workloads, and how systems
+that reuse prefix computation fundamentally change cost curves for
+enterprise inference.
+BLOCK END
+SYSTEM OVERVIEW
+You are an expert systems architect analyzing inference cost scaling.
+
+===========================================================
+ARCHITECTURE CONTEXT
+AMF (Adaptive Memory Fabric) is a deterministic inference memory system
+designed to eliminate redundant prompt computation by replaying previously
+computed prefix states. AMF operates below the model layer and above the
+kernel layer, enforcing strict determinism, ROI-based admission control,
+and monotonic policy updates.
+
+AMF stores:
+- KV cache states
+- Model execution metadata
+- Deterministic sampling context
+- Restore cost statistics
+- Saved compute estimates
+
+The system guarantees:
+- Replay only under deterministic sampling
+- ROI must exceed 1.0
+- Negative ROI disables replay
+- Fail-closed behavior on uncertainty
+
+===========================================================
+BLOCK START
+Explain in detail how inference cost scales with prompt length, why long
+contexts dominate compute cost in modern LLM workloads, and how systems
+that reuse prefix computation fundamentally change cost curves for
+enterprise inference.
+BLOCK END
+SYSTEM OVERVIEW
+You are an expert systems architect analyzing inference cost scaling.
+
+===========================================================
+ARCHITECTURE CONTEXT
+AMF (Adaptive Memory Fabric) is a deterministic inference memory system
+designed to eliminate redundant prompt computation by replaying previously
+computed prefix states. AMF operates below the model layer and above the
+kernel layer, enforcing strict determinism, ROI-based admission control,
+and monotonic policy updates.
+
+AMF stores:
+- KV cache states
+- Model execution metadata
+- Deterministic sampling context
+- Restore cost statistics
+- Saved compute estimates
+
+The system guarantees:
+- Replay only under deterministic sampling
+- ROI must exceed 1.0
+- Negative ROI disables replay
+- Fail-closed behavior on uncertainty
+
+===========================================================
+BLOCK START
+Explain in detail how inference cost scales with prompt length, why long
+contexts dominate compute cost in modern LLM workloads, and how systems
+that reuse prefix computation fundamentally change cost curves for
+enterprise inference.
+BLOCK END
+SYSTEM OVERVIEW
+You are an expert systems architect analyzing inference cost scaling.
+
+===========================================================
+ARCHITECTURE CONTEXT
+AMF (Adaptive Memory Fabric) is a deterministic inference memory system
+designed to eliminate redundant prompt computation by replaying previously
+computed prefix states. AMF operates below the model layer and above the
+kernel layer, enforcing strict determinism, ROI-based admission control,
+and monotonic policy updates.
+
+AMF stores:
+- KV cache states
+- Model execution metadata
+- Deterministic sampling context
+- Restore cost statistics
+- Saved compute estimates
+
+The system guarantees:
+- Replay only under deterministic sampling
+- ROI must exceed 1.0
+- Negative ROI disables replay
+- Fail-closed behavior on uncertainty
+
+===========================================================
+BLOCK START
+Explain in detail how inference cost scales with prompt length, why long
+contexts dominate compute cost in modern LLM workloads, and how systems
+that reuse prefix computation fundamentally change cost curves for
+enterprise inference.
+BLOCK END
+SYSTEM OVERVIEW
+You are an expert systems architect analyzing inference cost scaling.
+
+===========================================================
+ARCHITECTURE CONTEXT
+AMF (Adaptive Memory Fabric) is a deterministic inference memory system
+designed to eliminate redundant prompt computation by replaying previously
+computed prefix states. AMF operates below the model layer and above the
+kernel layer, enforcing strict determinism, ROI-based admission control,
+and monotonic policy updates.
+
+AMF stores:
+- KV cache states
+- Model execution metadata
+- Deterministic sampling context
+- Restore cost statistics
+- Saved compute estimates
+
+The system guarantees:
+- Replay only under deterministic sampling
+- ROI must exceed 1.0
+- Negative ROI disables replay
+- Fail-closed behavior on uncertainty
+
+===========================================================
+BLOCK START
+Explain in detail how inference cost scales with prompt length, why long
+contexts dominate compute cost in modern LLM workloads, and how systems
+that reuse prefix computation fundamentally change cost curves for
+enterprise inference.
+BLOCK END
+SYSTEM OVERVIEW
+You are an expert systems architect analyzing inference cost scaling.
+
+===========================================================
+ARCHITECTURE CONTEXT
+AMF (Adaptive Memory Fabric) is a deterministic inference memory system
+designed to eliminate redundant prompt computation by replaying previously
+computed prefix states. AMF operates below the model layer and above the
+kernel layer, enforcing strict determinism, ROI-based admission control,
+and monotonic policy updates.
+
+AMF stores:
+- KV cache states
+- Model execution metadata
+- Deterministic sampling context
+- Restore cost statistics
+- Saved compute estimates
+
+The system guarantees:
+- Replay only under deterministic sampling
+- ROI must exceed 1.0
+- Negative ROI disables replay
+- Fail-closed behavior on uncertainty
+
+===========================================================
+BLOCK START
+Explain in detail how inference cost scales with prompt length, why long
+contexts dominate compute cost in modern LLM workloads, and how systems
+that reuse prefix computation fundamentally change cost curves for
+enterprise inference.
+BLOCK END
+SYSTEM OVERVIEW
+You are an expert systems architect analyzing inference cost scaling.
+
+===========================================================
+ARCHITECTURE CONTEXT
+AMF (Adaptive Memory Fabric) is a deterministic inference memory system
+designed to eliminate redundant prompt computation by replaying previously
+computed prefix states. AMF operates below the model layer and above the
+kernel layer, enforcing strict determinism, ROI-based admission control,
+and monotonic policy updates.
+
+AMF stores:
+- KV cache states
+- Model execution metadata
+- Deterministic sampling context
+- Restore cost statistics
+- Saved compute estimates
+
+The system guarantees:
+- Replay only under deterministic sampling
+- ROI must exceed 1.0
+- Negative ROI disables replay
+- Fail-closed behavior on uncertainty
+
+===========================================================
+BLOCK START
+Explain in detail how inference cost scales with prompt length, why long
+contexts dominate compute cost in modern LLM workloads, and how systems
+that reuse prefix computation fundamentally change cost curves for
+enterprise inference.
+BLOCK END
+SYSTEM OVERVIEW
+You are an expert systems architect analyzing inference cost scaling.
+
+===========================================================
+ARCHITECTURE CONTEXT
+AMF (Adaptive Memory Fabric) is a deterministic inference memory system
+designed to eliminate redundant prompt computation by replaying previously
+computed prefix states. AMF operates below the model layer and above the
+kernel layer, enforcing strict determinism, ROI-based admission control,
+and monotonic policy updates.
+
+AMF stores:
+- KV cache states
+- Model execution metadata
+- Deterministic sampling context
+- Restore cost statistics
+- Saved compute estimates
+
+The system guarantees:
+- Replay only under deterministic sampling
+- ROI must exceed 1.0
+- Negative ROI disables replay
+- Fail-closed behavior on uncertainty
+
+===========================================================
+BLOCK START
+Explain in detail how inference cost scales with prompt length, why long
+contexts dominate compute cost in modern LLM workloads, and how systems
+that reuse prefix computation fundamentally change cost curves for
+enterprise inference.
+BLOCK END
+SYSTEM OVERVIEW
+You are an expert systems architect analyzing inference cost scaling.
+
+===========================================================
+ARCHITECTURE CONTEXT
+AMF (Adaptive Memory Fabric) is a deterministic inference memory system
+designed to eliminate redundant prompt computation by replaying previously
+computed prefix states. AMF operates below the model layer and above the
+kernel layer, enforcing strict determinism, ROI-based admission control,
+and monotonic policy updates.
+
+AMF stores:
+- KV cache states
+- Model execution metadata
+- Deterministic sampling context
+- Restore cost statistics
+- Saved compute estimates
+
+The system guarantees:
+- Replay only under deterministic sampling
+- ROI must exceed 1.0
+- Negative ROI disables replay
+- Fail-closed behavior on uncertainty
+
+===========================================================
+BLOCK START
+Explain in detail how inference cost scales with prompt length, why long
+contexts dominate compute cost in modern LLM workloads, and how systems
+that reuse prefix computation fundamentally change cost curves for
+enterprise inference.
+BLOCK END
+SYSTEM OVERVIEW
+You are an expert systems architect analyzing inference cost scaling.
+
+===========================================================
+ARCHITECTURE CONTEXT
+AMF (Adaptive Memory Fabric) is a deterministic inference memory system
+designed to eliminate redundant prompt computation by replaying previously
+computed prefix states. AMF operates below the model layer and above the
+kernel layer, enforcing strict determinism, ROI-based admission control,
+and monotonic policy updates.
+
+AMF stores:
+- KV cache states
+- Model execution metadata
+- Deterministic sampling context
+- Restore cost statistics
+- Saved compute estimates
+
+The system guarantees:
+- Replay only under deterministic sampling
+- ROI must exceed 1.0
+- Negative ROI disables replay
+- Fail-closed behavior on uncertainty
+
+===========================================================
+BLOCK START
+Explain in detail how inference cost scales with prompt length, why long
+contexts dominate compute cost in modern LLM workloads, and how systems
+that reuse prefix computation fundamentally change cost curves for
+enterprise inference.
+BLOCK END
+SYSTEM OVERVIEW
+You are an expert systems architect analyzing inference cost scaling.
+
+===========================================================
+ARCHITECTURE CONTEXT
+AMF (Adaptive Memory Fabric) is a deterministic inference memory system
+designed to eliminate redundant prompt computation by replaying previously
+computed prefix states. AMF operates below the model layer and above the
+kernel layer, enforcing strict determinism, ROI-based admission control,
+and monotonic policy updates.
+
+AMF stores:
+- KV cache states
+- Model execution metadata
+- Deterministic sampling context
+- Restore cost statistics
+- Saved compute estimates
+
+The system guarantees:
+- Replay only under deterministic sampling
+- ROI must exceed 1.0
+- Negative ROI disables replay
+- Fail-closed behavior on uncertainty
+
+===========================================================
+BLOCK START
+Explain in detail how inference cost scales with prompt length, why long
+contexts dominate compute cost in modern LLM workloads, and how systems
+that reuse prefix computation fundamentally change cost curves for
+enterprise inference.
+BLOCK END
+SYSTEM OVERVIEW
+You are an expert systems architect analyzing inference cost scaling.
+
+===========================================================
+ARCHITECTURE CONTEXT
+AMF (Adaptive Memory Fabric) is a deterministic inference memory system
+designed to eliminate redundant prompt computation by replaying previously
+computed prefix states. AMF operates below the model layer and above the
+kernel layer, enforcing strict determinism, ROI-based admission control,
+and monotonic policy updates.
+
+AMF stores:
+- KV cache states
+- Model execution metadata
+- Deterministic sampling context
+- Restore cost statistics
+- Saved compute estimates
+
+The system guarantees:
+- Replay only under deterministic sampling
+- ROI must exceed 1.0
+- Negative ROI disables replay
+- Fail-closed behavior on uncertainty
+
+===========================================================
+BLOCK START
+Explain in detail how inference cost scales with prompt length, why long
+contexts dominate compute cost in modern LLM workloads, and how systems
+that reuse prefix computation fundamentally change cost curves for
+enterprise inference.
+BLOCK END
+SYSTEM OVERVIEW
+You are an expert systems architect analyzing inference cost scaling.
+
+===========================================================
+ARCHITECTURE CONTEXT
+AMF (Adaptive Memory Fabric) is a deterministic inference memory system
+designed to eliminate redundant prompt computation by replaying previously
+computed prefix states. AMF operates below the model layer and above the
+kernel layer, enforcing strict determinism, ROI-based admission control,
+and monotonic policy updates.
+
+AMF stores:
+- KV cache states
+- Model execution metadata
+- Deterministic sampling context
+- Restore cost statistics
+- Saved compute estimates
+
+The system guarantees:
+- Replay only under deterministic sampling
+- ROI must exceed 1.0
+- Negative ROI disables replay
+- Fail-closed behavior on uncertainty
+
+===========================================================
+BLOCK START
+Explain in detail how inference cost scales with prompt length, why long
+contexts dominate compute cost in modern LLM workloads, and how systems
+that reuse prefix computation fundamentally change cost curves for
+enterprise inference.
+BLOCK END
+SYSTEM OVERVIEW
+You are an expert systems architect analyzing inference cost scaling.
+
+===========================================================
+ARCHITECTURE CONTEXT
+AMF (Adaptive Memory Fabric) is a deterministic inference memory system
+designed to eliminate redundant prompt computation by replaying previously
+computed prefix states. AMF operates below the model layer and above the
+kernel layer, enforcing strict determinism, ROI-based admission control,
+and monotonic policy updates.
+
+AMF stores:
+- KV cache states
+- Model execution metadata
+- Deterministic sampling context
+- Restore cost statistics
+- Saved compute estimates
+
+The system guarantees:
+- Replay only under deterministic sampling
+- ROI must exceed 1.0
+- Negative ROI disables replay
+- Fail-closed behavior on uncertainty
+
+===========================================================
+BLOCK START
+Explain in detail how inference cost scales with prompt length, why long
+contexts dominate compute cost in modern LLM workloads, and how systems
+that reuse prefix computation fundamentally change cost curves for
+enterprise inference.
+BLOCK END
+SYSTEM OVERVIEW
+You are an expert systems architect analyzing inference cost scaling.
+
+===========================================================
+ARCHITECTURE CONTEXT
+AMF (Adaptive Memory Fabric) is a deterministic inference memory system
+designed to eliminate redundant prompt computation by replaying previously
+computed prefix states. AMF operates below the model layer and above the
+kernel layer, enforcing strict determinism, ROI-based admission control,
+and monotonic policy updates.
+
+AMF stores:
+- KV cache states
+- Model execution metadata
+- Deterministic sampling context
+- Restore cost statistics
+- Saved compute estimates
+
+The system guarantees:
+- Replay only under deterministic sampling
+- ROI must exceed 1.0
+- Negative ROI disables replay
+- Fail-closed behavior on uncertainty
+
+===========================================================
+BLOCK START
+Explain in detail how inference cost scales with prompt length, why long
+contexts dominate compute cost in modern LLM workloads, and how systems
+that reuse prefix computation fundamentally change cost curves for
+enterprise inference.
+BLOCK END
+SYSTEM OVERVIEW
+You are an expert systems architect analyzing inference cost scaling.
+
+===========================================================
+ARCHITECTURE CONTEXT
+AMF (Adaptive Memory Fabric) is a deterministic inference memory system
+designed to eliminate redundant prompt computation by replaying previously
+computed prefix states. AMF operates below the model layer and above the
+kernel layer, enforcing strict determinism, ROI-based admission control,
+and monotonic policy updates.
+
+AMF stores:
+- KV cache states
+- Model execution metadata
+- Deterministic sampling context
+- Restore cost statistics
+- Saved compute estimates
+
+The system guarantees:
+- Replay only under deterministic sampling
+- ROI must exceed 1.0
+- Negative ROI disables replay
+- Fail-closed behavior on uncertainty
+
+===========================================================
+BLOCK START
+Explain in detail how inference cost scales with prompt length, why long
+contexts dominate compute cost in modern LLM workloads, and how systems
+that reuse prefix computation fundamentally change cost curves for
+enterprise inference.
+BLOCK END
+SYSTEM OVERVIEW
+You are an expert systems architect analyzing inference cost scaling.
+
+===========================================================
+ARCHITECTURE CONTEXT
+AMF (Adaptive Memory Fabric) is a deterministic inference memory system
+designed to eliminate redundant prompt computation by replaying previously
+computed prefix states. AMF operates below the model layer and above the
+kernel layer, enforcing strict determinism, ROI-based admission control,
+and monotonic policy updates.
+
+AMF stores:
+- KV cache states
+- Model execution metadata
+- Deterministic sampling context
+- Restore cost statistics
+- Saved compute estimates
+
+The system guarantees:
+- Replay only under deterministic sampling
+- ROI must exceed 1.0
+- Negative ROI disables replay
+- Fail-closed behavior on uncertainty
+
+===========================================================
+BLOCK START
+Explain in detail how inference cost scales with prompt length, why long
+contexts dominate compute cost in modern LLM workloads, and how systems
+that reuse prefix computation fundamentally change cost curves for
+enterprise inference.
+BLOCK END
+SYSTEM OVERVIEW
+You are an expert systems architect analyzing inference cost scaling.
+
+===========================================================
+ARCHITECTURE CONTEXT
+AMF (Adaptive Memory Fabric) is a deterministic inference memory system
+designed to eliminate redundant prompt computation by replaying previously
+computed prefix states. AMF operates below the model layer and above the
+kernel layer, enforcing strict determinism, ROI-based admission control,
+and monotonic policy updates.
+
+AMF stores:
+- KV cache states
+- Model execution metadata
+- Deterministic sampling context
+- Restore cost statistics
+- Saved compute estimates
+
+The system guarantees:
+- Replay only under deterministic sampling
+- ROI must exceed 1.0
+- Negative ROI disables replay
+- Fail-closed behavior on uncertainty
+
+===========================================================
+BLOCK START
+Explain in detail how inference cost scales with prompt length, why long
+contexts dominate compute cost in modern LLM workloads, and how systems
+that reuse prefix computation fundamentally change cost curves for
+enterprise inference.
+BLOCK END
+SYSTEM OVERVIEW
+You are an expert systems architect analyzing inference cost scaling.
+
+===========================================================
+ARCHITECTURE CONTEXT
+AMF (Adaptive Memory Fabric) is a deterministic inference memory system
+designed to eliminate redundant prompt computation by replaying previously
+computed prefix states. AMF operates below the model layer and above the
+kernel layer, enforcing strict determinism, ROI-based admission control,
+and monotonic policy updates.
+
+AMF stores:
+- KV cache states
+- Model execution metadata
+- Deterministic sampling context
+- Restore cost statistics
+- Saved compute estimates
+
+The system guarantees:
+- Replay only under deterministic sampling
+- ROI must exceed 1.0
+- Negative ROI disables replay
+- Fail-closed behavior on uncertainty
+
+===========================================================
+BLOCK START
+Explain in detail how inference cost scales with prompt length, why long
+contexts dominate compute cost in modern LLM workloads, and how systems
+that reuse prefix computation fundamentally change cost curves for
+enterprise inference.
+BLOCK END
+SYSTEM OVERVIEW
+You are an expert systems architect analyzing inference cost scaling.
+
+===========================================================
+ARCHITECTURE CONTEXT
+AMF (Adaptive Memory Fabric) is a deterministic inference memory system
+designed to eliminate redundant prompt computation by replaying previously
+computed prefix states. AMF operates below the model layer and above the
+kernel layer, enforcing strict determinism, ROI-based admission control,
+and monotonic policy updates.
+
+AMF stores:
+- KV cache states
+- Model execution metadata
+- Deterministic sampling context
+- Restore cost statistics
+- Saved compute estimates
+
+The system guarantees:
+- Replay only under deterministic sampling
+- ROI must exceed 1.0
+- Negative ROI disables replay
+- Fail-closed behavior on uncertainty
+
+===========================================================
+BLOCK START
+Explain in detail how inference cost scales with prompt length, why long
+contexts dominate compute cost in modern LLM workloads, and how systems
+that reuse prefix computation fundamentally change cost curves for
+enterprise inference.
+BLOCK END

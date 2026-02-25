@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: korith-worker
+spec:
+  selector:
+    matchLabels:
+      app: korith-worker
+  template:
+    metadata:
+      labels:
+        app: korith-worker
+    spec:
+      containers:
+        - name: worker
+          image: {{ .Values.worker.image }}
+          ports:
+            - containerPort: {{ .Values.worker.port }}
+          env:
+            - name: KORITH_QUEUE_BACKEND
+              value: {{ .Values.config.queueBackend }}
+            - name: KORITH_QUEUE_DB
+              value: {{ .Values.config.queueDb }}
+            - name: KORITH_LEDGER_BACKEND
+              value: {{ .Values.config.ledgerBackend }}
+            - name: KORITH_PLATFORM_DB
+              value: {{ .Values.config.ledgerDb }}
+            - name: KORITH_ARTIFACT_BACKEND
+              value: {{ .Values.config.artifactBackend }}
+            - name: KORITH_PLATFORM_ARTIFACTS
+              value: {{ .Values.config.artifactPath }}
+            - name: KORITH_REGISTRY_DB
+              value: {{ .Values.config.registryDb }}
+            - name: KORITH_RESTORE_DB
+              value: {{ .Values.config.restoreDb }}
+            - name: KORITH_HIT_PRIORITY
+              value: "{{ .Values.config.hitPriority }}"
+            - name: KORITH_MISS_PRIORITY
+              value: "{{ .Values.config.missPriority }}"
+            - name: KORITH_DEFAULT_BACKEND_ID
+              value: {{ .Values.worker.defaultBackend }}
+            - name: KORITH_DEFAULT_MODEL_ID
+              value: {{ .Values.worker.defaultModelId }}
+            - name: KORITH_DEFAULT_MODEL_PATH
+              value: {{ .Values.worker.defaultModelPath }}

@@ -1,0 +1,112 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Korith Job Spec v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "owner", "workload", "runtime", "policy"],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "korith.job.v1"
+    },
+    "owner": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["user_id", "org_id"],
+      "properties": {
+        "user_id": { "type": "string", "minLength": 1 },
+        "org_id": { "type": "string", "minLength": 1 }
+      }
+    },
+    "workload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "input"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["summarize", "extract", "classify", "ticket_triage"]
+        },
+        "input": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["content_type", "source"],
+          "properties": {
+            "content_type": { "type": "string", "minLength": 1 },
+            "source": { "type": "string", "enum": ["file", "inline"] },
+            "data": { "type": "string" },
+            "path": { "type": "string" }
+          },
+          "oneOf": [
+            { "required": ["data"] },
+            { "required": ["path"] }
+          ]
+        },
+        "instructions": { "type": "string" },
+        "constraints": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "max_tokens": { "type": "integer", "minimum": 1, "maximum": 65536 },
+            "format": { "type": "string" }
+          }
+        }
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["model_id"],
+      "properties": {
+        "backend": {
+          "type": "string",
+          "enum": ["korith_local", "openai_compatible"],
+          "default": "korith_local"
+        },
+        "model_id": { "type": "string", "minLength": 1 },
+        "model_path": { "type": "string" },
+        "endpoint": { "type": "string" },
+        "seed": { "type": "integer" },
+        "n_ctx": { "type": "integer", "minimum": 256, "maximum": 2097152 },
+        "n_batch": { "type": "integer", "minimum": 1, "maximum": 65536 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "backend": { "const": "korith_local" } } },
+          "then": { "required": ["model_path", "seed", "n_ctx", "n_batch"] }
+        },
+        {
+          "if": { "properties": { "backend": { "const": "openai_compatible" } } },
+          "then": { "required": ["endpoint"] }
+        }
+      ]
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "allow_amf_reuse", "fail_closed", "log_level", "governance"],
+      "properties": {
+        "mode": { "type": "string", "enum": ["deterministic", "creative"] },
+        "allow_amf_reuse": { "type": "boolean" },
+        "fail_closed": { "type": "boolean" },
+        "log_level": { "type": "string", "enum": ["info", "debug"] },
+        "governance": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["record_prompts", "record_outputs", "redact_pii"],
+          "properties": {
+            "record_prompts": { "type": "boolean" },
+            "record_outputs": { "type": "boolean" },
+            "redact_pii": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "tags": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "idempotency_key": { "type": "string" }
+  }
+}
+

@@ -1,0 +1,13 @@
+[AMF_PATH] dir=./demo_amf_store index=./demo_amf_store/amf_index.bin entries=0 bytes=0
+[AMF_KEY] result=first_run model_hash=3bfbd74e2fec2e40 prompt_hash=e630b2263f76dfad n_ctx=8192 n_batch=512 rope_base=0x00000000 rope_scale=0x3f800000 sampling_hash=a09aca4f35aa53d6 seed=4b4f524954485f30
+[AMF_MISS] reason=first_run prompt_ms=52.97 tokens=317 base_prompt_tps=5984.71
+[AMF_STATS] saved_ms=0 saved_tokens=0 hits=0 misses=1 blocks=0 failures=0 admit=1 reject=0 admit_bytes=10904717 evict=0 evict_bytes=0 store_fail=0 entries=1 bytes=10904717
+[KORITH_RUN_SUMMARY] tokens_generated=256 avg_tps=271.53 amf_hit=0 amf_roi=0.00 fallback_used=1
+[AMF_SUMMARY] hits=0 misses=1 hit_rate=0.000 avg_roi=0.000 restore_ms_ema=0.00 saved_ms_ema=0.00 bytes=10904717 evictions=0
+[AMF_PATH] dir=./demo_amf_store index=./demo_amf_store/amf_index.bin entries=1 bytes=10904717
+[AMF_KEY] result=hit model_hash=3bfbd74e2fec2e40 prompt_hash=e630b2263f76dfad n_ctx=8192 n_batch=512 rope_base=0x00000000 rope_scale=0x3f800000 sampling_hash=a09aca4f35aa53d6 seed=4b4f524954485f30
+[AMF_HIT] tokens_saved=317 prefix_len=317 load_ms=7.24 suffix_ms=0.00 saved_ms=44.76
+[AMF_ROI] saved_ms=44.76 restore_ms=7.24 roi=6.19
+[AMF_STATS] saved_ms=44 saved_tokens=317 hits=1 misses=0 blocks=0 failures=0 admit=0 reject=0 admit_bytes=0 evict=0 evict_bytes=0 store_fail=0 entries=1 bytes=10904717
+[KORITH_RUN_SUMMARY] tokens_generated=256 avg_tps=286.83 amf_hit=1 amf_roi=6.29 fallback_used=1
+[AMF_SUMMARY] hits=1 misses=0 hit_rate=1.000 avg_roi=6.286 restore_ms_ema=7.00 saved_ms_ema=44.00 bytes=10904717 evictions=0

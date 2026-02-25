@@ -1,20 +1,18 @@
-# Python
-.venv/
+.venv*
+build*/
+models/
+platform_data/
 __pycache__/
 *.pyc
-.pytest_cache/
-
-# Local DB / state
+*.pyo
+controller/target/
+controller/.git.nested.backup/
+*.log
 *.db
-*.sqlite
-*.sqlite3
-
-# Frontend
-frontend/node_modules/
-frontend/dist/
-frontend/.env
-frontend/.env.production
-
-# OS/editor
-.DS_Store
-.vscode/
+a.out
+amf_state/
+amf_store/
+demo_amf_store/
+cold.log
+hot.log
+decode_bottleneck_report.json

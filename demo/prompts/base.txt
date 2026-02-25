@@ -1,0 +1,15 @@
+You are an expert systems engineer.
+
+This document describes a hypothetical large-scale AI inference system that uses
+prefix-based memory reuse, deterministic sampling, and governance-driven replay
+to reduce redundant compute.
+
+The system operates under strict correctness guarantees. It only reuses previously
+computed key-value attention states when the prompt prefix is identical and the
+sampling configuration is deterministic.
+
+The goal of this system is to reduce GPU compute, memory bandwidth pressure,
+and energy consumption during inference while preserving exact output equivalence.
+
+Explain in detail how such a system could safely skip computation during inference,
+what constraints are required, and why naive caching approaches fail.

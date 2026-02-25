@@ -1,0 +1,12 @@
+{
+  "suite_id": "korith.bench.v1",
+  "cases": [
+    {
+      "name": "ticket_triage_demo",
+      "model_path": "models/llama-3.2-1b-q4_k_m.gguf",
+      "prompt_file": "demo/prompts/base.txt",
+      "max_tokens": 256,
+      "shots": 3
+    }
+  ]
+}

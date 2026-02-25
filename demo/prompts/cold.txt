@@ -1,0 +1,2 @@
+Explain three risks of deploying large-scale inference caching systems in production AI environments.
+Respond concisely.

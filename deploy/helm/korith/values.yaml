@@ -1,0 +1,29 @@
+router:
+  image: korith-router:latest
+  replicas: 1
+  port: 8000
+
+gateway:
+  image: korith-gateway:latest
+  replicas: 1
+  port: 8080
+
+worker:
+  image: korith-worker:latest
+  port: 9000
+  gpuId: 0
+  defaultBackend: korith_local
+  defaultModelId: llama-3.2-1b-q4_k_m
+  defaultModelPath: /models/llama-3.2-1b-q4_k_m.gguf
+
+config:
+  queueBackend: sqlite
+  ledgerBackend: sqlite
+  artifactBackend: local
+  queueDb: /data/queue.sqlite
+  ledgerDb: /data/ledger.sqlite
+  artifactPath: /data/artifacts
+  registryDb: /data/registry.sqlite
+  restoreDb: /data/restore.sqlite
+  hitPriority: 3
+  missPriority: 1

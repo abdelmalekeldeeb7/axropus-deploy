@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Korith JobSpec v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "backend_id", "model", "deterministic_cfg", "policy"],
+  "properties": {
+    "schema_version": { "type": "string", "const": "korith.jobspec.v1" },
+    "job_id": { "type": "string" },
+    "parent_job_id": { "type": "string" },
+    "session_id": { "type": "string" },
+    "idempotency_key": { "type": "string" },
+    "owner": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "org_id": { "type": "string", "minLength": 1 },
+        "user_id": { "type": "string" }
+      }
+    },
+    "backend_id": { "type": "string", "minLength": 1 },
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["model_id"],
+      "properties": {
+        "model_id": { "type": "string", "minLength": 1 },
+        "model_path": { "type": "string" },
+        "endpoint": { "type": "string" }
+      }
+    },
+    "prompt": { "type": "string" },
+    "prompt_template": { "type": "string" },
+    "input": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "deterministic_cfg": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["seed", "n_ctx", "n_batch"],
+      "properties": {
+        "seed": { "type": "integer" },
+        "temperature": { "type": "number" },
+        "top_p": { "type": "number" },
+        "top_k": { "type": "integer" },
+        "n_ctx": { "type": "integer", "minimum": 256 },
+        "n_batch": { "type": "integer", "minimum": 1 },
+        "max_tokens": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["allow_amf_reuse", "allow_spec"],
+      "properties": {
+        "allow_amf_reuse": { "type": "boolean" },
+        "allow_spec": { "type": "boolean" }
+      }
+    }
+  },
+  "oneOf": [
+    { "required": ["prompt"] },
+    { "required": ["prompt_template"] }
+  ]
+}

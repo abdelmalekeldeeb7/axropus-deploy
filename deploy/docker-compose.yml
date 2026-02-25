@@ -1,0 +1,313 @@
+version: "3.9"
+
+services:
+  redis:
+    profiles: ["multi-node"]
+    image: redis:7-alpine
+    container_name: korith-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  router:
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile.router
+    image: korith-router:latest
+    container_name: korith-router
+    environment:
+      KORITH_PLATFORM_CONFIG: /config/config.yaml
+      KORITH_LEDGER_BACKEND: sqlite
+      KORITH_PLATFORM_DB: /data/ledger.sqlite
+      KORITH_QUEUE_BACKEND: sqlite
+      KORITH_QUEUE_DB: /data/queue.sqlite
+      KORITH_ARTIFACT_BACKEND: local
+      KORITH_PLATFORM_ARTIFACTS: /data/artifacts
+      KORITH_REGISTRY_DB: /data/registry.sqlite
+      KORITH_RESTORE_DB: /data/restore.sqlite
+    volumes:
+      - ../platform_data:/data
+      - ./config:/config:ro
+      - ../models:/models:ro
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).read()"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  worker-gpu0:
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile.worker
+    image: korith-worker:latest
+    container_name: korith-worker-gpu0
+    environment:
+      KORITH_PLATFORM_CONFIG: /config/config.yaml
+      KORITH_WORKER_ID: worker-gpu0
+      KORITH_GPU_ID: 0
+      KORITH_LEDGER_BACKEND: sqlite
+      KORITH_PLATFORM_DB: /data/ledger.sqlite
+      KORITH_QUEUE_BACKEND: sqlite
+      KORITH_QUEUE_DB: /data/queue.sqlite
+      KORITH_ARTIFACT_BACKEND: local
+      KORITH_PLATFORM_ARTIFACTS: /data/artifacts
+      KORITH_REGISTRY_DB: /data/registry.sqlite
+      KORITH_RESTORE_DB: /data/restore.sqlite
+      KORITH_DEFAULT_BACKEND_ID: korith_local
+      KORITH_DEFAULT_MODEL_ID: llama-3.2-1b-q4_k_m
+      KORITH_DEFAULT_MODEL_PATH: /models/llama-3.2-1b-q4_k_m.gguf
+    volumes:
+      - ../platform_data:/data
+      - ./config:/config:ro
+      - ../models:/models:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9000/health', timeout=2).read()"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  worker-gpu1:
+    profiles: ["multi-gpu"]
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile.worker
+    image: korith-worker:latest
+    container_name: korith-worker-gpu1
+    environment:
+      KORITH_PLATFORM_CONFIG: /config/config.yaml
+      KORITH_WORKER_ID: worker-gpu1
+      KORITH_GPU_ID: 1
+      KORITH_LEDGER_BACKEND: sqlite
+      KORITH_PLATFORM_DB: /data/ledger.sqlite
+      KORITH_QUEUE_BACKEND: sqlite
+      KORITH_QUEUE_DB: /data/queue.sqlite
+      KORITH_ARTIFACT_BACKEND: local
+      KORITH_PLATFORM_ARTIFACTS: /data/artifacts
+      KORITH_REGISTRY_DB: /data/registry.sqlite
+      KORITH_RESTORE_DB: /data/restore.sqlite
+      KORITH_DEFAULT_BACKEND_ID: korith_local
+      KORITH_DEFAULT_MODEL_ID: llama-3.2-1b-q4_k_m
+      KORITH_DEFAULT_MODEL_PATH: /models/llama-3.2-1b-q4_k_m.gguf
+    volumes:
+      - ../platform_data:/data
+      - ./config:/config:ro
+      - ../models:/models:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9000/health', timeout=2).read()"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  gateway:
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile.gateway
+    image: korith-gateway:latest
+    container_name: korith-gateway
+    environment:
+      KORITH_GATEWAY_ROUTER_URL: http://router:8000
+    depends_on:
+      - router
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2).read()"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  cluster-router:
+    profiles: ["multi-node"]
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile.router
+    image: korith-router:latest
+    container_name: korith-cluster-router
+    command: ["python3", "platform/korith_platform.py", "router", "--mode", "cluster", "--host", "0.0.0.0", "--port", "8000", "--config", "/config/config.yaml"]
+    environment:
+      KORITH_PLATFORM_CONFIG: /config/config.yaml
+      KORITH_LEDGER_BACKEND: sqlite
+      KORITH_PLATFORM_DB: /data/ledger.sqlite
+      KORITH_QUEUE_BACKEND: redis_streams
+      KORITH_REDIS_URL: redis://redis:6379/0
+      KORITH_STREAM_PREFIX: korith:jobs
+      KORITH_STREAM_CONSUMER_GROUP: korith
+      KORITH_ARTIFACT_BACKEND: local
+      KORITH_PLATFORM_ARTIFACTS: /data/artifacts
+      KORITH_REGISTRY_DB: /data/registry.sqlite
+      KORITH_NODE_REGISTRY_DB: /data/node_registry.sqlite
+      KORITH_RESTORE_DB: /data/restore.sqlite
+      KORITH_NODE_REGISTRY_REDIS_URL: redis://redis:6379/0
+      KORITH_SNAPSHOT_INDEX_REDIS_URL: redis://redis:6379/0
+    volumes:
+      - ../platform_data:/data
+      - ./config:/config:ro
+      - ../models:/models:ro
+    depends_on:
+      - redis
+    ports:
+      - "8010:8000"
+
+  node-router-a:
+    profiles: ["multi-node"]
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile.router
+    image: korith-router:latest
+    container_name: korith-node-router-a
+    command: ["python3", "platform/korith_platform.py", "router", "--mode", "node", "--node-id", "node-a", "--host", "0.0.0.0", "--port", "8100", "--config", "/config/config.yaml"]
+    environment:
+      KORITH_PLATFORM_CONFIG: /config/config.yaml
+      KORITH_NODE_ID: node-a
+      KORITH_NODE_HOST: node-router-a
+      KORITH_NODE_ROUTER_PORT: 8100
+      KORITH_LEDGER_BACKEND: sqlite
+      KORITH_PLATFORM_DB: /data/ledger.sqlite
+      KORITH_QUEUE_BACKEND: redis_streams
+      KORITH_REDIS_URL: redis://redis:6379/0
+      KORITH_STREAM_PREFIX: korith:jobs
+      KORITH_STREAM_CONSUMER_GROUP: korith
+      KORITH_REGISTRY_DB: /data/registry.sqlite
+      KORITH_NODE_REGISTRY_DB: /data/node_registry.sqlite
+      KORITH_NODE_REGISTRY_REDIS_URL: redis://redis:6379/0
+      KORITH_SNAPSHOT_INDEX_REDIS_URL: redis://redis:6379/0
+    volumes:
+      - ../platform_data:/data
+      - ./config:/config:ro
+    depends_on:
+      - redis
+    ports:
+      - "8100:8100"
+
+  node-router-b:
+    profiles: ["multi-node"]
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile.router
+    image: korith-router:latest
+    container_name: korith-node-router-b
+    command: ["python3", "platform/korith_platform.py", "router", "--mode", "node", "--node-id", "node-b", "--host", "0.0.0.0", "--port", "8101", "--config", "/config/config.yaml"]
+    environment:
+      KORITH_PLATFORM_CONFIG: /config/config.yaml
+      KORITH_NODE_ID: node-b
+      KORITH_NODE_HOST: node-router-b
+      KORITH_NODE_ROUTER_PORT: 8101
+      KORITH_LEDGER_BACKEND: sqlite
+      KORITH_PLATFORM_DB: /data/ledger.sqlite
+      KORITH_QUEUE_BACKEND: redis_streams
+      KORITH_REDIS_URL: redis://redis:6379/0
+      KORITH_STREAM_PREFIX: korith:jobs
+      KORITH_STREAM_CONSUMER_GROUP: korith
+      KORITH_REGISTRY_DB: /data/registry.sqlite
+      KORITH_NODE_REGISTRY_DB: /data/node_registry.sqlite
+      KORITH_NODE_REGISTRY_REDIS_URL: redis://redis:6379/0
+      KORITH_SNAPSHOT_INDEX_REDIS_URL: redis://redis:6379/0
+    volumes:
+      - ../platform_data:/data
+      - ./config:/config:ro
+    depends_on:
+      - redis
+    ports:
+      - "8101:8101"
+
+  worker-node-a:
+    profiles: ["multi-node"]
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile.worker
+    image: korith-worker:latest
+    container_name: korith-worker-node-a
+    command: ["python3", "platform/korith_platform.py", "worker", "--worker-id", "worker-node-a-gpu0", "--gpu-id", "0", "--node-id", "node-a", "--host", "0.0.0.0", "--port", "9000", "--config", "/config/config.yaml"]
+    environment:
+      KORITH_PLATFORM_CONFIG: /config/config.yaml
+      KORITH_NODE_ID: node-a
+      KORITH_LEDGER_BACKEND: sqlite
+      KORITH_PLATFORM_DB: /data/ledger.sqlite
+      KORITH_QUEUE_BACKEND: redis_streams
+      KORITH_REDIS_URL: redis://redis:6379/0
+      KORITH_STREAM_PREFIX: korith:jobs
+      KORITH_STREAM_CONSUMER_GROUP: korith
+      KORITH_ARTIFACT_BACKEND: local
+      KORITH_PLATFORM_ARTIFACTS: /data/artifacts
+      KORITH_REGISTRY_DB: /data/registry.sqlite
+      KORITH_NODE_REGISTRY_DB: /data/node_registry.sqlite
+      KORITH_NODE_REGISTRY_REDIS_URL: redis://redis:6379/0
+      KORITH_RESTORE_DB: /data/restore.sqlite
+      KORITH_SNAPSHOT_INDEX_REDIS_URL: redis://redis:6379/0
+      KORITH_DEFAULT_BACKEND_ID: korith_local
+      KORITH_DEFAULT_MODEL_ID: llama-3.2-1b-q4_k_m
+      KORITH_DEFAULT_MODEL_PATH: /models/llama-3.2-1b-q4_k_m.gguf
+    volumes:
+      - ../platform_data:/data
+      - ./config:/config:ro
+      - ../models:/models:ro
+    depends_on:
+      - redis
+
+  worker-node-b:
+    profiles: ["multi-node"]
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile.worker
+    image: korith-worker:latest
+    container_name: korith-worker-node-b
+    command: ["python3", "platform/korith_platform.py", "worker", "--worker-id", "worker-node-b-gpu0", "--gpu-id", "0", "--node-id", "node-b", "--host", "0.0.0.0", "--port", "9000", "--config", "/config/config.yaml"]
+    environment:
+      KORITH_PLATFORM_CONFIG: /config/config.yaml
+      KORITH_NODE_ID: node-b
+      KORITH_LEDGER_BACKEND: sqlite
+      KORITH_PLATFORM_DB: /data/ledger.sqlite
+      KORITH_QUEUE_BACKEND: redis_streams
+      KORITH_REDIS_URL: redis://redis:6379/0
+      KORITH_STREAM_PREFIX: korith:jobs
+      KORITH_STREAM_CONSUMER_GROUP: korith
+      KORITH_ARTIFACT_BACKEND: local
+      KORITH_PLATFORM_ARTIFACTS: /data/artifacts
+      KORITH_REGISTRY_DB: /data/registry.sqlite
+      KORITH_NODE_REGISTRY_DB: /data/node_registry.sqlite
+      KORITH_NODE_REGISTRY_REDIS_URL: redis://redis:6379/0
+      KORITH_RESTORE_DB: /data/restore.sqlite
+      KORITH_SNAPSHOT_INDEX_REDIS_URL: redis://redis:6379/0
+      KORITH_DEFAULT_BACKEND_ID: korith_local
+      KORITH_DEFAULT_MODEL_ID: llama-3.2-1b-q4_k_m
+      KORITH_DEFAULT_MODEL_PATH: /models/llama-3.2-1b-q4_k_m.gguf
+    volumes:
+      - ../platform_data:/data
+      - ./config:/config:ro
+      - ../models:/models:ro
+    depends_on:
+      - redis
+
+  gateway-cluster:
+    profiles: ["multi-node"]
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile.gateway
+    image: korith-gateway:latest
+    container_name: korith-gateway-cluster
+    environment:
+      KORITH_GATEWAY_ROUTER_URL: http://cluster-router:8000
+    depends_on:
+      - cluster-router
+    ports:
+      - "8081:8080"

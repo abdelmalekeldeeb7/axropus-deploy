@@ -1,0 +1,13 @@
+runtime:
+  backend_id: korith_local
+  scheduler:
+    hit_priority: 3
+    miss_priority: 1
+queue:
+  backend: inproc
+ledger:
+  backend: sqlite
+artifact:
+  backend: local
+workers:
+  gpus: [0]

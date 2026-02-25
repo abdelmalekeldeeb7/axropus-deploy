@@ -1,0 +1,11 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+COPY . /app
+RUN pip install --no-cache-dir pyyaml
+ENV PYTHONPATH=/app
+ENV KORITH_PLATFORM_CONFIG=/config/config.yaml
+
+EXPOSE 9000
+HEALTHCHECK --interval=15s --timeout=5s --retries=5 CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9000/health', timeout=2).read()"
+CMD ["python", "-m", "platform.runtime.worker_service", "--host", "0.0.0.0", "--port", "9000", "--config", "/config/config.yaml"]

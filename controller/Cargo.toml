@@ -1,0 +1,11 @@
+[package]
+name = "korith_scheduler"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+path = "ffi.rs"
+
+[dependencies]
+libc = "0.2"

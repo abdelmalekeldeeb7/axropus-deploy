@@ -1,0 +1,171 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Korith RunMetrics v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["ids", "backend", "model", "input", "scheduling", "amf", "mf", "engine", "kernels", "spec", "savings", "perf", "health", "errors"],
+  "properties": {
+    "ids": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["job_id", "created_at", "started_at", "finished_at"],
+      "properties": {
+        "job_id": { "type": "string" },
+        "parent_job_id": { "type": "string" },
+        "org_id": { "type": "string" },
+        "request_id": { "type": "string" },
+        "created_at": { "type": "string" },
+        "started_at": { "type": "string" },
+        "finished_at": { "type": "string" }
+      }
+    },
+    "backend": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["backend_id", "backend_version"],
+      "properties": {
+        "backend_id": { "type": "string" },
+        "backend_version": { "type": "string" }
+      }
+    },
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["model_id", "model_hash", "tokenizer_hash"],
+      "properties": {
+        "model_id": { "type": "string" },
+        "model_hash": { "type": "string" },
+        "tokenizer_hash": { "type": "string" }
+      }
+    },
+    "input": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["prompt_hash", "sampling_hash", "prompt_tokens"],
+      "properties": {
+        "prompt_hash": { "type": "string" },
+        "sampling_hash": { "type": "string" },
+        "prompt_tokens": { "type": "integer" }
+      }
+    },
+    "scheduling": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["worker_id", "gpu_id", "lane", "queue_latency_ms"],
+      "properties": {
+        "worker_id": { "type": "string" },
+        "node_id": { "type": "string" },
+        "gpu_id": { "type": "integer" },
+        "lane": { "type": "string", "enum": ["SPEC_HIT", "HIT", "SPEC_MISS", "MISS"] },
+        "queue_latency_ms": { "type": "number" }
+      }
+    },
+    "amf": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["supported", "decision", "prefix_len", "skipped_tokens", "skip_ratio"],
+      "properties": {
+        "supported": { "type": "boolean" },
+        "decision": { "type": "string", "enum": ["hit", "miss", "blocked", "unavailable"] },
+        "prefix_len": { "type": "integer" },
+        "skipped_tokens": { "type": "integer" },
+        "skip_ratio": { "type": "number" },
+        "restore_ms": { "type": "number" },
+        "baseline_prefix_ms": { "type": "number" },
+        "saved_ms": { "type": "number" },
+        "roi": { "type": "number" }
+      }
+    },
+    "mf": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["supported", "min_admit_roi", "eviction_pressure", "replay_disable_mask", "cooldown_ms"],
+      "properties": {
+        "supported": { "type": "boolean" },
+        "min_admit_roi": { "type": "number" },
+        "eviction_pressure": { "type": "number" },
+        "replay_disable_mask": { "type": "integer" },
+        "cooldown_ms": { "type": "integer" },
+        "snapshot_id": { "type": "string" }
+      }
+    },
+    "engine": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "accel_enabled", "cuda_device", "kv_layout_version"],
+      "properties": {
+        "mode": { "type": "string", "enum": ["baseline", "accel", "speculative"] },
+        "accel_enabled": { "type": "boolean" },
+        "cuda_device": { "type": "integer" },
+        "kv_layout_version": { "type": "string" }
+      }
+    },
+    "spec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["supported", "enabled", "k", "proposed_tokens", "accepted_tokens", "acceptance_rate", "verify_ms", "draft_ms", "saved_ms", "roi", "speedup_est"],
+      "properties": {
+        "supported": { "type": "boolean" },
+        "enabled": { "type": "boolean" },
+        "k": { "type": "integer" },
+        "proposed_tokens": { "type": "integer" },
+        "accepted_tokens": { "type": "integer" },
+        "acceptance_rate": { "type": "number" },
+        "verify_ms": { "type": "number" },
+        "draft_ms": { "type": "number" },
+        "saved_ms": { "type": "number" },
+        "roi": { "type": "number" },
+        "speedup_est": { "type": "number" }
+      }
+    },
+    "kernels": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "backend", "kernels_applied", "verify", "verify_ok", "fallback", "decode_ms_actual", "decode_ms_baseline_est", "comparable", "comparable_tag", "ms_saved"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "backend": { "type": "string" },
+        "kernels_applied": { "type": "boolean" },
+        "verify": { "type": "boolean" },
+        "verify_ok": { "type": "boolean" },
+        "fallback": { "type": "boolean" },
+        "decode_ms_actual": { "type": "number" },
+        "decode_ms_baseline_est": { "type": "number" },
+        "comparable": { "type": "boolean" },
+        "comparable_tag": { "type": "string" },
+        "ms_saved": { "type": "number" }
+      }
+    },
+    "savings": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["prefill_saved_ms", "spec_saved_ms", "kernels_saved_ms", "total_saved_ms"],
+      "properties": {
+        "prefill_saved_ms": { "type": "number" },
+        "spec_saved_ms": { "type": "number" },
+        "kernels_saved_ms": { "type": "number" },
+        "total_saved_ms": { "type": "number" }
+      }
+    },
+    "perf": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tokens_out", "total_ms", "prefill_ms", "decode_ms", "avg_tps"],
+      "properties": {
+        "tokens_out": { "type": "integer" },
+        "total_ms": { "type": "number" },
+        "prefill_ms": { "type": "number" },
+        "decode_ms": { "type": "number" },
+        "avg_tps": { "type": "number" }
+      }
+    },
+    "health": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "errors": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  }
+}

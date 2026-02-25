@@ -1,0 +1,112 @@
+You are a senior AI infrastructure engineer designing large-scale inference
+systems for foundation models deployed in production.
+
+Below is a technical design document. Read it carefully. You will be asked
+questions that reuse most of this information.
+
+===========================================================
+KORITH TECHNICAL DESIGN BRIEF
+===========================================================
+
+Overview
+--------
+Korith is an AI inference optimization engine designed to reduce the cost and
+latency of large language model inference. The system introduces an Adaptive
+Memory Framework (AMF) that persists inference state across prompts, enabling
+prefix reuse beyond traditional KV cache mechanisms.
+
+Traditional inference systems discard computation after each request. Even when
+KV cache is used, it is scoped to a single request or session. Korith instead
+treats inference as a reusable computation artifact.
+
+Core Components
+---------------
+1. Adaptive Memory Framework (AMF)
+2. Memory Field (MF) governance layer
+3. Deterministic replay validator
+4. Scheduler and speculative planning layer
+5. Thermodynamic depth controller
+
+Adaptive Memory Framework
+-------------------------
+AMF captures and stores:
+- Model state metadata
+- Output token IDs
+- Logits
+- Embeddings
+- Internal memory modules
+
+Each stored entry is indexed by a deterministic key derived from:
+- Model hash
+- Prompt hash
+- Context size
+- Batch size
+- Sampling configuration
+- Random seed
+
+AMF enforces strict correctness:
+- No replay on first observation
+- Replay disabled for non-deterministic sampling
+- Baseline latency must stabilize before ROI is computed
+- Negative ROI disables reuse
+- Memory eviction is pressure-aware
+
+Memory Field Governance
+-----------------------
+The Memory Field (MF) acts as a policy layer that dynamically adjusts AMF
+behavior. It observes:
+- Hit/miss rate
+- Restore cost
+- Saved milliseconds
+- Negative ROI streaks
+- Memory pressure
+- Entry age
+
+MF outputs governance signals such as:
+- Minimum ROI threshold
+- Replay disable masks
+- Cooldown windows
+- Eviction pressure multipliers
+
+These policies prevent thrashing and ensure AMF improves economics rather than
+degrading them.
+
+Economic Model
+--------------
+AMF measures return on investment (ROI) as:
+
+ROI = (baseline_compute_ms − restore_ms) / restore_ms
+
+As prompt length increases, baseline compute grows linearly while restore cost
+grows sub-linearly. This creates increasing returns for longer, reusable prompts.
+
+This makes AMF particularly effective for:
+- Long-context chat
+- Agent loops
+- Tool-calling systems
+- RAG pipelines
+- Repeated enterprise workflows
+
+Scheduler Integration
+---------------------
+Korith integrates AMF with a scheduler that coordinates:
+- Decode depth
+- Speculative execution lanes
+- Cost vs benefit tradeoffs
+
+By default, the system operates in safety-first mode. Speculative execution is
+disabled unless explicitly allowed and economically justified.
+
+Thermodynamic Controller
+------------------------
+A thermodynamic controller tracks long-term gain and cost. If savings decline or
+variance increases, the system collapses back to baseline execution.
+
+This prevents silent regressions and ensures predictable performance.
+
+===========================================================
+
+Task:
+Explain how AMF fundamentally changes inference economics compared to traditional
+KV caching, and why its effectiveness increases as prompt length and reuse
+frequency grow.

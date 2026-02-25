@@ -1,0 +1,8 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+COPY . /app
+RUN pip install --no-cache-dir pyyaml
+ENV PYTHONPATH=/app
+
+CMD ["python", "-c", "from platform.ledger.migrate import migrate_sqlite; import os; from pathlib import Path; migrate_sqlite(Path(os.environ.get('KORITH_PLATFORM_DB','/data/ledger.sqlite')))"]

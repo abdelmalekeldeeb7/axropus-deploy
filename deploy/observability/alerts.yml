@@ -1,0 +1,38 @@
+groups:
+  - name: korith-platform-alerts
+    rules:
+      - alert: KorithReplayFailureRateHigh
+        expr: replay_failures_total / clamp_min(jobs_processed_total, 1) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Korith replay failure rate above 5%"
+      - alert: KorithMfRestoreFailuresHigh
+        expr: mf_restore_failures > 10
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MF restore failures exceed threshold"
+      - alert: KorithQueueLatencyHigh
+        expr: queue_latency_ms > 500
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Queue latency exceeds SLA"
+      - alert: KorithWorkerHealthDrop
+        expr: min_over_time(worker_health[5m]) < 1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Worker health degraded"
+      - alert: KorithNegativeRoiSurge
+        expr: increase(negative_roi_streaks[15m]) > 25
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Negative ROI streak events surged"

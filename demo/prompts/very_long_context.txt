@@ -1,0 +1,33 @@
+====================================================================
+DETAILED ANALYSIS SECTION
+Explain in detail how inference cost scales with prompt length.
+Explain why long-context prompts dominate cost in enterprise workloads.
+Explain why agents, RAG systems, and tool-heavy workflows exacerbate this.
+Explain why reuse frequency amplifies AMF ROI over time.
+Explain why AMF becomes more effective as prompts grow larger.
+====================================================================
+====================================================================
+DETAILED ANALYSIS SECTION
+Explain in detail how inference cost scales with prompt length.
+Explain why long-context prompts dominate cost in enterprise workloads.
+Explain why agents, RAG systems, and tool-heavy workflows exacerbate this.
+Explain why reuse frequency amplifies AMF ROI over time.
+Explain why AMF becomes more effective as prompts grow larger.
+====================================================================
+====================================================================
+DETAILED ANALYSIS SECTION
+Explain in detail how inference cost scales with prompt length.
+Explain why long-context prompts dominate cost in enterprise workloads.
+Explain why agents, RAG systems, and tool-heavy workflows exacerbate this.
+Explain why reuse frequency amplifies AMF ROI over time.
+Explain why AMF becomes more effective as prompts grow larger.
+====================================================================
+====================================================================
+DETAILED ANALYSIS SECTION
+Explain in detail how inference cost scales with prompt length.
+Explain why long-context prompts dominate cost in enterprise workloads.
+Explain why agents, RAG systems, and tool-heavy workflows exacerbate this.
+Explain why reuse frequency amplifies AMF ROI over time.
+Explain why AMF becomes more effective as prompts grow larger.
+====================================================================
+

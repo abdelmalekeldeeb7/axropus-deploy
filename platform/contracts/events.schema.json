@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Korith Events v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["type", "ts", "payload"],
+  "properties": {
+    "type": { "type": "string" },
+    "ts": { "oneOf": [{ "type": "string" }, { "type": "number" }] },
+    "payload": { "type": "object" }
+  }
+}

@@ -1,0 +1,53 @@
+runtime:
+  backend_id: "korith_local"
+  model_id: "llama-3.2-1b-q4_k_m"
+  model_path: "/models/llama-3.2-1b-q4_k_m.gguf"
+  model_endpoint: ""
+  scheduler:
+    hit_priority: 3
+    miss_priority: 1
+    negative_roi_max: 3
+    negative_roi_cooldown_ms: 30000
+
+gateway:
+  rate_limit:
+    backend: "sqlite"
+    sqlite_path: "/data/rate_limit.sqlite"
+    redis_url: "redis://redis:6379/0"
+    burst_factor: 2.0
+
+queue:
+  backend: "sqlite"
+  sqlite_path: "/data/queue.sqlite"
+  redis_url: "redis://redis:6379/0"
+  nats_url: "nats://nats:4222"
+  sqs_url: ""
+
+ledger:
+  backend: "sqlite"
+  sqlite_path: "/data/ledger.sqlite"
+  postgres_dsn: ""
+
+artifacts:
+  backend: "local"
+  local_path: "/data/artifacts"
+  s3_bucket: ""
+  s3_prefix: "korith"
+  minio_endpoint: ""
+  minio_access_key: ""
+  minio_secret_key: ""
+  minio_bucket: ""
+  minio_prefix: "korith"
+
+registry:
+  sqlite_path: "/data/registry.sqlite"
+
+restore:
+  sqlite_path: "/data/restore.sqlite"
+
+security:
+  api_key_salt: "korith_pilot_change_this_before_prod"
+
+workers:
+  - worker_id: "worker-gpu0"
+    gpu_id: 0

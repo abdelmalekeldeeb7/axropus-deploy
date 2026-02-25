@@ -1,0 +1,78 @@
+runtime:
+  backend_id: "korith_local"
+  model_id: "llama-3.2-1b-q4_k_m"
+  model_path: "/models/llama-3.2-1b-q4_k_m.gguf"
+  model_endpoint: ""
+  engine:
+    accel_enabled: 0
+    cuda_device: 0
+    kv_layout_version: "v1"
+    cuda_dtype: "fp16"
+  spec:
+    enabled: 0
+    k: 6
+    min_accept: 0.55
+    disable_after_n: 50
+  scheduler:
+    hit_priority: 3
+    miss_priority: 1
+    negative_roi_max: 3
+    negative_roi_cooldown_ms: 30000
+
+gateway:
+  rate_limit:
+    backend: "sqlite"
+    sqlite_path: "/data/rate_limit.sqlite"
+    redis_url: "redis://redis:6379/0"
+    burst_factor: 2.0
+
+queue:
+  backend: "sqlite"
+  sqlite_path: "/data/queue.sqlite"
+  redis_url: "redis://redis:6379/0"
+  stream_prefix: "korith:jobs"
+  consumer_group: "korith"
+  nats_url: "nats://nats:4222"
+  sqs_url: ""
+
+cluster:
+  node_id: "node-a"
+  node_host: "node-router-a"
+  node_router_port: 8100
+  registry:
+    sqlite_path: "/data/node_registry.sqlite"
+    redis_url: "redis://redis:6379/0"
+  snapshot_index:
+    redis_url: "redis://redis:6379/0"
+  snapshot_bw_mbps: 200
+  snapshot_rtt_ms: 5
+  transfer_vs_recompute_threshold: 0.8
+
+ledger:
+  backend: "sqlite"
+  sqlite_path: "/data/ledger.sqlite"
+  postgres_dsn: ""
+
+artifacts:
+  backend: "local"
+  local_path: "/data/artifacts"
+  s3_bucket: ""
+  s3_prefix: "korith"
+  minio_endpoint: ""
+  minio_access_key: ""
+  minio_secret_key: ""
+  minio_bucket: ""
+  minio_prefix: "korith"
+
+registry:
+  sqlite_path: "/data/registry.sqlite"
+
+restore:
+  sqlite_path: "/data/restore.sqlite"
+
+security:
+  api_key_salt: "7ba8078270a84608ab0741ecca873681"
+
+workers:
+  - worker_id: "worker-gpu0"
+    gpu_id: 0

@@ -1,0 +1,12 @@
+SYSTEM PROMPT:
+You are Korith, a persistent inference engine with an authoritative memory field.
+
+This prompt is intentionally long and stable.
+It exists to validate KV prefix reuse.
+The content must remain identical across runs.
+No randomness is allowed.
+The goal is to exceed the AMF minimum prefix threshold.
+
+Repeatability matters.
+Determinism matters.
+This prefix must be cached and restored.
