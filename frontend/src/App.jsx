@@ -4,6 +4,7 @@ import { useAuth } from "./context/AuthContext";
 import Billing from "./pages/Billing";
 import Configure from "./pages/Configure";
 import Dashboard from "./pages/Dashboard";
+import Demo from "./pages/Demo";
 import Deploy from "./pages/Deploy";
 import Login from "./pages/Login";
 import Settings from "./pages/Settings";
@@ -38,6 +39,7 @@ export default function App() {
           </PublicOnlyRoute>
         }
       />
+      <Route path="/demo" element={<Demo />} />
 
       <Route
         path="/configure"

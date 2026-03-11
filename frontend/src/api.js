@@ -103,6 +103,18 @@ class ApiClient {
     return this.request("GET", "/api/billing/invoices");
   }
 
+  getBenchmarkSummary() {
+    return this.request("GET", "/api/benchmarks/summary");
+  }
+
+  getBenchmarkRuns() {
+    return this.request("GET", "/api/benchmarks/runs");
+  }
+
+  getBenchmarkMixed() {
+    return this.request("GET", "/api/benchmarks/mixed");
+  }
+
   getDeployStreamUrl(deploymentId) {
     const wsBase = API_BASE ? API_BASE.replace(/^http/i, "ws") : WS_BASE_DEFAULT;
     return `${wsBase}/api/deploy/stream/${deploymentId}`;

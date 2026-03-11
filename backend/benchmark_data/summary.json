@@ -1,0 +1,22 @@
+{
+  "long": {
+    "runs": 817,
+    "hits": 816,
+    "misses": 1,
+    "hit_rate": 0.9987760097919217,
+    "cold_total_ms": 243610.0,
+    "warm_total_ms_avg": 11446.446323529412,
+    "warm_total_ms_median": 11390.849999999999,
+    "e2e_savings_pct": 95.30132329398243,
+    "warm_skip_ratio_avg": 1.0
+  },
+  "short": {
+    "runs": 1000,
+    "hits": 999,
+    "misses": 1,
+    "hit_rate": 0.999,
+    "cold_total_ms": 3307.29,
+    "warm_total_ms_avg": 2162.491831831832,
+    "e2e_savings_pct": 34.61438725265
+  }
+}

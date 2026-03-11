@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
 from .auth import router as auth_router
+from .benchmarks import router as benchmarks_router
 from .config import get_settings
 from .db import SessionLocal, init_db
 from .billing import router as billing_router
@@ -65,6 +66,7 @@ def create_app() -> FastAPI:
             db.close()
 
     app.include_router(auth_router)
+    app.include_router(benchmarks_router)
     app.include_router(keys_router)
     app.include_router(deploy_router)
     app.include_router(metrics_router)
