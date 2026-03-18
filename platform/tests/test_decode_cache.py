@@ -47,6 +47,40 @@ class DecodeCacheStoreTests(unittest.TestCase):
         self.assertTrue(ClusterWorker._decode_cache_eligible(worker, ok_job))
         self.assertFalse(ClusterWorker._decode_cache_eligible(worker, bad_job))
 
+    def test_decode_cache_isolated_by_org_id(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = DecodeCacheStore(Path(td) / "decode_cache.sqlite")
+            base = {
+                "backend_id": "vllm",
+                "fingerprint_hash": "fp",
+                "prompt_hash": "ph",
+                "sampling_hash": "sh",
+            }
+            store.set(
+                org_id="org-a",
+                **base,
+                output_text="tenant-a",
+                tokens_out=1,
+                decode_ms=1.0,
+                total_ms=2.0,
+                updated_at=1.0,
+            )
+            store.set(
+                org_id="org-b",
+                **base,
+                output_text="tenant-b",
+                tokens_out=1,
+                decode_ms=1.1,
+                total_ms=2.1,
+                updated_at=2.0,
+            )
+            row_a = store.get(org_id="org-a", **base)
+            row_b = store.get(org_id="org-b", **base)
+            self.assertIsNotNone(row_a)
+            self.assertIsNotNone(row_b)
+            self.assertEqual(str(row_a["output_text"]), "tenant-a")
+            self.assertEqual(str(row_b["output_text"]), "tenant-b")
+
 
 if __name__ == "__main__":
     unittest.main()

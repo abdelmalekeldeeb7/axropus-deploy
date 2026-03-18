@@ -238,7 +238,35 @@ class Router:
         )
         char_estimate = int(math.ceil(float(len(prompt)) / chars_per_token_floor))
         mult_estimate = int(math.ceil(float(prompt_tokens) * multiplier))
-        return max(prompt_tokens, char_estimate, mult_estimate)
+        frag_scale = self._parse_positive_float(
+            os.environ.get("KORITH_CONTEXT_FRAGMENTATION_SCALE", "3.0"),
+            3.0,
+        )
+        frag_max_multiplier = self._parse_positive_float(
+            os.environ.get("KORITH_CONTEXT_FRAGMENTATION_MAX_MULTIPLIER", "4.0"),
+            4.0,
+        )
+        min_frag_len = self._parse_nonnegative_int(
+            os.environ.get("KORITH_CONTEXT_FRAGMENTATION_MIN_TOKEN_LEN", "12"),
+            12,
+        )
+        undercount_ratio = self._parse_positive_float(
+            os.environ.get("KORITH_CONTEXT_FRAGMENTATION_UNDERCOUNT_RATIO", "0.80"),
+            0.80,
+        )
+        words = [w for w in prompt.split() if w]
+        risky = 0
+        for token in words:
+            has_digit = any(ch.isdigit() for ch in token)
+            if "_" in token or "-" in token or has_digit or len(token) >= min_frag_len:
+                risky += 1
+        risky_ratio = float(risky) / float(max(1, len(words)))
+        frag_multiplier = min(frag_max_multiplier, 1.0 + (risky_ratio * frag_scale))
+        fragment_estimate = prompt_tokens
+        # Apply fragmentation boost only when base count is likely underestimating.
+        if float(prompt_tokens) < (float(char_estimate) * undercount_ratio):
+            fragment_estimate = int(math.ceil(float(prompt_tokens) * frag_multiplier))
+        return max(prompt_tokens, char_estimate, mult_estimate, fragment_estimate)
 
     def _validate_context_budget(self, jobspec: Dict[str, Any], prompt: str, prompt_tokens: int) -> None:
         det = jobspec.get("deterministic_cfg", {}) or {}

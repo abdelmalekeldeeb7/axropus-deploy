@@ -8,6 +8,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .cluster_worker import ClusterWorker
+from .amf_coordinator_client import AmfCoordinatorClient
 from .config import (
     apply_config_to_env,
     build_artifacts,
@@ -21,6 +22,25 @@ from .config import (
 )
 from ..adapters.registry import AdapterRegistry
 from ..observability.metrics import GLOBAL_METRICS
+from ..observability.metrics_exporter import render_worker_amf_metrics
+
+
+def _amf_health_payload(worker: ClusterWorker | None) -> dict:
+    if worker is None or not hasattr(worker, "amf_health"):
+        return {"cache_entries": 0, "cache_bytes": 0, "hit_rate": 0.0, "warm_ratio": 0.0, "ready": False}
+    try:
+        payload = worker.amf_health()
+        if isinstance(payload, dict):
+            return {
+                "cache_entries": int(payload.get("cache_entries", 0) or 0),
+                "cache_bytes": int(payload.get("cache_bytes", 0) or 0),
+                "hit_rate": float(payload.get("hit_rate", 0.0) or 0.0),
+                "warm_ratio": float(payload.get("warm_ratio", 0.0) or 0.0),
+                "ready": bool(payload.get("ready", False)),
+            }
+    except Exception:
+        pass
+    return {"cache_entries": 0, "cache_bytes": 0, "hit_rate": 0.0, "warm_ratio": 0.0, "ready": False}
 
 
 class WorkerHandler(BaseHTTPRequestHandler):
@@ -51,8 +71,22 @@ class WorkerHandler(BaseHTTPRequestHandler):
             worker = WorkerHandler.worker
             self._send(200, {"gpu_id": worker.gpu_id if worker else -1, "inflight": getattr(worker, "_inflight", 0)})
             return
+        if self.path == "/health/amf":
+            worker = WorkerHandler.worker
+            self._send(200, _amf_health_payload(worker))
+            return
         if self.path == "/metrics":
-            data = GLOBAL_METRICS.render_prometheus().encode("utf-8")
+            text = GLOBAL_METRICS.render_prometheus()
+            if str(os.environ.get("KORITH_METRICS_ENABLED", "0")).strip().lower() in ("1", "true", "yes", "on"):
+                worker = WorkerHandler.worker
+                if worker is not None and hasattr(worker, "amf_metrics_snapshot"):
+                    try:
+                        extra = render_worker_amf_metrics(worker.amf_metrics_snapshot())
+                        if extra:
+                            text += "\n" + extra
+                    except Exception:
+                        pass
+            data = text.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; version=0.0.4")
             self.send_header("Content-Length", str(len(data)))
@@ -107,6 +141,14 @@ def run_worker(worker_id: str, gpu_id: int, host: str, port: int, config_path: s
         node_registry=node_registry,
         node_id=resolved_node_id,
         host=host,
+        amf_coordinator_client=(
+            AmfCoordinatorClient(
+                os.environ.get("KORITH_AMF_COORDINATOR_URL", "").strip(),
+                timeout_s=float(os.environ.get("KORITH_AMF_COORDINATOR_TIMEOUT_S", "0.25") or 0.25),
+            )
+            if str(os.environ.get("KORITH_AMF_DISTRIBUTED", "0")).strip().lower() in ("1", "true", "yes", "on")
+            else None
+        ),
     )
     worker.start()
 

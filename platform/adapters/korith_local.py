@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import subprocess
 import time
@@ -66,7 +67,62 @@ class Tier1LocalKorithAdapter(BackendAdapter):
             draft_supported=True,
         )
 
+    @staticmethod
+    def _safe_positive_float(raw: str, default: float) -> float:
+        try:
+            value = float(raw)
+        except Exception:
+            return default
+        return value if value > 0.0 else default
+
+    @staticmethod
+    def _safe_positive_int(raw: str, default: int) -> int:
+        try:
+            value = int(raw)
+        except Exception:
+            return default
+        return value if value > 0 else default
+
+    def _estimate_prompt_tokens(self, prompt: str) -> int:
+        # Conservative estimate for context admission: protects against subword
+        # fragmentation for token-like corpora (e.g., d7_t123 patterns).
+        words = [w for w in prompt.split() if w]
+        word_count = max(1, len(words))
+        byte_len = len(prompt.encode("utf-8"))
+
+        chars_per_token_floor = self._safe_positive_float(
+            os.environ.get("KORITH_TOKEN_EST_CHARS_PER_TOKEN_FLOOR", "3.5"),
+            3.5,
+        )
+        byte_est = int(math.ceil(float(byte_len) / chars_per_token_floor))
+
+        min_frag_len = self._safe_positive_int(
+            os.environ.get("KORITH_TOKEN_EST_FRAGMENT_MIN_LEN", "12"),
+            12,
+        )
+        frag_scale = self._safe_positive_float(
+            os.environ.get("KORITH_TOKEN_EST_FRAGMENT_SCALE", "3.0"),
+            3.0,
+        )
+        frag_max_multiplier = self._safe_positive_float(
+            os.environ.get("KORITH_TOKEN_EST_FRAGMENT_MAX_MULTIPLIER", "4.0"),
+            4.0,
+        )
+
+        risky = 0
+        for token in words:
+            has_digit = any(ch.isdigit() for ch in token)
+            if "_" in token or "-" in token or has_digit or len(token) >= min_frag_len:
+                risky += 1
+        risky_ratio = float(risky) / float(word_count)
+        frag_multiplier = min(frag_max_multiplier, 1.0 + (risky_ratio * frag_scale))
+        fragment_est = int(math.ceil(float(word_count) * frag_multiplier))
+
+        return max(1, word_count, byte_est, fragment_est)
+
     def tokenize(self, prompt: str) -> int:
+        # Keep routing token count comparable with other lightweight adapters.
+        # Router-level budget validation applies conservative overflow guards.
         return max(1, len(prompt.split()))
 
     def run_baseline(
@@ -362,6 +418,12 @@ class Tier1LocalKorithAdapter(BackendAdapter):
         env["KORITH_ENGINE_EVENTS_PATH"] = artifacts["engine_events"]
         env["KORITH_MF_SNAPSHOT_OUT"] = artifacts["mf_snapshot"]
         env["KORITH_JOB_ID"] = Path(artifacts["job_dir"]).name
+        tenant_raw = str(policy.get("_tenant_id", policy.get("tenant_id", "default")) or "default").strip()
+        tenant_id = "".join(
+            ch if (ch.isalnum() or ch in ("-", "_", ".")) else "_"
+            for ch in tenant_raw
+        )[:128] or "default"
+        env["KORITH_TENANT_ID"] = tenant_id
 
         if mf_snapshot_in:
             env["KORITH_MF_SNAPSHOT_IN"] = mf_snapshot_in
@@ -388,7 +450,36 @@ class Tier1LocalKorithAdapter(BackendAdapter):
         default_amf_path = (platform_root / "amf_store").resolve()
         amf_path = Path(os.environ.get("KORITH_PLATFORM_AMF_PATH", str(default_amf_path))).resolve()
         amf_path.mkdir(parents=True, exist_ok=True)
-        env["KORITH_AMF_PATH"] = str(amf_path)
+        amf_tenant_isolation = str(os.environ.get("KORITH_AMF_TENANT_ISOLATION", "0")).strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        amf_shared_enabled = str(os.environ.get("KORITH_AMF_SHARED_PREFIXES", "0")).strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        tenant_namespace = tenant_id
+        if amf_shared_enabled:
+            patterns_raw = str(os.environ.get("KORITH_AMF_SHARED_PREFIX_PATTERNS", "") or "").strip()
+            if patterns_raw:
+                patterns = [p.strip() for p in patterns_raw.split(",") if p.strip()]
+                if any(prompt.startswith(p) for p in patterns):
+                    tenant_namespace = "__shared__"
+        if amf_tenant_isolation:
+            tenant_path = (amf_path / tenant_namespace).resolve()
+            tenant_path.mkdir(parents=True, exist_ok=True)
+            env["KORITH_AMF_PATH"] = str(tenant_path)
+            env["KORITH_AMF_TENANT_ISOLATION"] = "1"
+            per_tenant_budget = str(os.environ.get("KORITH_AMF_PER_TENANT_BUDGET_GB", "") or "").strip()
+            if per_tenant_budget:
+                env["KORITH_AMF_STORAGE_BUDGET_GB"] = per_tenant_budget
+        else:
+            env["KORITH_AMF_PATH"] = str(amf_path)
+            env["KORITH_AMF_TENANT_ISOLATION"] = "0"
 
         engine_cfg = engine_cfg or {}
         spec_cfg = spec_cfg or {}
@@ -400,8 +491,19 @@ class Tier1LocalKorithAdapter(BackendAdapter):
         env["KORITH_KERNEL_VERIFY"] = kernel_verify
         if mode in ("accel", "spec"):
             env["KORITH_ACCEL_ENABLED"] = "1"
-            env["KORITH_CUDA_DEVICE"] = str(engine_cfg.get("cuda_device", os.environ.get("KORITH_CUDA_DEVICE", "0")))
             env["KORITH_CUDA_DTYPE"] = str(engine_cfg.get("cuda_dtype", os.environ.get("KORITH_CUDA_DTYPE", "fp16")))
+            # Multi-GPU: tensor_split distributes model layers across GPUs via llama.cpp
+            tensor_split = engine_cfg.get("tensor_split", os.environ.get("KORITH_TENSOR_SPLIT", ""))
+            n_gpus = int(engine_cfg.get("n_gpus", os.environ.get("KORITH_N_GPUS", "1")))
+            if tensor_split and n_gpus > 1:
+                env["KORITH_TENSOR_SPLIT"] = tensor_split
+                env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in range(n_gpus))
+                env["KORITH_MAIN_GPU"] = str(engine_cfg.get("main_gpu", 0))
+            else:
+                env["KORITH_CUDA_DEVICE"] = str(engine_cfg.get("cuda_device", os.environ.get("KORITH_CUDA_DEVICE", "0")))
+            # FP8 KV cache
+            if engine_cfg.get("kv_fp8") or os.environ.get("KORITH_KV_FP8"):
+                env["KORITH_KV_FP8"] = "1"
             env["KORITH_KV_LAYOUT_VERSION"] = str(
                 engine_cfg.get("kv_layout_version", os.environ.get("KORITH_KV_LAYOUT_VERSION", "v1"))
             )
@@ -486,6 +588,28 @@ class Tier1LocalKorithAdapter(BackendAdapter):
             except json.JSONDecodeError as exc:
                 engine_errors.append(f"engine_metrics_json_decode_failed:{exc}")
                 engine_metrics = {}
+        if proc.returncode != 0:
+            det_n_ctx = 0
+            det_max_tokens = 0
+            reserve_tokens = 64
+            try:
+                det_n_ctx = int(deterministic_cfg.get("n_ctx", 0) or 0)
+            except Exception:
+                det_n_ctx = 0
+            try:
+                det_max_tokens = int(max_tokens or deterministic_cfg.get("max_tokens", 0) or 0)
+            except Exception:
+                det_max_tokens = 0
+            try:
+                reserve_tokens = int(os.environ.get("KORITH_CONTEXT_RESERVE_TOKENS", "64") or 64)
+            except Exception:
+                reserve_tokens = 64
+            prompt_tokens_est = self._estimate_prompt_tokens(prompt)
+            required_ctx = prompt_tokens_est + max(0, det_max_tokens) + max(0, reserve_tokens)
+            if det_n_ctx > 0 and required_ctx >= det_n_ctx:
+                engine_errors.append(
+                    f"context_overflow_estimated:required_ctx={required_ctx}:available_ctx={det_n_ctx}:prompt_tokens_est={prompt_tokens_est}"
+                )
 
         if mode == "accel" and isinstance(engine_metrics, dict):
             engine_metrics.setdefault("engine", {})

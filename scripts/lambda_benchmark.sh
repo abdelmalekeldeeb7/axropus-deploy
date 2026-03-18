@@ -160,7 +160,7 @@ from pathlib import Path
 
 out_path = Path(sys.argv[1])
 count = int(sys.argv[2])
-tokens = ["axropus"] * count
+tokens = ["a"] * count
 prompt = " ".join(tokens)
 out_path.write_text(prompt, encoding="utf-8")
 if len(prompt.split()) != count:
@@ -605,6 +605,41 @@ main() {
     "amf_fp8_native_spec|AMF + FP8 KV + Native Spec|1|1|1|1|1|1|0"
     "amf_fp8_native_spec_sched|AMF + FP8 KV + Native Spec + Scheduler|1|1|1|1|1|1|1"
   )
+
+  # Optional: restrict execution to a subset of scenario IDs.
+  # Example:
+  #   SCENARIO_IDS_CSV=amf_only
+  #   SCENARIO_IDS_CSV=baseline,amf_only,amf_fp8
+  if [[ -n "${SCENARIO_IDS_CSV:-}" ]]; then
+    local -a selected=()
+    local -a wanted=()
+    local wanted_raw
+    IFS=',' read -r -a wanted_raw <<<"${SCENARIO_IDS_CSV}"
+    local w
+    for w in "${wanted_raw[@]}"; do
+      w="${w//[[:space:]]/}"
+      if [[ -n "${w}" ]]; then
+        wanted+=("${w}")
+      fi
+    done
+
+    local row sid
+    for row in "${scenarios[@]}"; do
+      IFS='|' read -r sid _ <<<"${row}"
+      for w in "${wanted[@]}"; do
+        if [[ "${sid}" == "${w}" ]]; then
+          selected+=("${row}")
+          break
+        fi
+      done
+    done
+
+    if [[ "${#selected[@]}" -eq 0 ]]; then
+      die "SCENARIO_IDS_CSV did not match any known scenario ids"
+    fi
+    scenarios=("${selected[@]}")
+    log "scenario filter active ids=${SCENARIO_IDS_CSV} count=${#scenarios[@]}"
+  fi
 
   local row
   for row in "${scenarios[@]}"; do

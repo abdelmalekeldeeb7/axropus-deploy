@@ -70,3 +70,24 @@ def estimate_savings(metrics: Dict, gpu_hourly_cost: float) -> Dict[str, float]:
         "cost_saved_usd": cost_saved,
         "cost_total_usd": cost_total,
     }
+
+
+def estimate_tenant_savings(
+    *,
+    total_saved_ms: float,
+    total_compute_ms: float,
+    gpu_hourly_cost: float,
+) -> Dict[str, float]:
+    saved_ms = max(0.0, _safe_float(total_saved_ms))
+    compute_ms = max(0.0, _safe_float(total_compute_ms))
+    gpu_cost_per_ms = (max(0.0, float(gpu_hourly_cost)) / 3_600_000.0)
+    baseline_ms = saved_ms + compute_ms
+    savings_pct = (saved_ms / baseline_ms * 100.0) if baseline_ms > 0.0 else 0.0
+    return {
+        "saved_ms": saved_ms,
+        "compute_ms": compute_ms,
+        "gpu_cost_per_ms": gpu_cost_per_ms,
+        "cost_saved_usd": saved_ms * gpu_cost_per_ms,
+        "cost_served_usd": compute_ms * gpu_cost_per_ms,
+        "savings_pct": savings_pct,
+    }

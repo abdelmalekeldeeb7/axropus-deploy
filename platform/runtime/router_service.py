@@ -4,6 +4,7 @@ import argparse
 import os
 
 from .cluster_router import ClusterRouter
+from .amf_coordinator_client import AmfCoordinatorClient
 from .node_router import NodeRouter, serve_node_router
 from ..gateway.auth import require_api_key_salt_configured
 from .config import (
@@ -43,6 +44,14 @@ def run_router(host: str, port: int, config_path: str | None = None) -> None:
         adapter_registry=adapters,
         node_registry=node_registry,
         snapshot_index=snapshot_index,
+        amf_coordinator_client=(
+            AmfCoordinatorClient(
+                os.environ.get("KORITH_AMF_COORDINATOR_URL", "").strip(),
+                timeout_s=float(os.environ.get("KORITH_AMF_COORDINATOR_TIMEOUT_S", "0.25") or 0.25),
+            )
+            if str(os.environ.get("KORITH_AMF_DISTRIBUTED", "0")).strip().lower() in ("1", "true", "yes", "on")
+            else None
+        ),
         transfer_bandwidth_mbps=float(os.environ.get("KORITH_SNAPSHOT_BW_MBPS", "200")),
         transfer_rtt_ms=float(os.environ.get("KORITH_SNAPSHOT_RTT_MS", "5")),
         transfer_threshold=float(os.environ.get("KORITH_TRANSFER_VS_RECOMPUTE_THRESHOLD", "0.8")),

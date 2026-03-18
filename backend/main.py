@@ -15,6 +15,7 @@ from .db import SessionLocal, init_db
 from .billing import router as billing_router
 from .dashboard import router as dashboard_router
 from .deploy import router as deploy_router
+from .inference import router as inference_router
 from .keys import router as keys_router
 from .metrics import router as metrics_router
 
@@ -69,6 +70,7 @@ def create_app() -> FastAPI:
     app.include_router(benchmarks_router)
     app.include_router(keys_router)
     app.include_router(deploy_router)
+    app.include_router(inference_router)
     app.include_router(metrics_router)
     app.include_router(dashboard_router)
     app.include_router(billing_router)

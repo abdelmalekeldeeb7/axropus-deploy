@@ -54,6 +54,7 @@ class Deployment(Base):
     model_family: Mapped[str] = mapped_column(String(64), nullable=False)
     model_size: Mapped[str] = mapped_column(String(64), nullable=False)
     draft_model: Mapped[str | None] = mapped_column(Text, nullable=True)
+    inference_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False)
     deployed_at: Mapped[str | None] = mapped_column(DateTime(timezone=False), nullable=True)
 

@@ -259,6 +259,170 @@ std::string json_escape(const std::string & s) {
   return out.str();
 }
 
+bool env_truthy(const char * name, bool default_value = false) {
+  const char * raw = std::getenv(name);
+  if (!raw || raw[0] == '\0') {
+    return default_value;
+  }
+  const std::string v(raw);
+  return v == "1" || v == "true" || v == "TRUE" || v == "yes" || v == "on";
+}
+
+std::string collapse_whitespace_for_amf(const std::string & input, bool * changed) {
+  std::string out;
+  out.reserve(input.size());
+  bool in_space = false;
+  for (unsigned char ch : input) {
+    if (std::isspace(ch) != 0) {
+      in_space = true;
+      continue;
+    }
+    if (in_space && !out.empty()) {
+      out.push_back(' ');
+    }
+    in_space = false;
+    out.push_back(static_cast<char>(ch));
+  }
+  if (changed) {
+    *changed = (out != input);
+  }
+  return out;
+}
+
+std::string replace_all(std::string input,
+                        const std::string & needle,
+                        const std::string & value,
+                        bool * changed) {
+  if (needle.empty()) {
+    return input;
+  }
+  std::size_t pos = 0;
+  while ((pos = input.find(needle, pos)) != std::string::npos) {
+    input.replace(pos, needle.size(), value);
+    pos += value.size();
+    if (changed) {
+      *changed = true;
+    }
+  }
+  return input;
+}
+
+std::string normalize_unicode_nfc_for_amf(const std::string & input, bool * changed) {
+  std::string out = input;
+  if (changed) {
+    *changed = false;
+  }
+  // Best-effort UTF-8 NFC collapsing for common accent combinations.
+  out = replace_all(out, "A\xCC\x81", "\xC3\x81", changed);  // A + acute
+  out = replace_all(out, "a\xCC\x81", "\xC3\xA1", changed);  // a + acute
+  out = replace_all(out, "E\xCC\x81", "\xC3\x89", changed);  // E + acute
+  out = replace_all(out, "e\xCC\x81", "\xC3\xA9", changed);  // e + acute
+  out = replace_all(out, "I\xCC\x81", "\xC3\x8D", changed);  // I + acute
+  out = replace_all(out, "i\xCC\x81", "\xC3\xAD", changed);  // i + acute
+  out = replace_all(out, "O\xCC\x81", "\xC3\x93", changed);  // O + acute
+  out = replace_all(out, "o\xCC\x81", "\xC3\xB3", changed);  // o + acute
+  out = replace_all(out, "U\xCC\x81", "\xC3\x9A", changed);  // U + acute
+  out = replace_all(out, "u\xCC\x81", "\xC3\xBA", changed);  // u + acute
+  out = replace_all(out, "N\xCC\x83", "\xC3\x91", changed);  // N + tilde
+  out = replace_all(out, "n\xCC\x83", "\xC3\xB1", changed);  // n + tilde
+  out = replace_all(out, "C\xCC\xA7", "\xC3\x87", changed);  // C + cedilla
+  out = replace_all(out, "c\xCC\xA7", "\xC3\xA7", changed);  // c + cedilla
+  return out;
+}
+
+struct PromptCanonicalizationResult {
+  std::string text;
+  bool whitespace_changed = false;
+  bool unicode_changed = false;
+};
+
+PromptCanonicalizationResult canonicalize_prompt_for_amf(const std::string & input) {
+  PromptCanonicalizationResult out{};
+  out.text = input;
+
+  if (env_truthy("KORITH_AMF_NORMALIZE_WHITESPACE", true)) {
+    out.text = collapse_whitespace_for_amf(out.text, &out.whitespace_changed);
+  }
+  if (env_truthy("KORITH_AMF_NORMALIZE_UNICODE", true)) {
+    out.text = normalize_unicode_nfc_for_amf(out.text, &out.unicode_changed);
+  }
+  return out;
+}
+
+std::string sanitize_tenant_id_for_amf(std::string tenant_id) {
+  if (tenant_id.empty()) {
+    return "default";
+  }
+  for (char & ch : tenant_id) {
+    const bool ok =
+        (ch >= 'a' && ch <= 'z') ||
+        (ch >= 'A' && ch <= 'Z') ||
+        (ch >= '0' && ch <= '9') ||
+        ch == '-' || ch == '_' || ch == '.';
+    if (!ok) {
+      ch = '_';
+    }
+  }
+  if (tenant_id.size() > 128) {
+    tenant_id.resize(128);
+  }
+  return tenant_id;
+}
+
+std::vector<std::string> split_csv_patterns(const std::string & csv) {
+  std::vector<std::string> out;
+  std::string current;
+  for (char ch : csv) {
+    if (ch == ',') {
+      if (!current.empty()) {
+        out.push_back(current);
+      }
+      current.clear();
+      continue;
+    }
+    current.push_back(ch);
+  }
+  if (!current.empty()) {
+    out.push_back(current);
+  }
+  return out;
+}
+
+bool prompt_matches_shared_patterns(const std::string & prompt_text) {
+  const char * raw = std::getenv("KORITH_AMF_SHARED_PREFIX_PATTERNS");
+  if (!raw || raw[0] == '\0') {
+    return false;
+  }
+  const std::vector<std::string> patterns = split_csv_patterns(raw);
+  for (const std::string & pattern : patterns) {
+    if (pattern.empty()) {
+      continue;
+    }
+    if (prompt_text.rfind(pattern, 0) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+std::size_t find_last_subsequence(const std::vector<llama_token> & haystack,
+                                  const std::vector<llama_token> & needle) {
+  if (needle.empty() || haystack.size() < needle.size()) {
+    return static_cast<std::size_t>(-1);
+  }
+  std::size_t i = haystack.size() - needle.size();
+  while (true) {
+    if (std::equal(needle.begin(), needle.end(), haystack.begin() + static_cast<std::ptrdiff_t>(i))) {
+      return i;
+    }
+    if (i == 0) {
+      break;
+    }
+    --i;
+  }
+  return static_cast<std::size_t>(-1);
+}
+
 void emit_engine_event(const char * type, const std::string & payload_json) {
   if (!type || !type[0]) {
     return;
@@ -988,6 +1152,7 @@ void fallback_decode_cb(korith::core::Context & ctx) {
 }
 
 void shutdown_unlocked() {
+  g.amf.shutdown();
   korith::core::cuda_graph_decode_invalidate_all();
 
   if (g.batch_draft_inited) {
@@ -1701,6 +1866,9 @@ void log_run_summary_unlocked() {
   const korith::core::AmfStats & stats = g.amf.stats();
   const double denom = static_cast<double>(stats.hits + stats.misses);
   const double hit_rate = (denom > 0.0) ? (static_cast<double>(stats.hits) / denom) : 0.0;
+  const double warm_ratio = g.amf.warm_ratio();
+  const bool prewarm_complete = g.amf.prewarm_complete();
+  const bool amf_ready_now = prewarm_complete || (hit_rate > 0.5);
   double avg_roi_ema = std::numeric_limits<double>::quiet_NaN();
   if (std::isfinite(stats.restore_ms_ema) && stats.restore_ms_ema > 0.0 &&
       std::isfinite(stats.saved_ms_ema)) {
@@ -1726,10 +1894,14 @@ void log_run_summary_unlocked() {
 
   std::fprintf(stderr,
                "[KORITH_HEALTH] hit_rate=%.3f avg_skip_ratio=%.3f avg_roi_ema=%.3f "
+               "warm_ratio=%.3f prewarm_complete=%d ready=%d "
                "roi_slope=%.4f evictions=%llu mf_updates=%llu replay_disables=%llu\n",
                hit_rate,
                avg_skip_ratio,
                avg_roi_ema,
+               warm_ratio,
+               prewarm_complete ? 1 : 0,
+               amf_ready_now ? 1 : 0,
                g.amf_roi_slope_ema,
                static_cast<unsigned long long>(g.amf_eviction_events),
                static_cast<unsigned long long>(g.mf_policy_updates),
@@ -1810,6 +1982,11 @@ void log_run_summary_unlocked() {
     out << "\"amf\":{"
         << "\"supported\":" << (g.amf_ready ? "true" : "false") << ","
         << "\"decision\":\"" << json_escape(g.last_amf_decision) << "\","
+        << "\"cache_entries\":" << static_cast<unsigned long long>(stats.entries) << ","
+        << "\"hit_rate\":" << finite_or_zero(hit_rate) << ","
+        << "\"warm_ratio\":" << finite_or_zero(warm_ratio) << ","
+        << "\"prewarm_complete\":" << (prewarm_complete ? "true" : "false") << ","
+        << "\"ready\":" << (amf_ready_now ? "true" : "false") << ","
         << "\"prefix_len\":" << g.last_prefix_len << ","
         << "\"skipped_tokens\":" << g.last_skipped_tokens << ","
         << "\"skip_ratio\":" << finite_or_zero(g.last_skip_ratio) << ","
@@ -1972,9 +2149,19 @@ bool engine_init(const char * model_path) {
     llama_model_params mparams = llama_model_default_params();
     if (llama_supports_gpu_offload()) {
       mparams.n_gpu_layers = 999;  // clamped internally
-      mparams.main_gpu = 0;
+      const char* main_gpu_env = std::getenv("KORITH_MAIN_GPU");
+      mparams.main_gpu = main_gpu_env ? std::atoi(main_gpu_env) : 0;
     } else {
       mparams.n_gpu_layers = 0;
+    }
+    static std::vector<float> s_tensor_split;
+    if (const char* ts_env = std::getenv("KORITH_TENSOR_SPLIT")) {
+      s_tensor_split.clear();
+      std::istringstream ss(ts_env);
+      std::string tok;
+      while (std::getline(ss, tok, ','))
+        s_tensor_split.push_back(std::stof(tok));
+      mparams.tensor_split = s_tensor_split.data();
     }
 
     g.model_target = llama_model_load_from_file(paths.target.c_str(), mparams);
@@ -2275,6 +2462,21 @@ bool engine_init(const char * model_path) {
         korith::core::amf_float_bits(llama_model_rope_freq_scale_train(g.model_target));
     g.amf_ctx.sampling_hash = amf_sampling_hash();
     g.amf_ctx.rng_hash = amf_rng_hash();
+    g.amf_ctx.tenant_hash = 0;
+    if (env_truthy("KORITH_AMF_TENANT_ISOLATION", false)) {
+      std::string tenant_id = "default";
+      if (const char * env = std::getenv("KORITH_TENANT_ID")) {
+        if (env[0] != '\0') {
+          tenant_id = sanitize_tenant_id_for_amf(std::string(env));
+        }
+      }
+      g.amf_ctx.tenant_hash = korith::core::amf_hash_tenant_id(tenant_id);
+      std::fprintf(stderr,
+                   "[AMF_TENANT] tenant_id=%s tenant_hash=%016llx\n",
+                   tenant_id.c_str(),
+                   static_cast<unsigned long long>(g.amf_ctx.tenant_hash));
+      (void) std::fflush(stderr);
+    }
     bool amf_flag = false;
     if (const char * env = std::getenv("KORITH_ENABLE_AMF")) {
       amf_flag = (env[0] != '\0') && (env[0] != '0');
@@ -2301,7 +2503,6 @@ bool engine_init(const char * model_path) {
         if (korith::core::memory_field_state_from_json(snapshot_json, &restored)) {
           g.memory_field = restored;
           g.amf.set_min_admit_roi(g.memory_field.last.min_admit_roi);
-          g.amf.set_eviction_pressure(g.memory_field.last.eviction_pressure);
           g.amf_replay_disable_mask = g.memory_field.last.replay_disable_mask;
           if ((g.amf_replay_disable_mask & 0x1u) != 0u) {
             const std::uint64_t now_ms = now_epoch_ms();
@@ -2335,9 +2536,13 @@ bool engine_init(const char * model_path) {
     const char * prompt_env = std::getenv("KORITH_PROMPT");
     std::vector<llama_token> prompt_tokens;
     std::string prompt_file_text;
+    std::string prompt_text;
+    std::string canonical_prompt_text;
+    bool prompt_loaded = false;
     if (prompt_file_env && prompt_file_env[0] != '\0') {
       if (load_text_file(prompt_file_env, prompt_file_text)) {
-        prompt_tokens = tokenize_prompt(g.vocab_target, prompt_file_text.c_str());
+        prompt_text = prompt_file_text;
+        prompt_loaded = true;
       } else {
         std::fprintf(stderr, "[PROMPT_LOAD_FAILED] path=%s reason=read_failed\n", prompt_file_env);
         (void) std::fflush(stderr);
@@ -2345,11 +2550,64 @@ bool engine_init(const char * model_path) {
               json_escape(prompt_file_env) + "\",\"reason\":\"read_failed\"}");
       }
     }
-    if (prompt_tokens.empty() && prompt_env && prompt_env[0] != '\0') {
-      prompt_tokens = tokenize_prompt(g.vocab_target, prompt_env);
+    if (!prompt_loaded && prompt_env && prompt_env[0] != '\0') {
+      prompt_text = prompt_env;
+      prompt_loaded = true;
+    }
+    if (prompt_loaded && !prompt_text.empty()) {
+      const PromptCanonicalizationResult canon = canonicalize_prompt_for_amf(prompt_text);
+      canonical_prompt_text = canon.text;
+      if (canon.whitespace_changed || canon.unicode_changed) {
+        std::string changes;
+        if (canon.whitespace_changed) {
+          changes = "whitespace";
+        }
+        if (canon.unicode_changed) {
+          if (!changes.empty()) {
+            changes += ",";
+          }
+          changes += "unicode";
+        }
+        std::fprintf(stderr,
+                     "[AMF_CANONICALIZE] changes=%s original_len=%zu canonical_len=%zu\n",
+                     changes.c_str(),
+                     prompt_text.size(),
+                     canon.text.size());
+        (void) std::fflush(stderr);
+      }
+      prompt_tokens = tokenize_prompt(g.vocab_target, canon.text.c_str());
     }
 
     if (!prompt_tokens.empty()) {
+      korith::core::AmfContext amf_ctx_request = g.amf_ctx;
+      std::vector<llama_token> amf_lookup_tokens = prompt_tokens;
+      bool amf_prefix_extracted = false;
+      if (env_truthy("KORITH_AMF_SHARED_PREFIXES", false) &&
+          prompt_matches_shared_patterns(canonical_prompt_text)) {
+        amf_ctx_request.tenant_hash = korith::core::amf_hash_tenant_id("__shared__");
+      }
+      if (env_truthy("KORITH_AMF_PREFIX_EXTRACTION", false)) {
+        const char * boundary_raw = std::getenv("KORITH_AMF_PREFIX_BOUNDARY_TOKEN");
+        std::string boundary = boundary_raw ? boundary_raw : "";
+        if (boundary.empty()) {
+          boundary = "<|user|>";
+        }
+        const std::vector<llama_token> boundary_tokens =
+            tokenize_prompt(g.vocab_target, boundary.c_str());
+        const std::size_t boundary_at = find_last_subsequence(prompt_tokens, boundary_tokens);
+        if (boundary_at != static_cast<std::size_t>(-1)) {
+          amf_prefix_extracted = true;
+          amf_lookup_tokens.assign(
+              prompt_tokens.begin(),
+              prompt_tokens.begin() + static_cast<std::ptrdiff_t>(boundary_at));
+          std::fprintf(stderr,
+                       "[AMF_PREFIX] total_tokens=%zu prefix_tokens=%zu boundary=\"%s\"\n",
+                       prompt_tokens.size(),
+                       amf_lookup_tokens.size(),
+                       boundary.c_str());
+          (void) std::fflush(stderr);
+        }
+      }
       g.last_prompt_tokens = prompt_tokens.size();
       g.last_amf_decision = g.amf_ready ? "miss" : "unavailable";
       if (!g.amf_ready) {
@@ -2428,13 +2686,14 @@ bool engine_init(const char * model_path) {
           g.last_amf_decision = "blocked";
           emit_engine_event("AMF_BLOCK", "{\"reason\":\"non_deterministic\"}");
         } else {
-          const std::uint64_t prompt_hash = korith::core::amf_hash_tokens(prompt_tokens);
-          lookup = g.amf.find_longest_prefix(g.amf_ctx, prompt_tokens, &hit_entry, &hit_tokens);
+          const std::uint64_t prompt_hash = korith::core::amf_hash_tokens(amf_lookup_tokens);
+          lookup = g.amf.find_longest_prefix(amf_ctx_request, amf_lookup_tokens, &hit_entry, &hit_tokens);
           std::fprintf(stderr,
-                       "[AMF_KEY] result=%s model_hash=%llx prompt_hash=%llx n_ctx=%u n_batch=%u "
+                       "[AMF_KEY] result=%s model_hash=%llx tenant_hash=%llx prompt_hash=%llx n_ctx=%u n_batch=%u "
                        "rope_base=0x%08x rope_scale=0x%08x sampling_hash=%llx seed=%llx\n",
                        korith::core::amf_lookup_reason_name(lookup),
                        static_cast<unsigned long long>(g.amf_ctx.model_hash),
+                       static_cast<unsigned long long>(amf_ctx_request.tenant_hash),
                        static_cast<unsigned long long>(prompt_hash),
                        g.amf_ctx.n_ctx,
                        static_cast<unsigned int>(llama_n_batch(g.ctx_target)),
@@ -2611,6 +2870,17 @@ bool engine_init(const char * model_path) {
                                    restore_ms,
                                    saved_ms);
                     }
+                    if (amf_prefix_extracted &&
+                        static_cast<std::size_t>(hit_entry.prefix_len) < amf_lookup_tokens.size()) {
+                      const std::size_t cached_prefix = static_cast<std::size_t>(hit_entry.prefix_len);
+                      const std::size_t full_prefix = amf_lookup_tokens.size();
+                      const std::size_t compute_tokens = full_prefix - cached_prefix;
+                      std::fprintf(stderr,
+                                   "[AMF_PARTIAL_HIT] full_prefix=%zu cached_prefix=%zu compute_tokens=%zu\n",
+                                   full_prefix,
+                                   cached_prefix,
+                                   compute_tokens);
+                    }
                     std::fprintf(stderr,
                                  "[AMF_HIT] prefix_tokens=%u skipped_tokens=%u baseline_ms=%.2f "
                                  "restore_ms=%.2f saved_ms=%.2f roi=%.2f\n",
@@ -2721,12 +2991,14 @@ amf_skip_lookup:
         g.token_prefix_hash = hash_token_prefix_step(g.token_prefix_hash, tok);
       }
 
+      const std::vector<llama_token> & amf_store_tokens =
+          amf_prefix_extracted ? amf_lookup_tokens : prompt_tokens;
       const bool amf_prefix_extended =
           used_amf &&
           hit_entry.prefix_len > 0 &&
-          static_cast<std::size_t>(hit_entry.prefix_len) < prompt_tokens.size();
+          static_cast<std::size_t>(hit_entry.prefix_len) < amf_store_tokens.size();
       if (g.amf_ready &&
-          prompt_tokens.size() >= g.amf.min_tokens() &&
+          amf_store_tokens.size() >= g.amf.min_tokens() &&
           (!used_amf || amf_prefix_extended)) {
         const std::size_t size = llama_state_get_size(g.ctx_target);
         if (size > 0) {
@@ -2734,8 +3006,8 @@ amf_skip_lookup:
           const std::size_t got = llama_state_get_data(g.ctx_target, kv_blob.data(), kv_blob.size());
           if (got == kv_blob.size()) {
             if (g.amf.store_entry(
-                g.amf_ctx,
-                prompt_tokens,
+                amf_ctx_request,
+                amf_store_tokens,
                 kv_blob.data(),
                 kv_blob.size(),
                 admit_saved_ms)) {
@@ -2744,7 +3016,7 @@ amf_skip_lookup:
                 std::fprintf(stderr,
                              "[AMF_ADMIT_UPGRADE] old_prefix=%u new_prefix=%zu\n",
                              hit_entry.prefix_len,
-                             prompt_tokens.size());
+                             amf_store_tokens.size());
                 (void) std::fflush(stderr);
               }
             }
@@ -2774,6 +3046,28 @@ amf_skip_lookup:
                      static_cast<unsigned long long>(stats.entries),
                      static_cast<unsigned long long>(stats.bytes));
         (void) std::fflush(stderr);
+        const korith::core::AmfStorageStats storage = g.amf.storage_stats(now_ms);
+        std::fprintf(stderr,
+                     "[AMF_STORAGE] total_bytes=%llu budget_bytes=%llu utilization=%.2f%% hot=%llu warm=%llu cold=%llu "
+                     "disk_free_bytes=%llu disk_capacity_bytes=%llu disk_free_pct=%.2f%% low_disk=%d\n",
+                     static_cast<unsigned long long>(storage.total_bytes),
+                     static_cast<unsigned long long>(storage.budget_bytes),
+                     storage.utilization * 100.0,
+                     static_cast<unsigned long long>(storage.hot_entries),
+                     static_cast<unsigned long long>(storage.warm_entries),
+                     static_cast<unsigned long long>(storage.cold_entries),
+                     static_cast<unsigned long long>(storage.disk_free_bytes),
+                     static_cast<unsigned long long>(storage.disk_capacity_bytes),
+                     storage.disk_free_ratio * 100.0,
+                     storage.low_disk ? 1 : 0);
+        (void) std::fflush(stderr);
+        if (storage.low_disk) {
+          std::fprintf(stderr,
+                       "[AMF_ALERT] type=disk_pressure free_bytes=%llu free_pct=%.2f%%\n",
+                       static_cast<unsigned long long>(storage.disk_free_bytes),
+                       storage.disk_free_ratio * 100.0);
+          (void) std::fflush(stderr);
+        }
       }
 
       if (g.amf_ready) {
@@ -2809,8 +3103,9 @@ amf_skip_lookup:
         mf_in.evictions = stats.evictions;
         mf_in.evicted_bytes = stats.evicted_bytes;
         mf_in.entries = stats.entries;
-        mf_in.bytes = stats.bytes;
-        mf_in.max_bytes = g.amf.max_bytes();
+        const korith::core::AmfStorageStats storage = g.amf.storage_stats(now_ms);
+        mf_in.bytes = storage.total_bytes;
+        mf_in.max_bytes = storage.budget_bytes;
         mf_in.oldest_entry_age_ms = g.amf.oldest_entry_age_ms(now_ms);
         mf_in.negative_roi_streak = static_cast<std::uint64_t>(g.amf_negative_roi_hits);
 
@@ -2822,7 +3117,6 @@ amf_skip_lookup:
           g.mf_policy_updates += 1;
           const std::uint32_t prev_mask = g.amf_replay_disable_mask;
           g.amf.set_min_admit_roi(mf_out.min_admit_roi);
-          g.amf.set_eviction_pressure(mf_out.eviction_pressure);
 
           if ((mf_out.replay_disable_mask & 0x1u) != 0u) {
             g.amf_replay_disable_mask = mf_out.replay_disable_mask;

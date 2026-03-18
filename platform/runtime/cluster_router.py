@@ -16,6 +16,7 @@ from ..cluster.node_registry import NodeRegistry
 from ..cluster.snapshot_index import SnapshotIndex
 from ..cluster.snapshot_transfer import estimate_transfer_ms
 from ..economics.model import extract_savings_components
+from ..economics.tenant_meter import TenantMeter
 from ..ledger.store import LedgerStore
 from ..observability.metrics import GLOBAL_METRICS
 from ..observability.platform_logging import emit_log
@@ -55,6 +56,14 @@ def sha256_str(data: str) -> str:
     return hashlib.sha256(data.encode("utf-8")).hexdigest()
 
 
+def fnv1a64_str(data: str) -> str:
+    h = 1469598103934665603
+    for b in data.encode("utf-8", errors="ignore"):
+        h ^= int(b)
+        h = (h * 1099511628211) & 0xFFFFFFFFFFFFFFFF
+    return f"{h:016x}"
+
+
 def _bucket_ceil(value: int, bucket: int) -> int:
     if bucket <= 0:
         return max(0, int(value))
@@ -73,6 +82,7 @@ class ClusterRouter:
         adapter_registry: AdapterRegistry,
         node_registry: Optional[NodeRegistry] = None,
         snapshot_index: Optional[SnapshotIndex] = None,
+        amf_coordinator_client = None,
         transfer_bandwidth_mbps: float = 200.0,
         transfer_rtt_ms: float = 5.0,
         transfer_threshold: float = 0.8,
@@ -85,12 +95,14 @@ class ClusterRouter:
         self.adapter_registry = adapter_registry
         self.node_registry = node_registry
         self.snapshot_index = snapshot_index
+        self.amf_coordinator_client = amf_coordinator_client
         self.transfer_bandwidth_mbps = max(1.0, float(transfer_bandwidth_mbps))
         self.transfer_rtt_ms = max(0.0, float(transfer_rtt_ms))
         self.transfer_threshold = max(0.1, float(transfer_threshold))
         self._session_affinity: Dict[str, Dict[str, str]] = {}
         self._fingerprint_affinity: Dict[str, Dict[str, str]] = {}
         self._shape_affinity: Dict[str, Dict[str, str]] = {}
+        self._worker_amf_ready: Dict[str, bool] = {}
         self._rr = 0
 
     def submit(
@@ -98,10 +110,12 @@ class ClusterRouter:
         jobspec: Dict[str, Any],
         org_id: Optional[str] = None,
         request_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
     ) -> str:
         route_start = time.time()
         self._validate_jobspec(jobspec)
         resolved_org_id = org_id or self._extract_org_id(jobspec)
+        resolved_tenant_id = tenant_id or self._extract_tenant_id(jobspec, resolved_org_id)
         request_id = request_id or str(uuid.uuid4())
 
         idempotency_key = jobspec.get("idempotency_key")
@@ -114,6 +128,7 @@ class ClusterRouter:
         created_at = utc_now()
         prompt = self._render_prompt(jobspec)
         prompt_hash = sha256_str(prompt)
+        amf_lookup_hash = fnv1a64_str(f"{resolved_tenant_id}:{prompt}")
         sampling_hash = sha256_str(json.dumps(jobspec.get("deterministic_cfg", {}), sort_keys=True))
 
         adapter = self.adapter_registry.get_adapter(jobspec)
@@ -133,6 +148,8 @@ class ClusterRouter:
             jobspec=jobspec,
             fingerprint_hash=fingerprint_hash,
             org_id=resolved_org_id,
+            tenant_id=resolved_tenant_id,
+            amf_lookup_hash=amf_lookup_hash,
             predicted_lane=predicted_lane,
             shape_key=shape_key,
         )
@@ -164,6 +181,7 @@ class ClusterRouter:
             "job_id": job_id,
             "created_at": created_at,
             "org_id": resolved_org_id,
+            "tenant_id": resolved_tenant_id,
             "request_id": request_id,
             "backend_id": jobspec["backend_id"],
             "backend_version": adapter.backend_version,
@@ -203,6 +221,8 @@ class ClusterRouter:
                 "transfer_from_tier": str(routing.get("transfer_from_tier", "")),
                 "execution_backend_id": execution_backend_id,
                 "execution_reason": execution_reason,
+                "tenant_id": resolved_tenant_id,
+                "amf_lookup_hash": amf_lookup_hash,
             },
         }
 
@@ -230,6 +250,7 @@ class ClusterRouter:
             {
                 "job_id": job_id,
                 "org_id": resolved_org_id,
+                "tenant_id": resolved_tenant_id,
                 "request_id": request_id,
                 "worker_id": chosen_worker_id,
                 "node_id": chosen_node_id,
@@ -248,6 +269,7 @@ class ClusterRouter:
                 "worker_id": chosen_worker_id,
                 "session_id": jobspec.get("session_id", ""),
                 "org_id": resolved_org_id,
+                "tenant_id": resolved_tenant_id,
                 "request_id": request_id,
                 "latency_ms": (time.time() - route_start) * 1000.0,
                 "lane": lane,
@@ -263,12 +285,15 @@ class ClusterRouter:
             "lane": lane,
             "target_node_id": chosen_node_id,
             "target_worker_id": chosen_worker_id,
+            "tenant_id": resolved_tenant_id,
+            "amf_lookup_hash": amf_lookup_hash,
             "force_miss": bool(routing.get("force_miss", False)),
             "snapshot_transfer": {
                 "requested": bool(routing.get("transfer_requested", False)),
                 "from_node_id": routing.get("transfer_from_node_id", ""),
                 "fingerprint_hash": fingerprint_hash,
                 "org_id": resolved_org_id,
+                "tenant_id": resolved_tenant_id,
             },
             "enqueued_at": time.time(),
             "request_id": request_id,
@@ -386,22 +411,46 @@ class ClusterRouter:
         fingerprint_hash: str,
         org_id: str,
         predicted_lane: str,
+        tenant_id: str = "default",
+        amf_lookup_hash: str = "",
         shape_key: str = "",
     ) -> Dict[str, Any]:
         nodes = self.node_registry.list_nodes() if self.node_registry else []
         workers = self.registry.list_workers()
+        self._track_worker_amf_status(workers)
         lane_workers = self._workers_for_lane(workers, predicted_lane)
         if not lane_workers:
             if self._router_bool("KORITH_ROUTER_STRICT_WORKER_LANES", False):
                 raise RuntimeError(f"no workers available for lane={predicted_lane}")
             lane_workers = workers
+        is_hit_lane = predicted_lane in ("HIT", "SPEC_HIT")
+        is_miss_lane = predicted_lane in ("MISS", "SPEC_MISS")
+        amf_ready_preferred = False
+        ready_worker_ids = {
+            str(w.get("worker_id", "") or "")
+            for w in workers
+            if bool(self._worker_amf_health(w).get("ready", False))
+        }
+        if is_hit_lane and ready_worker_ids and len(ready_worker_ids) < len(workers):
+            warm_lane_workers = [w for w in lane_workers if str(w.get("worker_id", "") or "") in ready_worker_ids]
+            if warm_lane_workers:
+                lane_workers = warm_lane_workers
+                amf_ready_preferred = True
+            if nodes:
+                ready_node_ids = {
+                    str(w.get("node_id", "") or "")
+                    for w in workers
+                    if str(w.get("worker_id", "") or "") in ready_worker_ids
+                }
+                warm_nodes = [n for n in nodes if str(n.get("node_id", "") or "") in ready_node_ids]
+                if warm_nodes:
+                    nodes = warm_nodes
+                    amf_ready_preferred = True
         worker_ids = {str(w.get("worker_id") or "") for w in workers if str(w.get("worker_id") or "")}
         lane_worker_ids = {str(w.get("worker_id") or "") for w in lane_workers if str(w.get("worker_id") or "")}
         node_ids = {str(n.get("node_id") or "") for n in nodes if str(n.get("node_id") or "")}
         self._prune_affinity_state(worker_ids=worker_ids, node_ids=node_ids)
 
-        is_hit_lane = predicted_lane in ("HIT", "SPEC_HIT")
-        is_miss_lane = predicted_lane in ("MISS", "SPEC_MISS")
         locations = self.snapshot_index.get_locations(fingerprint_hash, org_id) if (self.snapshot_index and is_hit_lane) else []
         session_id = str(jobspec.get("session_id") or "")
         fingerprint_key = f"{org_id}:{fingerprint_hash}"
@@ -427,6 +476,49 @@ class ClusterRouter:
         if nodes:
             by_node = {n["node_id"]: n for n in nodes}
             chosen: Dict[str, Any]
+            coordinator_rows: list[Dict[str, Any]] = []
+            if (
+                self.amf_coordinator_client is not None
+                and bool(getattr(self.amf_coordinator_client, "enabled", False))
+                and bool(amf_lookup_hash)
+            ):
+                try:
+                    coordinator_rows = self.amf_coordinator_client.lookup(amf_lookup_hash, tenant_id)
+                except Exception:
+                    coordinator_rows = []
+            if coordinator_rows:
+                candidate_nodes = [row for row in coordinator_rows if str(row.get("node_id", "") or "") in by_node]
+                if candidate_nodes:
+                    candidate_nodes.sort(
+                        key=lambda row: (
+                            int(by_node[str(row.get("node_id", "") or "")].get("inflight", 0) or 0),
+                            int(by_node[str(row.get("node_id", "") or "")].get("queue_depth_hit", 0) or 0),
+                        )
+                    )
+                    selected = candidate_nodes[0]
+                    selected_node_id = str(selected.get("node_id", "") or "")
+                    selected_worker_id = self._resolve_worker_id(
+                        str(selected.get("worker_id", "") or ""),
+                        lane_worker_ids,
+                    )
+                    if not selected_worker_id:
+                        selected_worker_id = self._pick_worker_for_node(selected_node_id, lane_workers)
+                    if not selected_worker_id:
+                        selected_worker_id = self._pick_worker_for_node(selected_node_id, workers)
+                    if selected_worker_id:
+                        return {
+                            "chosen_node_id": selected_node_id,
+                            "chosen_worker_id": selected_worker_id,
+                            "reason": "amf_coordinator_cache",
+                            "predicted_lane": predicted_lane,
+                            "final_lane": predicted_lane,
+                            "affinity_hit": False,
+                            "fingerprint_affinity_hit": False,
+                            "shape_affinity_hit": False,
+                            "replay_local": predicted_lane in ("HIT", "SPEC_HIT"),
+                            "amf_ready_preferred": bool(amf_ready_preferred),
+                            "coordinator_lookup": True,
+                        }
             prefer_replay_local = (
                 is_hit_lane
                 and bool(locations)
@@ -599,6 +691,7 @@ class ClusterRouter:
                     replay_local = False
             chosen["replay_local"] = bool(replay_local)
             chosen.setdefault("shape_affinity_hit", False)
+            chosen["amf_ready_preferred"] = bool(amf_ready_preferred)
             return chosen
 
         # Backward-compatible single-node/worker mode.
@@ -619,6 +712,7 @@ class ClusterRouter:
             "affinity_hit": reason == "worker_affinity",
             "fingerprint_affinity_hit": reason == "fingerprint_affinity",
             "shape_affinity_hit": reason == "shape_affinity",
+            "amf_ready_preferred": bool(amf_ready_preferred),
         }
         if session_id:
             self._session_affinity[session_id] = {
@@ -645,6 +739,52 @@ class ClusterRouter:
     def _workers_for_lane(self, workers: list, lane: str) -> list:
         lane_up = str(lane).upper()
         return [w for w in workers if self._worker_supports_lane(w, lane_up)]
+
+    def _worker_amf_health(self, worker: Dict[str, Any]) -> Dict[str, Any]:
+        caps = worker.get("capabilities", {}) if isinstance(worker.get("capabilities", {}), dict) else {}
+        try:
+            cache_entries = int(caps.get("amf_cache_entries", 0) or 0)
+        except Exception:
+            cache_entries = 0
+        try:
+            hit_rate = float(caps.get("amf_hit_rate", 0.0) or 0.0)
+        except Exception:
+            hit_rate = 0.0
+        try:
+            warm_ratio = float(caps.get("amf_warm_ratio", 0.0) or 0.0)
+        except Exception:
+            warm_ratio = 0.0
+        prewarm_complete = bool(caps.get("amf_prewarm_complete", False))
+        ready = bool(caps.get("amf_ready", False) or prewarm_complete or hit_rate > 0.5)
+        return {
+            "ready": ready,
+            "cache_entries": max(0, cache_entries),
+            "hit_rate": max(0.0, min(1.0, hit_rate)),
+            "warm_ratio": max(0.0, min(1.0, warm_ratio)),
+        }
+
+    def _track_worker_amf_status(self, workers: list) -> None:
+        current_ids = set()
+        for worker in workers:
+            worker_id = str(worker.get("worker_id", "") or "")
+            if not worker_id:
+                continue
+            current_ids.add(worker_id)
+            health = self._worker_amf_health(worker)
+            ready = bool(health.get("ready", False))
+            prev = self._worker_amf_ready.get(worker_id)
+            if prev is None or prev != ready:
+                node_id = str(worker.get("node_id", "") or "")
+                status = "warm" if ready else "warming"
+                print(
+                    f"[ROUTER_AMF] node={node_id} status={status} "
+                    f"entries={int(health.get('cache_entries', 0))} "
+                    f"hit_rate={float(health.get('hit_rate', 0.0)):.3f}"
+                )
+            self._worker_amf_ready[worker_id] = ready
+        for stale_id in list(self._worker_amf_ready.keys()):
+            if stale_id not in current_ids:
+                self._worker_amf_ready.pop(stale_id, None)
 
     def _worker_supports_lane(self, worker: Dict[str, Any], lane: str) -> bool:
         caps = worker.get("capabilities", {}) if isinstance(worker.get("capabilities", {}), dict) else {}
@@ -1036,6 +1176,95 @@ class ClusterRouter:
             },
         }
 
+    def tenant_metrics(
+        self,
+        tenant_id: str,
+        *,
+        org_id: Optional[str] = None,
+        limit: int = 5000,
+        gpu_hourly_cost: float = 2.5,
+        period_start: str = "",
+        period_end: str = "",
+    ) -> Dict[str, Any]:
+        resolved_org_id = str(org_id or "default")
+        tenant_safe = self._extract_tenant_id({"tenant_id": tenant_id}, resolved_org_id)
+        meter = TenantMeter(tenant_id=tenant_safe)
+        jobs = self.ledger.list_jobs(limit=max(1, int(limit)), org_id=resolved_org_id)
+
+        min_started = period_start.strip()
+        max_finished = period_end.strip()
+        for job in jobs:
+            job_id = str(job.get("job_id") or "")
+            if not job_id:
+                continue
+            rec = self.ledger.get_job(job_id) or {}
+            jobspec = rec.get("jobspec", {}) if isinstance(rec.get("jobspec", {}), dict) else {}
+            job_tenant = self._extract_tenant_id(jobspec, str(rec.get("org_id", resolved_org_id)))
+            if job_tenant != tenant_safe:
+                continue
+            run = self.ledger.get_latest_run(job_id)
+            if not run:
+                continue
+            metrics_path = str(run.get("metrics_path") or "")
+            if not metrics_path:
+                continue
+            p = Path(metrics_path)
+            if not p.exists():
+                continue
+            try:
+                metrics = json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            meter.accumulate(metrics)
+            started = str(run.get("started_at") or "")
+            finished = str(run.get("finished_at") or "")
+            if started and (not min_started or started < min_started):
+                min_started = started
+            if finished and (not max_finished or finished > max_finished):
+                max_finished = finished
+
+        return meter.summary(
+            gpu_hourly_cost=float(gpu_hourly_cost),
+            period_start=min_started,
+            period_end=max_finished,
+        )
+
+    def billing_report(
+        self,
+        *,
+        org_id: str = "default",
+        tenant_id: str = "",
+        limit: int = 5000,
+        gpu_hourly_cost: float = 2.5,
+    ) -> Dict[str, Any]:
+        org = str(org_id or "default")
+        tenants: set[str] = set()
+        if tenant_id:
+            tenants.add(self._extract_tenant_id({"tenant_id": tenant_id}, org))
+        else:
+            jobs = self.ledger.list_jobs(limit=max(1, int(limit)), org_id=org)
+            for job in jobs:
+                job_id = str(job.get("job_id") or "")
+                if not job_id:
+                    continue
+                rec = self.ledger.get_job(job_id) or {}
+                jobspec = rec.get("jobspec", {}) if isinstance(rec.get("jobspec", {}), dict) else {}
+                tenants.add(self._extract_tenant_id(jobspec, org))
+        reports = [
+            self.tenant_metrics(
+                tenant,
+                org_id=org,
+                limit=limit,
+                gpu_hourly_cost=gpu_hourly_cost,
+            )
+            for tenant in sorted(tenants)
+        ]
+        return {
+            "generated_at": utc_now(),
+            "org_id": org,
+            "reports": reports,
+        }
+
     def create_key(
         self,
         key_id: str,
@@ -1085,6 +1314,19 @@ class ClusterRouter:
         owner = jobspec.get("owner") or {}
         org_id = owner.get("org_id") or jobspec.get("org_id") or "default"
         return str(org_id)
+
+    def _extract_tenant_id(self, jobspec: Dict[str, Any], default_org_id: str = "default") -> str:
+        owner = jobspec.get("owner") or {}
+        tenant_id = owner.get("tenant_id") or jobspec.get("tenant_id") or default_org_id or "default"
+        tenant = str(tenant_id or "default").strip() or "default"
+        # Keep namespace path-safe and deterministic across services.
+        safe = "".join(
+            ch if (ch.isalnum() or ch in ("-", "_", ".")) else "_"
+            for ch in tenant
+        )
+        if not safe:
+            safe = "default"
+        return safe[:128]
 
     def _fingerprint(self, jobspec: Dict[str, Any], adapter) -> Dict[str, Any]:
         fp = adapter.get_fingerprint()
@@ -1154,7 +1396,35 @@ class ClusterRouter:
         )
         char_estimate = int(math.ceil(float(len(prompt)) / chars_per_token_floor))
         mult_estimate = int(math.ceil(float(prompt_tokens) * multiplier))
-        return max(prompt_tokens, char_estimate, mult_estimate)
+        frag_scale = self._parse_positive_float(
+            os.environ.get("KORITH_CONTEXT_FRAGMENTATION_SCALE", "3.0"),
+            3.0,
+        )
+        frag_max_multiplier = self._parse_positive_float(
+            os.environ.get("KORITH_CONTEXT_FRAGMENTATION_MAX_MULTIPLIER", "4.0"),
+            4.0,
+        )
+        min_frag_len = self._parse_nonnegative_int(
+            os.environ.get("KORITH_CONTEXT_FRAGMENTATION_MIN_TOKEN_LEN", "12"),
+            12,
+        )
+        undercount_ratio = self._parse_positive_float(
+            os.environ.get("KORITH_CONTEXT_FRAGMENTATION_UNDERCOUNT_RATIO", "0.80"),
+            0.80,
+        )
+        words = [w for w in prompt.split() if w]
+        risky = 0
+        for token in words:
+            has_digit = any(ch.isdigit() for ch in token)
+            if "_" in token or "-" in token or has_digit or len(token) >= min_frag_len:
+                risky += 1
+        risky_ratio = float(risky) / float(max(1, len(words)))
+        frag_multiplier = min(frag_max_multiplier, 1.0 + (risky_ratio * frag_scale))
+        fragment_estimate = prompt_tokens
+        # Apply fragmentation boost only when base count is likely underestimating.
+        if float(prompt_tokens) < (float(char_estimate) * undercount_ratio):
+            fragment_estimate = int(math.ceil(float(prompt_tokens) * frag_multiplier))
+        return max(prompt_tokens, char_estimate, mult_estimate, fragment_estimate)
 
     def _validate_context_budget(self, jobspec: Dict[str, Any], prompt: str, prompt_tokens: int) -> None:
         det = jobspec.get("deterministic_cfg", {}) or {}

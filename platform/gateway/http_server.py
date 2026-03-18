@@ -14,6 +14,7 @@ from ..gateway.auth import AuthContext, AuthError, authenticate
 from ..gateway.auth import require_api_key_salt_configured
 from ..gateway.rate_limit import build_rate_limiter
 from ..observability.metrics import GLOBAL_METRICS
+from ..observability.metrics_exporter import render_router_amf_metrics
 from ..observability.platform_logging import emit_log
 
 
@@ -29,18 +30,29 @@ class KorithHandler(BaseHTTPRequestHandler):
     router = None
     _soft_limit_lock = threading.Lock()
     _soft_limit_seen: Dict[str, float] = {}
+    _tenant_rps_lock = threading.Lock()
+    _tenant_rps_state: Dict[str, tuple[int, int]] = {}
 
     def _request_id(self) -> str:
         rid = self.headers.get("X-Request-Id") or self.headers.get("x-request-id")
         return rid.strip() if rid else str(uuid.uuid4())
 
-    def _send(self, code: int, payload: Dict[str, Any], request_id: Optional[str] = None) -> None:
+    def _send(
+        self,
+        code: int,
+        payload: Dict[str, Any],
+        request_id: Optional[str] = None,
+        headers: Optional[Dict[str, str]] = None,
+    ) -> None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
         if request_id:
             self.send_header("X-Request-Id", request_id)
+        if headers:
+            for name, value in headers.items():
+                self.send_header(str(name), str(value))
         self.end_headers()
         self.wfile.write(data)
 
@@ -68,6 +80,48 @@ class KorithHandler(BaseHTTPRequestHandler):
                 },
             )
             raise
+
+    def _tenant_id(self, auth_ctx: AuthContext) -> str:
+        raw = self.headers.get("X-Axropus-Tenant-Id") or self.headers.get("x-axropus-tenant-id") or ""
+        tenant = str(raw or auth_ctx.org_id or "default").strip() or "default"
+        safe = "".join(ch if (ch.isalnum() or ch in ("-", "_", ".")) else "_" for ch in tenant)
+        if not safe:
+            safe = str(auth_ctx.org_id or "default")
+        return safe[:128]
+
+    def _check_tenant_rps(self, tenant_id: str) -> Optional[Dict[str, Any]]:
+        raw = str(os.environ.get("KORITH_AMF_TENANT_RATE_LIMIT_RPS", "") or "").strip()
+        if not raw:
+            return None
+        try:
+            limit = int(raw)
+        except Exception:
+            return None
+        if limit <= 0:
+            return None
+        now_sec = int(time.time())
+        retry_after = 1
+        with KorithHandler._tenant_rps_lock:
+            sec, count = KorithHandler._tenant_rps_state.get(tenant_id, (now_sec, 0))
+            if sec != now_sec:
+                sec, count = now_sec, 0
+            if count >= limit:
+                KorithHandler._tenant_rps_state[tenant_id] = (sec, count)
+                # keep the map bounded by dropping stale windows.
+                stale = [k for k, (ts, _) in KorithHandler._tenant_rps_state.items() if ts < (now_sec - 2)]
+                for key in stale:
+                    KorithHandler._tenant_rps_state.pop(key, None)
+                return {
+                    "error": "tenant rate limit exceeded",
+                    "tenant_id": tenant_id,
+                    "limit_rps": limit,
+                    "retry_after": retry_after,
+                }
+            KorithHandler._tenant_rps_state[tenant_id] = (sec, count + 1)
+            stale = [k for k, (ts, _) in KorithHandler._tenant_rps_state.items() if ts < (now_sec - 2)]
+            for key in stale:
+                KorithHandler._tenant_rps_state.pop(key, None)
+        return None
 
     def _check_limits(self, org_id: str, token_estimate: int, ctx: AuthContext, request_id: str) -> Optional[Dict[str, Any]]:
         decision = RATE_LIMITER.check_and_consume(
@@ -205,7 +259,16 @@ class KorithHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/metrics":
-            data = GLOBAL_METRICS.render_prometheus().encode("utf-8")
+            text = GLOBAL_METRICS.render_prometheus()
+            if str(os.environ.get("KORITH_METRICS_ENABLED", "0")).strip().lower() in ("1", "true", "yes", "on"):
+                try:
+                    workers = KorithHandler.router.get_workers() if hasattr(KorithHandler.router, "get_workers") else []
+                    extra = render_router_amf_metrics(workers)
+                    if extra:
+                        text += "\n" + extra
+                except Exception:
+                    pass
+            data = text.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; version=0.0.4")
             self.send_header("Content-Length", str(len(data)))
@@ -321,6 +384,22 @@ class KorithHandler(BaseHTTPRequestHandler):
                     request_id=request_id,
                 )
                 return
+        if path.startswith("/v1/metrics/tenant/"):
+            parts = path.split("/")
+            tenant_id = parts[4] if len(parts) > 4 else ""
+            if not tenant_id:
+                self._send(400, {"error": "tenant_id required"}, request_id=request_id)
+                return
+            if hasattr(KorithHandler.router, "tenant_metrics"):
+                self._send(
+                    200,
+                    KorithHandler.router.tenant_metrics(
+                        tenant_id,
+                        org_id=auth_ctx.org_id,
+                    ),
+                    request_id=request_id,
+                )
+                return
         if path.startswith("/v1/jobs/"):
             parts = path.split("/")
             job_id = parts[3] if len(parts) > 3 else ""
@@ -398,13 +477,30 @@ class KorithHandler(BaseHTTPRequestHandler):
             if "owner" not in job or not isinstance(job["owner"], dict):
                 job["owner"] = {}
             job["owner"]["org_id"] = auth_ctx.org_id
+            tenant_id = self._tenant_id(auth_ctx)
+            job["owner"]["tenant_id"] = tenant_id
+            job["tenant_id"] = tenant_id
+            tenant_blocked = self._check_tenant_rps(tenant_id)
+            if tenant_blocked:
+                self._send(
+                    429,
+                    tenant_blocked,
+                    request_id=request_id,
+                    headers={"Retry-After": str(int(tenant_blocked.get("retry_after", 1) or 1))},
+                )
+                return
             token_estimate = self._estimate_tokens(job)
             blocked = self._check_limits(auth_ctx.org_id, token_estimate, auth_ctx, request_id)
             if blocked:
                 self._send(429, blocked, request_id=request_id)
                 return
             try:
-                job_id = KorithHandler.router.submit(job, org_id=auth_ctx.org_id, request_id=request_id)
+                job_id = KorithHandler.router.submit(
+                    job,
+                    org_id=auth_ctx.org_id,
+                    request_id=request_id,
+                    tenant_id=tenant_id,
+                )
             except ValueError as exc:
                 status_code = int(getattr(exc, "status_code", 400) or 400)
                 if hasattr(exc, "to_payload") and callable(getattr(exc, "to_payload")):
@@ -414,6 +510,34 @@ class KorithHandler(BaseHTTPRequestHandler):
                 self._send(status_code, payload, request_id=request_id)
                 return
             self._send(200, {"job_id": job_id, "request_id": request_id}, request_id=request_id)
+            return
+        if parsed.path == "/v1/billing/report":
+            if not hasattr(KorithHandler.router, "billing_report"):
+                self._send(404, {"error": "not found"}, request_id=request_id)
+                return
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length).decode("utf-8", errors="replace") if length > 0 else "{}"
+            payload: Dict[str, Any]
+            try:
+                payload = json.loads(body) if body.strip() else {}
+            except Exception:
+                payload = {}
+            tenant_id = str(payload.get("tenant_id", "") or "")
+            try:
+                gpu_hourly_cost = float(payload.get("gpu_hourly_cost", 2.5) or 2.5)
+            except Exception:
+                gpu_hourly_cost = 2.5
+            try:
+                limit = int(payload.get("limit", 5000) or 5000)
+            except Exception:
+                limit = 5000
+            report = KorithHandler.router.billing_report(
+                org_id=auth_ctx.org_id,
+                tenant_id=tenant_id,
+                limit=limit,
+                gpu_hourly_cost=gpu_hourly_cost,
+            )
+            self._send(200, report, request_id=request_id)
             return
         if parsed.path.startswith("/v1/jobs/") and parsed.path.endswith("/restore"):
             job_id = parsed.path.split("/")[3]

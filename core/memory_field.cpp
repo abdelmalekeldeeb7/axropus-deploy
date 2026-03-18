@@ -64,7 +64,8 @@ double clamp_range(double v, double lo, double hi) {
 bool small_change(double old_v, double new_v, double rel_eps, double abs_eps) {
   const double diff = std::fabs(new_v - old_v);
   const double scale = std::max(abs_eps, std::fabs(old_v) * rel_eps);
-  return diff < scale;
+  const double fuzz = std::max(1e-12, scale * 1e-7);
+  return (diff + fuzz) < scale;
 }
 
 }  // namespace
@@ -175,7 +176,7 @@ MemoryFieldOutput memory_field_update(MemoryFieldState * state,
       }
       state->last_replay_flip_ms = now_ms;
       state->replay_flip_count = flip_count;
-      if (flip_count > 1) {
+      if (flip_count > 2) {
         next_mask = 1u;
         out.cooldown_ms = std::max(out.cooldown_ms, window_ms_effective);
       }

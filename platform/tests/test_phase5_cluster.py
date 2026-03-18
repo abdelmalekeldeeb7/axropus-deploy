@@ -50,6 +50,22 @@ class _AdapterRegistry:
         return {"korith_local": _FakeAdapter().get_capabilities().as_dict()}
 
 
+class _CoordinatorStub:
+    def __init__(self, rows=None):
+        self.enabled = True
+        self._rows = rows or []
+
+    def lookup(self, prefix_hash: str, tenant_id: str):
+        return list(self._rows)
+
+
+class _CoordinatorFailStub:
+    enabled = True
+
+    def lookup(self, prefix_hash: str, tenant_id: str):
+        raise RuntimeError("coordinator unavailable")
+
+
 class Phase5ClusterTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -244,6 +260,66 @@ class Phase5ClusterTests(unittest.TestCase):
         )
         self.assertEqual(hit_route["chosen_worker_id"], "worker-hit")
         self.assertEqual(miss_route["chosen_worker_id"], "worker-miss")
+
+    def test_hit_lane_prefers_amf_ready_workers_during_warmup(self):
+        self.workers.register("worker-cold", "127.0.0.1", 0, capabilities={"amf_ready": False})
+        self.workers.register("worker-warm", "127.0.0.1", 1, capabilities={"amf_ready": True})
+        self.workers.heartbeat("worker-cold", inflight=0, capabilities={"amf_ready": False})
+        self.workers.heartbeat("worker-warm", inflight=5, capabilities={"amf_ready": True})
+
+        hit_route = self.router._select_route(
+            jobspec={},
+            fingerprint_hash="fp-amf-warm",
+            org_id="org1",
+            predicted_lane="HIT",
+        )
+        miss_route = self.router._select_route(
+            jobspec={},
+            fingerprint_hash="fp-amf-cold",
+            org_id="org1",
+            predicted_lane="MISS",
+        )
+        self.assertEqual(hit_route["chosen_worker_id"], "worker-warm")
+        self.assertTrue(bool(hit_route.get("amf_ready_preferred", False)))
+        self.assertEqual(miss_route["chosen_worker_id"], "worker-cold")
+
+    def test_distributed_coordinator_lookup_prefers_cached_node(self):
+        self._register_nodes()
+        self.workers.register("worker-a", "127.0.0.1", 0, capabilities={}, node_id="node-a")
+        self.workers.register("worker-b", "127.0.0.1", 1, capabilities={}, node_id="node-b")
+        self.workers.heartbeat("worker-a", inflight=3, capabilities={})
+        self.workers.heartbeat("worker-b", inflight=0, capabilities={})
+        self.router.amf_coordinator_client = _CoordinatorStub(
+            rows=[{"node_id": "node-a", "worker_id": "worker-a"}]
+        )
+        route = self.router._select_route(
+            jobspec={},
+            fingerprint_hash="fp-coord",
+            org_id="org1",
+            tenant_id="tenant-a",
+            amf_lookup_hash="abc123",
+            predicted_lane="HIT",
+        )
+        self.assertEqual(route["reason"], "amf_coordinator_cache")
+        self.assertEqual(route["chosen_node_id"], "node-a")
+        self.assertEqual(route["chosen_worker_id"], "worker-a")
+
+    def test_distributed_coordinator_fail_open_falls_back_to_default_routing(self):
+        self.workers.register("worker-a", "127.0.0.1", 0, capabilities={})
+        self.workers.register("worker-b", "127.0.0.1", 1, capabilities={})
+        self.workers.heartbeat("worker-a", inflight=3, capabilities={})
+        self.workers.heartbeat("worker-b", inflight=0, capabilities={})
+        self.router.amf_coordinator_client = _CoordinatorFailStub()
+        route = self.router._select_route(
+            jobspec={},
+            fingerprint_hash="fp-coord-fail",
+            org_id="org1",
+            tenant_id="tenant-a",
+            amf_lookup_hash="abc123",
+            predicted_lane="HIT",
+        )
+        self.assertEqual(route["reason"], "least_loaded")
+        self.assertEqual(route["chosen_worker_id"], "worker-b")
 
     def test_single_node_strict_lane_filter_raises_when_no_compatible_worker(self):
         old = os.environ.get("KORITH_ROUTER_STRICT_WORKER_LANES")
@@ -751,6 +827,25 @@ class Phase5ClusterTests(unittest.TestCase):
             else:
                 os.environ["KORITH_AMF_CANONICALIZE_TEMPLATE_JSON"] = old
 
+    def test_submit_propagates_tenant_id_and_sanitizes_owner_tenant(self):
+        self.workers.register("worker-0", "127.0.0.1", 0, capabilities={})
+        jobspec = {
+            "schema_version": "korith.jobspec.v1",
+            "backend_id": "korith_local",
+            "model": {"model_id": "local-model", "model_path": "/tmp/fake.gguf"},
+            "prompt": "hello world",
+            "deterministic_cfg": {"seed": 1, "n_ctx": 1024, "n_batch": 64, "max_tokens": 16},
+            "policy": {"allow_amf_reuse": True, "allow_spec": False},
+            "owner": {"tenant_id": "tenant/alpha"},
+        }
+        self.router.submit(jobspec, org_id="org1")
+        item = self.queue.dequeue("worker-0", timeout_s=0.1)
+        self.assertIsNotNone(item)
+        payload = item.payload
+        self.assertEqual(str(payload["tenant_id"]), "tenant_alpha")
+        self.assertEqual(str(payload["job"]["tenant_id"]), "tenant_alpha")
+        self.assertEqual(str(payload["job"]["routing_decision"]["tenant_id"]), "tenant_alpha")
+
     def test_submit_routes_miss_execution_to_vllm_when_enabled(self):
         keys = (
             "KORITH_VLLM_MISS_BACKEND_ENABLED",
@@ -1211,6 +1306,106 @@ class Phase5ClusterTests(unittest.TestCase):
         self.assertIn(70, by_target)
         self.assertIn(80, by_target)
         self.assertGreater(float(by_target[70]["required_decode_cut_pct"]), 0.0)
+
+    def test_tenant_metrics_and_billing_report_are_isolated(self):
+        base = Path(self.tmp.name)
+        m_a = base / "metrics_tenant_a.json"
+        m_b = base / "metrics_tenant_b.json"
+        m_a.write_text(
+            json.dumps(
+                {
+                    "amf": {"supported": True, "decision": "hit", "saved_ms": 40.0},
+                    "perf": {"total_ms": 10.0, "decode_ms": 5.0},
+                    "savings": {
+                        "prefill_saved_ms": 40.0,
+                        "spec_saved_ms": 0.0,
+                        "kernels_saved_ms": 0.0,
+                        "total_saved_ms": 40.0,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        m_b.write_text(
+            json.dumps(
+                {
+                    "amf": {"supported": True, "decision": "miss", "saved_ms": 0.0},
+                    "perf": {"total_ms": 20.0, "decode_ms": 8.0},
+                    "savings": {
+                        "prefill_saved_ms": 0.0,
+                        "spec_saved_ms": 0.0,
+                        "kernels_saved_ms": 0.0,
+                        "total_saved_ms": 0.0,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        self.ledger.insert_job(
+            job_id="job-tenant-a",
+            created_at="2026-02-01T00:00:00Z",
+            jobspec={"schema_version": "korith.jobspec.v1", "owner": {"tenant_id": "tenant-a"}},
+            fingerprint={},
+            prompt_hash="pta",
+            fingerprint_hash="fpta",
+            idempotency_key=None,
+            status="SUCCEEDED",
+            org_id="org1",
+        )
+        self.ledger.insert_run(
+            run_id="run-tenant-a",
+            job_id="job-tenant-a",
+            started_at="2026-02-01T00:00:00Z",
+            finished_at="2026-02-01T00:01:00Z",
+            exit_code=0,
+            metrics_path=str(m_a),
+            events_path=str(base / "events_tenant_a.jsonl"),
+            output_path=str(base / "output_tenant_a.txt"),
+            log_path=str(base / "log_tenant_a.txt"),
+            org_id="org1",
+        )
+
+        self.ledger.insert_job(
+            job_id="job-tenant-b",
+            created_at="2026-02-01T00:02:00Z",
+            jobspec={"schema_version": "korith.jobspec.v1", "owner": {"tenant_id": "tenant-b"}},
+            fingerprint={},
+            prompt_hash="ptb",
+            fingerprint_hash="fptb",
+            idempotency_key=None,
+            status="SUCCEEDED",
+            org_id="org1",
+        )
+        self.ledger.insert_run(
+            run_id="run-tenant-b",
+            job_id="job-tenant-b",
+            started_at="2026-02-01T00:02:00Z",
+            finished_at="2026-02-01T00:03:00Z",
+            exit_code=0,
+            metrics_path=str(m_b),
+            events_path=str(base / "events_tenant_b.jsonl"),
+            output_path=str(base / "output_tenant_b.txt"),
+            log_path=str(base / "log_tenant_b.txt"),
+            org_id="org1",
+        )
+
+        tenant_a = self.router.tenant_metrics("tenant-a", org_id="org1", limit=10, gpu_hourly_cost=3.6)
+        self.assertEqual(str(tenant_a["tenant_id"]), "tenant-a")
+        self.assertEqual(int(tenant_a["total_requests"]), 1)
+        self.assertAlmostEqual(float(tenant_a["amf_hit_rate"]), 1.0, places=6)
+        self.assertAlmostEqual(float(tenant_a["total_saved_ms"]), 40.0, places=6)
+
+        tenant_b = self.router.tenant_metrics("tenant-b", org_id="org1", limit=10, gpu_hourly_cost=3.6)
+        self.assertEqual(str(tenant_b["tenant_id"]), "tenant-b")
+        self.assertEqual(int(tenant_b["total_requests"]), 1)
+        self.assertAlmostEqual(float(tenant_b["amf_hit_rate"]), 0.0, places=6)
+        self.assertAlmostEqual(float(tenant_b["total_saved_ms"]), 0.0, places=6)
+
+        billing = self.router.billing_report(org_id="org1", limit=10, gpu_hourly_cost=3.6)
+        self.assertEqual(str(billing["org_id"]), "org1")
+        reports = billing.get("reports", [])
+        self.assertEqual(len(reports), 2)
 
 
 if __name__ == "__main__":

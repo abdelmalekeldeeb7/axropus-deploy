@@ -248,6 +248,12 @@ class Worker:
             snapshot_id = job["job_id"]
 
         errors = engine_metrics.get("errors", [])
+        engine_errors = result.get("engine_errors", [])
+        if isinstance(engine_errors, list):
+            errors = list(errors) if isinstance(errors, list) else []
+            for item in engine_errors:
+                if isinstance(item, str) and item.strip():
+                    errors.append(item.strip())
         if int(result.get("exit_code", 0)) != 0:
             errors = list(errors) if isinstance(errors, list) else []
             errors.append(f"exit_code:{result.get('exit_code')}")

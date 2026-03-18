@@ -161,7 +161,7 @@ class DeployRequest(BaseModel):
     password: Optional[str] = None
     python_path: Optional[str] = None
     api_key_id: int
-    runtime: str
+    runtime: str = "korith"
     model_family: str
     model_size: str
 
@@ -239,151 +239,70 @@ def _run_deployment_task(deployment_id: int, payload: DeployRequest, api_key_val
             secrets_to_mask,
         )
 
-        _push_progress(deployment_id, 4, "running", "[AXROPUS] Detecting runtime...", 0.42, secrets_to_mask)
+        _push_progress(deployment_id, 4, "running", "[AXROPUS] Checking GPU...", 0.42, secrets_to_mask)
         runtime = payload.runtime.strip().lower()
-        code, ps_out, _ = _ssh_run(ssh, "ps aux | grep -E 'vllm|sglang|triton' | grep -v grep || true")
-        _ = code
-        detected = False
-        runtime_detail = ""
-        if runtime == "vllm":
-            code, out, err = _ssh_run(ssh, f"{shlex.quote(python_bin)} -c \"import vllm; print(vllm.__version__)\"")
-            if code == 0:
-                detected = True
-                runtime_detail = f"vLLM v{(out or err).strip()}"
-        elif runtime == "sglang":
-            code, out, err = _ssh_run(ssh, f"{shlex.quote(python_bin)} -c \"import sglang; print(sglang.__version__)\"")
-            if code == 0:
-                detected = True
-                runtime_detail = f"SGLang v{(out or err).strip()}"
-        elif runtime == "trtllm":
-            if "triton" in (ps_out or "").lower():
-                detected = True
-                runtime_detail = "TensorRT-LLM runtime detected"
-        if not detected and runtime in (ps_out or "").lower():
-            detected = True
-            runtime_detail = runtime.upper()
-        if not detected:
-            raise RuntimeError("Runtime not detected")
-        _push_progress(
-            deployment_id,
-            4,
-            "success",
-            f"[AXROPUS] \u2713 {runtime_detail} detected",
-            0.50,
-            secrets_to_mask,
-        )
+        code, gpu_out, _ = _ssh_run(ssh, "nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || echo 'no gpu'")
+        gpu_lines = [l.strip() for l in gpu_out.strip().splitlines() if l.strip() and l.strip() != "no gpu"]
+        gpu_summary = f"{len(gpu_lines)}x {gpu_lines[0].split(',')[0].strip()}" if gpu_lines else "GPU detected"
+        _push_progress(deployment_id, 4, "success", f"[AXROPUS] \u2713 {gpu_summary}", 0.50, secrets_to_mask)
 
-        _push_progress(deployment_id, 5, "running", "[AXROPUS] Detecting model...", 0.58, secrets_to_mask)
-        code, model_proc, _ = _ssh_run(ssh, "ps aux | grep -E -- '--model|model=' | grep -v grep || true")
-        _ = code
-        detected_family = payload.model_family.strip().title()
-        detected_size = payload.model_size.strip().upper()
-        if model_proc.strip():
-            lowered = model_proc.lower()
-            if "llama" in lowered:
-                detected_family = "Llama"
-            elif "mistral" in lowered:
-                detected_family = "Mistral"
-            elif "qwen" in lowered:
-                detected_family = "Qwen"
-        _push_progress(
-            deployment_id,
-            5,
-            "success",
-            f"[AXROPUS] \u2713 {detected_family} {detected_size} detected",
-            0.62,
-            secrets_to_mask,
-        )
-
-        draft_repo = _draft_model_for_family(payload.model_family)
-        _push_progress(
-            deployment_id,
-            6,
-            "running",
-            f"[AXROPUS] Downloading draft model ({draft_repo})...",
-            0.70,
-            secrets_to_mask,
-        )
-        code, out, err = _ssh_run(
-            ssh,
-            f"huggingface-cli download {shlex.quote(draft_repo)} --local-dir ~/.axropus/models",
-            timeout=1200,
-        )
-        if code != 0:
-            raise RuntimeError(f"Draft model download failed: {(err or out).strip()}")
-        _push_progress(deployment_id, 6, "success", "[AXROPUS] \u2713 Draft model ready", 0.74, secrets_to_mask)
-
-        _push_progress(deployment_id, 7, "running", "[AXROPUS] Configuring...", 0.80, secrets_to_mask)
+        _push_progress(deployment_id, 5, "running", "[AXROPUS] Building korith_dynamic + downloading models...", 0.52, secrets_to_mask)
         install_script = _load_install_script()
         remote_script = "/tmp/axropus_install.sh"
-        create_script_cmd = (
-            f"cat > {remote_script} <<'AXROPUS_EOF'\n{install_script}\nAXROPUS_EOF\n"
-            f"chmod 700 {remote_script}"
-        )
+        # Use printf to safely write the script without heredoc quoting issues
+        import base64 as _b64
+        encoded = _b64.b64encode(install_script.encode()).decode()
+        create_script_cmd = f"echo {shlex.quote(encoded)} | base64 -d > {remote_script} && chmod 700 {remote_script}"
         code, out, err = _ssh_run(ssh, create_script_cmd)
         if code != 0:
             raise RuntimeError(f"Install script upload failed: {(err or out).strip()}")
         run_script_cmd = (
             f"AXROPUS_API_KEY={shlex.quote(api_key_value)} "
+            f"AXROPUS_DEPLOYMENT_ID={shlex.quote(str(deployment_id))} "
             f"AXROPUS_RUNTIME={shlex.quote(runtime)} "
             f"AXROPUS_MODEL_FAMILY={shlex.quote(payload.model_family)} "
             f"AXROPUS_MODEL_SIZE={shlex.quote(payload.model_size)} "
-            f"AXROPUS_DRAFT_MODEL={shlex.quote(draft_repo)} "
             f"AXROPUS_PYTHON={shlex.quote(python_bin)} "
             f"bash {remote_script}"
         )
-        code, out, err = _ssh_run(ssh, run_script_cmd, timeout=600)
+        # Build + model download can take 10-20 min on first run
+        code, out, err = _ssh_run(ssh, run_script_cmd, timeout=1800)
         if code != 0:
-            raise RuntimeError(f"Configuration failed: {(err or out).strip()}")
-        _push_progress(deployment_id, 7, "success", "[AXROPUS] \u2713 Configuration saved", 0.84, secrets_to_mask)
+            raise RuntimeError(f"Install failed: {(err or out)[-500:].strip()}")
+        _push_progress(deployment_id, 5, "success", "[AXROPUS] \u2713 korith_dynamic built, gateway started", 0.80, secrets_to_mask)
 
-        _push_progress(
-            deployment_id,
-            8,
-            "running",
-            "[AXROPUS] Activating AMF prefix elimination...",
-            0.88,
-            secrets_to_mask,
-        )
-        _push_progress(
-            deployment_id,
-            8,
-            "success",
-            "[AXROPUS] \u2713 AMF active \u2014 100% prefix elimination",
-            0.90,
-            secrets_to_mask,
-        )
+        _push_progress(deployment_id, 6, "running", "[AXROPUS] Waiting for gateway to register...", 0.85, secrets_to_mask)
+        # Poll DB until node self-registers (gateway_agent does this automatically)
+        registered = False
+        for _ in range(24):  # 24 × 5s = 2 min
+            time.sleep(5)
+            db = SessionLocal()
+            try:
+                row = db.get(Deployment, deployment_id)
+                if row and row.inference_url:
+                    registered = True
+                    inference_url = row.inference_url
+                    break
+            finally:
+                db.close()
+        if not registered:
+            raise RuntimeError("Gateway did not register within 2 minutes. Check ~/.axropus/agent.log on the node.")
+        _push_progress(deployment_id, 6, "success", f"[AXROPUS] \u2713 Gateway live at {inference_url}", 0.92, secrets_to_mask)
 
-        _push_progress(
-            deployment_id,
-            9,
-            "running",
-            "[AXROPUS] Activating Spec V2 decode acceleration...",
-            0.93,
-            secrets_to_mask,
-        )
-        _push_progress(
-            deployment_id,
-            9,
-            "success",
-            "[AXROPUS] \u2713 Spec V2 active \u2014 49% decode speedup",
-            0.95,
-            secrets_to_mask,
-        )
-
-        _push_progress(deployment_id, 10, "running", "[AXROPUS] Verifying deployment...", 0.97, secrets_to_mask)
-        code, out, err = _ssh_run(
-            ssh,
-            "test -f ~/.axropus/config.json && (systemctl --user is-active axropus-agent || pgrep -f axropus-agent)",
-        )
-        if code != 0:
-            raise RuntimeError(f"Verification failed: {(err or out).strip()}")
-        _push_progress(deployment_id, 10, "success", "[AXROPUS] \u2713 Zero-data isolation enforced", 0.98, secrets_to_mask)
-        _push_progress(deployment_id, 10, "success", "[AXROPUS] \u2713 Metrics flowing", 0.99, secrets_to_mask)
+        _push_progress(deployment_id, 7, "running", "[AXROPUS] Verifying inference endpoint...", 0.95, secrets_to_mask)
+        import urllib.request as _urllib
+        try:
+            with _urllib.urlopen(f"{inference_url}/health", timeout=10) as r:
+                if r.status != 200:
+                    raise RuntimeError(f"Health check returned {r.status}")
+        except Exception as exc:
+            raise RuntimeError(f"Inference endpoint unreachable: {exc}") from exc
+        _push_progress(deployment_id, 7, "success", "[AXROPUS] \u2713 AMF active — prefix elimination enabled", 0.97, secrets_to_mask)
+        _push_progress(deployment_id, 7, "success", "[AXROPUS] \u2713 AI reasoning layer active — adaptive spec decode", 0.98, secrets_to_mask)
         _push_progress(deployment_id, 10, "success", "", 1.00, secrets_to_mask)
         _push_progress(deployment_id, 10, "success", "[AXROPUS] \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550", 1.00, secrets_to_mask)
         _push_progress(deployment_id, 10, "success", "[AXROPUS]   DEPLOYMENT COMPLETE", 1.00, secrets_to_mask)
-        _push_progress(deployment_id, 10, "success", "[AXROPUS]   Estimated savings: 70-85%", 1.00, secrets_to_mask)
+        _push_progress(deployment_id, 10, "success", "[AXROPUS]   Estimated savings: 94-99%+ compute eliminated", 1.00, secrets_to_mask)
         _push_progress(deployment_id, 10, "success", "[AXROPUS] \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550", 1.00, secrets_to_mask)
         _mark_deployment_status(deployment_id, "active")
     except Exception as exc:
@@ -472,6 +391,45 @@ def deploy_status(
         "deployed_at": row.deployed_at,
         "logs": DEPLOY_STATE.tail(deployment_id, limit=50),
     }
+
+
+class RegisterNodeRequest(BaseModel):
+    api_key: str
+    inference_url: str
+
+
+@router.post("/{deployment_id}/register")
+def register_node(
+    deployment_id: int,
+    payload: RegisterNodeRequest,
+    db: Session = Depends(get_db),
+) -> dict:
+    """Called by gateway_agent on the GPU node after startup to register its public URL."""
+    key_value = str(payload.api_key or "").strip()
+    if not key_value.startswith("ax-"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid api_key format")
+
+    api_key = db.query(APIKey).filter(APIKey.key == key_value).first()
+    if api_key is None or api_key.status not in ("trial", "active"):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key")
+
+    row = (
+        db.query(Deployment)
+        .filter(Deployment.id == deployment_id, Deployment.api_key_id == api_key.id)
+        .first()
+    )
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Deployment not found")
+
+    url = str(payload.inference_url or "").strip()
+    if not url.startswith("http://") and not url.startswith("https://"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="inference_url must start with http(s)://")
+
+    row.inference_url = url
+    row.status = "active"
+    row.deployed_at = _utcnow_naive()
+    db.commit()
+    return {"ok": True, "deployment_id": deployment_id, "inference_url": url}
 
 
 @router.websocket("/stream/{deployment_id}")

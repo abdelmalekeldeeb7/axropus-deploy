@@ -28,9 +28,15 @@ def _csv_env(name: str, default: str) -> list[str]:
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
+    _jwt_secret = os.getenv("AXROPUS_JWT_SECRET")
+    if not _jwt_secret:
+        raise RuntimeError(
+            "AXROPUS_JWT_SECRET environment variable is not set. "
+            "Generate one with: python -c \"import secrets; print(secrets.token_hex(32))\""
+        )
     return Settings(
         database_url=str(os.getenv("AXROPUS_DATABASE_URL", "sqlite:////data/axropus.db")),
-        jwt_secret=str(os.getenv("AXROPUS_JWT_SECRET", "change-me-in-production")),
+        jwt_secret=_jwt_secret,
         jwt_algorithm=str(os.getenv("AXROPUS_JWT_ALGORITHM", "HS256")),
         jwt_expire_minutes=int(str(os.getenv("AXROPUS_JWT_EXPIRE_MINUTES", "1440"))),
         trial_key_days=int(str(os.getenv("AXROPUS_TRIAL_KEY_DAYS", "7"))),

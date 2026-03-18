@@ -68,6 +68,16 @@ Run Commands
 - Enable spec:
   - `KORITH_SPEC_ENABLED=1 KORITH_SPEC_K=6 KORITH_SPEC_MIN_ACCEPT=0.55 KORITH_SPEC_DISABLE_AFTER_N=50 ...`
 
+GPU Profile Helpers (H100/A100)
+- Print profile env for detected GPU:
+  - `python3 scripts/amf_gpu_profile.py --profile auto --print-env`
+- Force H100 profile:
+  - `python3 scripts/amf_gpu_profile.py --profile h100 --print-env`
+- Force A100 80GB profile:
+  - `python3 scripts/amf_gpu_profile.py --profile a100-80g --print-env`
+- Run AMF benchmark loop with profile defaults:
+  - `python3 scripts/amf_gpu_profile.py --profile auto --bench --model models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf --prompt-file workloads/long_prompt.txt --runs 20 --max-tokens 128`
+
 Bench Command
 - `python3 platform/korith_platform.py bench spec --jobspec demo/jobs/ticket_triage.json --runs 10 --url http://127.0.0.1:8000 --api-key "$KORITH_API_KEY"`
 - `./scripts/spec_jobs_check.sh demo/jobs/ticket_triage.json 5 60 6`

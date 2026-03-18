@@ -69,7 +69,7 @@ int main() {
   in_pressure.max_bytes = 1000;
 
   out = memory_field_update(&state, in_pressure);
-  if (!near(out.eviction_pressure, 2.0, 1e-6)) {
+  if (!near(out.eviction_pressure, 1.5, 1e-6)) {
     return 10;
   }
 

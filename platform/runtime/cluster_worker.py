@@ -28,6 +28,11 @@ from .decode_cache_store import DecodeCacheStore
 from .registry import WorkerRegistry
 from .restore_store import RestoreStore
 
+try:
+    from ..reasoning.orchestrator import Orchestrator as _Orchestrator
+except Exception:
+    _Orchestrator = None  # type: ignore[assignment,misc]
+
 _TRUTHY = ("1", "true", "yes", "on")
 
 
@@ -200,6 +205,7 @@ class ClusterWorker:
         node_registry: Optional[NodeRegistry] = None,
         node_id: str = "",
         host: str = "localhost",
+        amf_coordinator_client = None,
     ) -> None:
         self.worker_id = worker_id
         self.gpu_id = gpu_id
@@ -213,6 +219,14 @@ class ClusterWorker:
         self.node_registry = node_registry
         self.node_id = node_id
         self.host = host
+        self._amf_coordinator_client = amf_coordinator_client
+        self._orchestrator: Optional[Any] = None
+        self._amf_coordinator_entries: Dict[str, Dict[str, Any]] = {}
+        self._amf_coordinator_heartbeat_s = max(
+            1.0,
+            float(os.environ.get("KORITH_AMF_COORDINATOR_HEARTBEAT_S", "10") or 10),
+        )
+        self._amf_coordinator_last_heartbeat = 0.0
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._inflight = 0
@@ -304,6 +318,13 @@ class ClusterWorker:
         self._decode_governor_spec_state: Dict[str, Dict[str, Any]] = {}
         self._amf_seen_by_org: Dict[str, float] = {}
         self._amf_hits_by_org: Dict[str, float] = {}
+        self._amf_cache_entries = 0
+        self._amf_cache_bytes = 0
+        self._amf_warm_ratio = 0.0
+        self._amf_prewarm_complete = False
+        self._amf_hit_rate = 0.0
+        self._amf_ready = False
+        self._tenant_saved_ms: Dict[str, float] = {}
         self._vllm_amf_infer_by_lane = os.environ.get("KORITH_VLLM_AMF_INFER_BY_LANE", "1").strip().lower() in _TRUTHY
         self._vllm_amf_miss_ema: Dict[str, float] = {}
         self._kernel_backend = resolve_kernel_backend()
@@ -763,19 +784,12 @@ class ClusterWorker:
         return {"adapter": fallback_adapter, "caps": fallback_caps, "result": fallback_result}
 
     def start(self) -> None:
-        worker_caps = {
-            "gpu_id": self.gpu_id,
-            "node_id": self.node_id,
-            "lane_role": self._worker_lane_role,
-        }
-        if self._worker_lanes:
-            worker_caps["lanes"] = list(self._worker_lanes)
         self.registry.register(
             self.worker_id,
             host=self.host,
             gpu_id=self.gpu_id,
             node_id=self.node_id,
-            capabilities=worker_caps,
+            capabilities=self._worker_capabilities(),
         )
         self._thread.start()
 
@@ -783,8 +797,79 @@ class ClusterWorker:
         self._stop.set()
         self._thread.join(timeout=2)
 
+    def _worker_capabilities(self) -> Dict[str, Any]:
+        worker_caps: Dict[str, Any] = {
+            "gpu_id": self.gpu_id,
+            "node_id": self.node_id,
+            "lane_role": self._worker_lane_role,
+            "amf_ready": bool(self._amf_ready),
+            "amf_cache_entries": int(self._amf_cache_entries),
+            "amf_cache_bytes": int(self._amf_cache_bytes),
+            "amf_hit_rate": float(self._amf_hit_rate),
+            "amf_warm_ratio": float(self._amf_warm_ratio),
+            "amf_prewarm_complete": bool(self._amf_prewarm_complete),
+        }
+        if self._worker_lanes:
+            worker_caps["lanes"] = list(self._worker_lanes)
+        return worker_caps
+
+    def _coordinator_enabled(self) -> bool:
+        client = self._amf_coordinator_client
+        return bool(client is not None and getattr(client, "enabled", False))
+
+    def _coordinator_register_entry(
+        self,
+        *,
+        tenant_id: str,
+        amf_lookup_hash: str,
+        worker_id: str,
+        metadata: Dict[str, Any],
+    ) -> None:
+        if not self._coordinator_enabled():
+            return
+        prefix_hash = str(amf_lookup_hash or "").strip().lower()
+        if not prefix_hash:
+            return
+        tenant = str(tenant_id or "default")
+        cache_key = f"{tenant}:{prefix_hash}"
+        row = {
+            "tenant_id": tenant,
+            "hash": prefix_hash,
+            "worker_id": str(worker_id or self.worker_id),
+            "metadata": dict(metadata or {}),
+        }
+        self._amf_coordinator_entries[cache_key] = row
+        try:
+            self._amf_coordinator_client.register(
+                prefix_hash=prefix_hash,
+                tenant_id=tenant,
+                node_id=self.node_id,
+                worker_id=self.worker_id,
+                metadata=row["metadata"],
+            )
+        except Exception:
+            # Fail open: request execution must continue without coordinator.
+            return
+
+    def _coordinator_heartbeat(self, force: bool = False) -> None:
+        if not self._coordinator_enabled():
+            return
+        now = time.time()
+        if not force and (now - self._amf_coordinator_last_heartbeat) < self._amf_coordinator_heartbeat_s:
+            return
+        entries = list(self._amf_coordinator_entries.values())
+        try:
+            self._amf_coordinator_client.heartbeat(
+                node_id=self.node_id,
+                entries=entries,
+            )
+            self._amf_coordinator_last_heartbeat = now
+        except Exception:
+            return
+
     def _loop(self) -> None:
         while not self._stop.is_set():
+            self._coordinator_heartbeat()
             item = None
             queue_order = ("SPEC_HIT", "HIT", "SPEC_MISS", "MISS")
             queue_map = {
@@ -818,10 +903,10 @@ class ClusterWorker:
                     else:
                         self._q_miss.put(fetched)
                     continue
-                self.registry.heartbeat(self.worker_id, self._inflight)
+                self.registry.heartbeat(self.worker_id, self._inflight, capabilities=self._worker_capabilities())
                 continue
             self._inflight += 1
-            self.registry.heartbeat(self.worker_id, self._inflight)
+            self.registry.heartbeat(self.worker_id, self._inflight, capabilities=self._worker_capabilities())
             try:
                 self._process(item.payload["job"], item.payload.get("lane", "MISS"), item.enqueued_at, item.payload)
                 self.queue.ack(item.job_id)
@@ -829,11 +914,17 @@ class ClusterWorker:
                 self.queue.retry(item.job_id, delay_s=1.0)
                 GLOBAL_METRICS.inc("replay_failures_total", 1.0)
             self._inflight -= 1
-            self.registry.heartbeat(self.worker_id, self._inflight)
+            self.registry.heartbeat(self.worker_id, self._inflight, capabilities=self._worker_capabilities())
+
+    def enable_orchestrator(self, orchestrator: Any) -> None:
+        """Wire the AI reasoning orchestrator into the request path. Fail-closed: any
+        error from the orchestrator falls back to existing AMF behavior transparently."""
+        self._orchestrator = orchestrator
 
     def _process(self, job: Dict[str, Any], lane: str, enqueued_at: float, payload: Optional[Dict[str, Any]] = None) -> None:
         job_id = job["job_id"]
         org_id = job.get("org_id", "default")
+        tenant_id = str(job.get("tenant_id", org_id) or org_id)
         request_id = job.get("request_id", "")
         session_id = job.get("session_id", "")
         artifacts = self.artifacts.init_job(job_id, org_id=org_id)
@@ -847,6 +938,7 @@ class ClusterWorker:
             "gpu_id": self.gpu_id,
             "lane": lane,
             "org_id": org_id,
+            "tenant_id": tenant_id,
             "request_id": request_id,
             "queue_latency_ms": queue_latency_ms,
         })
@@ -859,12 +951,26 @@ class ClusterWorker:
                 "worker_id": self.worker_id,
                 "session_id": session_id,
                 "org_id": org_id,
+                "tenant_id": tenant_id,
                 "request_id": request_id,
                 "latency_ms": queue_latency_ms,
             },
             artifact_log=platform_log,
         )
         self.ledger.update_status(job_id, "RUNNING")
+
+        # AI reasoning orchestrator — fail-closed, zero impact on existing path
+        _orch_outcome = None
+        if self._orchestrator is not None:
+            try:
+                _orch_outcome = self._orchestrator.on_request(
+                    prefix_hash=str(job.get("prefix_hash", "") or ""),
+                    tenant_id=tenant_id,
+                    node_id=str(self.gpu_id),
+                    worker_id=self.worker_id,
+                )
+            except Exception:
+                _orch_outcome = None
 
         adapter_job = dict(job)
         if job.get("execution_backend_id"):
@@ -879,6 +985,7 @@ class ClusterWorker:
         policy = dict(job.get("policy", {}))
         policy["_lane"] = str(lane).upper()
         policy["_execution_backend_id"] = str(job.get("execution_backend_id", "") or job.get("backend_id", ""))
+        policy["_tenant_id"] = tenant_id
         job_spec_cfg = dict(job.get("spec_cfg", {}) or {})
         if payload and bool(payload.get("force_miss", False)):
             policy["allow_amf_reuse"] = False
@@ -1796,8 +1903,37 @@ class ClusterWorker:
                 )
 
         amf_decision = metrics.get("amf", {}).get("decision")
+        amf_lookup_hash = str((payload or {}).get("amf_lookup_hash", "") or "")
+        if not amf_lookup_hash:
+            routing_decision = job.get("routing_decision", {}) if isinstance(job.get("routing_decision", {}), dict) else {}
+            amf_lookup_hash = str(routing_decision.get("amf_lookup_hash", "") or "")
+        if (
+            amf_lookup_hash
+            and bool(metrics.get("amf", {}).get("supported", False))
+            and amf_decision in ("hit", "miss")
+        ):
+            amf_metrics = metrics.get("amf", {}) if isinstance(metrics.get("amf", {}), dict) else {}
+            self._coordinator_register_entry(
+                tenant_id=tenant_id,
+                amf_lookup_hash=amf_lookup_hash,
+                worker_id=self.worker_id,
+                metadata={
+                    "cache_entries": int(amf_metrics.get("cache_entries", 0) or 0),
+                    "hit_rate": float(amf_metrics.get("hit_rate", self._amf_hit_rate) or self._amf_hit_rate),
+                    "warm_ratio": float(amf_metrics.get("warm_ratio", self._amf_warm_ratio) or self._amf_warm_ratio),
+                },
+            )
         if amf_decision in ("hit", "miss", "blocked"):
             self._append_event(events_path, f"AMF_{amf_decision.upper()}", {"job_id": job_id, "request_id": request_id})
+        if _orch_outcome is not None and getattr(_orch_outcome, "ai_augmented", False):
+            _orch_prefix = str(job.get("prefix_hash", "") or "")
+            try:
+                if amf_decision == "hit":
+                    self._orchestrator.on_hit(_orch_prefix)
+                elif amf_decision == "miss":
+                    self._orchestrator.on_miss(_orch_prefix)
+            except Exception:
+                pass
         if amf_decision == "hit" and self.snapshot_index is not None:
             locations = self.snapshot_index.get_locations(fingerprint_hash=fingerprint_hash, org_id=org_id)
             if locations:
@@ -2852,6 +2988,7 @@ class ClusterWorker:
             "started_at": started_at,
             "finished_at": finished_at,
             "org_id": job.get("org_id", "default"),
+            "tenant_id": job.get("tenant_id", job.get("org_id", "default")),
             "request_id": job.get("request_id", ""),
         }
         exec_backend_id = str(job.get("execution_backend_id", "") or job.get("backend_id", ""))
@@ -3039,6 +3176,11 @@ class ClusterWorker:
         errors = engine_metrics.get("errors", [])
         if not errors:
             errors = []
+        engine_errors = result.get("engine_errors", [])
+        if isinstance(engine_errors, list):
+            for item in engine_errors:
+                if isinstance(item, str) and item.strip():
+                    errors.append(item.strip())
         if cap_amf_supported and not engine_metrics:
             errors.append("engine_metrics_missing_for_capable_backend")
         if int(result.get("exit_code", 0)) != 0:
@@ -3095,6 +3237,7 @@ class ClusterWorker:
 
     def _update_health(self, metrics: Dict[str, Any], shape_key: str = "") -> None:
         org_id = metrics.get("ids", {}).get("org_id", "default")
+        tenant_id = metrics.get("ids", {}).get("tenant_id", org_id)
         amf = metrics.get("amf", {})
         scheduling = metrics.get("scheduling", {})
         perf = metrics.get("perf", {})
@@ -3104,12 +3247,54 @@ class ClusterWorker:
         if amf.get("supported"):
             GLOBAL_METRICS.inc("amf_seen_total", 1.0, labels={"org_id": org_id})
             GLOBAL_METRICS.inc("amf_hit_total", 1.0 if amf.get("decision") == "hit" else 0.0, labels={"org_id": org_id})
-            self._amf_seen_by_org[org_id] = self._amf_seen_by_org.get(org_id, 0.0) + 1.0
+            self._amf_seen_by_org[tenant_id] = self._amf_seen_by_org.get(tenant_id, 0.0) + 1.0
             if amf.get("decision") == "hit":
-                self._amf_hits_by_org[org_id] = self._amf_hits_by_org.get(org_id, 0.0) + 1.0
-            seen = self._amf_seen_by_org.get(org_id, 0.0)
-            hits = self._amf_hits_by_org.get(org_id, 0.0)
+                self._amf_hits_by_org[tenant_id] = self._amf_hits_by_org.get(tenant_id, 0.0) + 1.0
+            seen = self._amf_seen_by_org.get(tenant_id, 0.0)
+            hits = self._amf_hits_by_org.get(tenant_id, 0.0)
             GLOBAL_METRICS.set_gauge("amf_hit_rate", hits / seen if seen > 0 else 0.0, labels={"org_id": org_id})
+            misses = max(0.0, seen - hits)
+            try:
+                cache_entries = int(amf.get("cache_entries", self._amf_cache_entries) or self._amf_cache_entries)
+            except Exception:
+                cache_entries = self._amf_cache_entries
+            cache_bytes = int(amf.get("cache_bytes", 0) or 0)
+            print(
+                "[AMF_STATS_TENANT] tenant={tenant} hits={hits} misses={misses} entries={entries} bytes={bytes}".format(
+                    tenant=str(tenant_id),
+                    hits=int(hits),
+                    misses=int(misses),
+                    entries=int(max(0, cache_entries)),
+                    bytes=int(max(0, cache_bytes)),
+                )
+            )
+        total_seen = sum(float(v) for v in self._amf_seen_by_org.values())
+        total_hits = sum(float(v) for v in self._amf_hits_by_org.values())
+        if total_seen > 0.0:
+            self._amf_hit_rate = max(0.0, min(1.0, total_hits / total_seen))
+        else:
+            self._amf_hit_rate = max(0.0, min(1.0, float(amf.get("hit_rate", 0.0) or 0.0)))
+        try:
+            cache_entries = int(amf.get("cache_entries", self._amf_cache_entries) or self._amf_cache_entries)
+        except Exception:
+            cache_entries = self._amf_cache_entries
+        self._amf_cache_entries = max(0, cache_entries)
+        try:
+            cache_bytes = int(amf.get("cache_bytes", self._amf_cache_bytes) or self._amf_cache_bytes)
+        except Exception:
+            cache_bytes = self._amf_cache_bytes
+        self._amf_cache_bytes = max(0, cache_bytes)
+        try:
+            warm_ratio = float(amf.get("warm_ratio", self._amf_warm_ratio) or self._amf_warm_ratio)
+        except Exception:
+            warm_ratio = self._amf_warm_ratio
+        self._amf_warm_ratio = max(0.0, min(1.0, warm_ratio))
+        self._amf_prewarm_complete = bool(amf.get("prewarm_complete", self._amf_prewarm_complete))
+        self._amf_ready = bool(self._amf_prewarm_complete or self._amf_hit_rate > 0.5)
+        savings = metrics.get("savings", {}) if isinstance(metrics.get("savings", {}), dict) else {}
+        saved_ms = float(savings.get("total_saved_ms", 0.0) or 0.0)
+        self._tenant_saved_ms[tenant_id] = self._tenant_saved_ms.get(tenant_id, 0.0) + max(0.0, saved_ms)
+        GLOBAL_METRICS.set_gauge("amf_warm_ratio", self._amf_warm_ratio, labels={"org_id": org_id})
 
         skip_ratio = float(amf.get("skip_ratio", 0.0) or 0.0)
         roi = float(amf.get("roi", 0.0) or 0.0)
@@ -3140,6 +3325,40 @@ class ClusterWorker:
         GLOBAL_METRICS.set_gauge("spec_speedup_est", float(spec.get("speedup_est", 0.0) or 0.0), labels={"org_id": org_id})
         GLOBAL_METRICS.set_gauge("org_request_rate", 0.0, labels={"org_id": org_id})
         GLOBAL_METRICS.set_gauge("org_token_rate", 0.0, labels={"org_id": org_id})
+
+    def amf_health(self) -> Dict[str, Any]:
+        hit_rate = float(max(0.0, min(1.0, self._amf_hit_rate)))
+        warm_ratio = float(max(0.0, min(1.0, self._amf_warm_ratio)))
+        ready = bool(self._amf_prewarm_complete or hit_rate > 0.5)
+        return {
+            "cache_entries": int(max(0, self._amf_cache_entries)),
+            "cache_bytes": int(max(0, self._amf_cache_bytes)),
+            "hit_rate": hit_rate,
+            "warm_ratio": warm_ratio,
+            "ready": ready,
+        }
+
+    def amf_metrics_snapshot(self) -> Dict[str, Any]:
+        tenants: Dict[str, Dict[str, float]] = {}
+        for tenant, seen in self._amf_seen_by_org.items():
+            hits = float(self._amf_hits_by_org.get(tenant, 0.0) or 0.0)
+            tenants[str(tenant)] = {
+                "requests": float(seen),
+                "hits": float(hits),
+                "hit_rate": float(hits / seen) if seen > 0 else 0.0,
+                "savings_ms": float(self._tenant_saved_ms.get(tenant, 0.0) or 0.0),
+            }
+        return {
+            "node_id": self.node_id,
+            "worker_id": self.worker_id,
+            "requests_total": float(sum(self._amf_seen_by_org.values())),
+            "hit_rate": float(self._amf_hit_rate),
+            "entries": int(self._amf_cache_entries),
+            "storage_bytes": int(self._amf_cache_bytes),
+            "warmth": float(self._amf_warm_ratio),
+            "savings_ms_total": float(sum(self._tenant_saved_ms.values())),
+            "tenants": tenants,
+        }
 
     def _append_event(self, events_path: Path, event_type: str, payload: Dict[str, Any]) -> None:
         evt = {"type": event_type, "ts": utc_now(), "payload": payload}

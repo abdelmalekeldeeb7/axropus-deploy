@@ -1979,6 +1979,14 @@ int32_t batch_executor_step(
         // Delayed-commit override: keep verified tokens resident so they can age.
       }
 
+      const std::size_t remaining_call_budget =
+          (generated_this_call < batch_tokens)
+              ? static_cast<std::size_t>(batch_tokens - generated_this_call)
+              : 0u;
+      if (commit_count > remaining_call_budget) {
+        commit_count = remaining_call_budget;
+      }
+
       if (commit_count > 0) {
         static bool determinism_checked = false;
         static bool determinism_enabled = false;
@@ -2091,6 +2099,10 @@ int32_t batch_executor_step(
 
     if (spec_state.finish_pending && pending_count == 0) {
       finished = true;
+      break;
+    }
+
+    if (generated_this_call >= batch_tokens) {
       break;
     }
 
@@ -3190,6 +3202,21 @@ int32_t batch_executor_step(
     std::uint64_t & spec_fast_verified_tokens,
     int32_t engine_count_cap,
     std::uint64_t max_tokens) {
+  if (max_tokens > 0) {
+    if (printed_total >= max_tokens) {
+      return 0;
+    }
+    const std::uint64_t remaining_u64 = max_tokens - printed_total;
+    const std::uint64_t i32_cap_u64 =
+        static_cast<std::uint64_t>(std::numeric_limits<int32_t>::max());
+    const int32_t remaining_tokens = static_cast<int32_t>(
+        std::min<std::uint64_t>(remaining_u64, i32_cap_u64));
+    batch_tokens = std::min<int32_t>(batch_tokens, remaining_tokens);
+    if (batch_tokens <= 0) {
+      return 0;
+    }
+  }
+
   const char * env_bench = std::getenv("KORITH_BENCHMARK_MODE");
   const bool benchmark_mode = (env_bench != nullptr) && (env_bench[0] != '\0') && (env_bench[0] != '0');
 

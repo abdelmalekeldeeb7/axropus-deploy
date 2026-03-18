@@ -51,12 +51,18 @@ class WorkerRegistry:
         stale_s = max(1.0, float(os.environ.get("KORITH_WORKER_STALE_S", "15") or 15.0))
         return time.time() - stale_s
 
-    def heartbeat(self, worker_id: str, inflight: int) -> None:
+    def heartbeat(self, worker_id: str, inflight: int, capabilities: Dict[str, Any] | None = None) -> None:
         with sqlite3.connect(self.db_path) as conn:
-            conn.execute(
-                "UPDATE workers SET inflight=?, last_heartbeat=?, status=? WHERE worker_id=?",
-                (inflight, time.time(), "READY", worker_id),
-            )
+            if capabilities is None:
+                conn.execute(
+                    "UPDATE workers SET inflight=?, last_heartbeat=?, status=? WHERE worker_id=?",
+                    (inflight, time.time(), "READY", worker_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE workers SET inflight=?, last_heartbeat=?, status=?, capabilities_json=? WHERE worker_id=?",
+                    (inflight, time.time(), "READY", json.dumps(capabilities, ensure_ascii=False), worker_id),
+                )
 
     def list_workers(self) -> List[Dict[str, Any]]:
         cutoff = self._stale_cutoff()
