@@ -1,0 +1,30 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# System dependencies for file I/O and NATS TLS.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies.
+COPY requirements*.txt ./
+RUN pip install --no-cache-dir nats-py
+
+# Copy platform package.
+COPY platform/ ./platform/
+COPY korith_vllm_ext/ ./korith_vllm_ext/
+
+# Default snapshot storage directory.
+RUN mkdir -p /data/amf/snapshots
+
+ENV PYTHONPATH=/app
+ENV AMF_SNAPSHOT_DIR=/data/amf/snapshots
+ENV AMF_NODE_ID=amf-node-0
+ENV DYNAMO_NATS_URL=nats://nats:4222
+ENV DYNAMO_NATS_SUBJECT_PREFIX=dynamo.kv.block
+ENV AMF_COORDINATOR_URL=http://amf-coordinator:8500
+ENV AMF_MIN_PREFIX_TOKENS=256
+ENV AMF_MIN_SAVED_MS_TO_PERSIST=500
+
+ENTRYPOINT ["python", "-m", "platform.runtime.dynamo_event_subscriber"]

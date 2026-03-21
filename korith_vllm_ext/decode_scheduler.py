@@ -12,6 +12,51 @@ from vllm.v1.core.sched.scheduler import Scheduler
 logger = init_logger(__name__)
 _TRUTHY = ("1", "true", "yes", "on")
 
+# ---------------------------------------------------------------------------
+# Dynamo integration helpers — all guarded by _DYNAMO_WORKER flag
+# ---------------------------------------------------------------------------
+
+_DYNAMO_WORKER: bool = any(
+    os.environ.get(k, "").strip().lower() in _TRUTHY
+    for k in ("DYNAMO_WORKER", "DYNAMO_ENABLED", "DYNAMO_WORKER_MODE")
+)
+
+if _DYNAMO_WORKER:
+    logger.info("KorithDecodeScheduler running in Dynamo worker mode")
+
+
+def _get_amf_coordinator_client() -> Any:
+    """Lazily import and return AmfCoordinatorClient (avoids hard dep when Dynamo absent)."""
+    try:
+        from platform.runtime.amf_coordinator_client import AmfCoordinatorClient  # type: ignore[import]
+        url = os.environ.get("AMF_COORDINATOR_URL", "")
+        if url:
+            return AmfCoordinatorClient(url)
+    except ImportError:
+        pass
+    return None
+
+
+_AMF_CLIENT: Any = _get_amf_coordinator_client() if _DYNAMO_WORKER else None
+
+
+def _get_nats_client() -> Any:
+    """Return a lazy wrapper for NATS publish (best-effort, non-critical)."""
+    if not _DYNAMO_WORKER:
+        return None
+    try:
+        import nats  # type: ignore[import]
+        return nats
+    except ImportError:
+        return None
+
+
+_NATS_LIB: Any = _get_nats_client()
+
+# Async NATS connection is managed per-process; we keep a module-level handle.
+_nats_conn: Any = None
+_nats_lock_imported = False
+
 
 def _env_truthy(name: str, default: bool = False) -> bool:
     raw = str(os.environ.get(name, "")).strip().lower()
@@ -373,13 +418,155 @@ class KorithDecodeScheduler(Scheduler):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
+    # ------------------------------------------------------------------
+    # Dynamo integration — only active when DYNAMO_WORKER=true
+    # ------------------------------------------------------------------
+
+    def _dynamo_check_amf_hit(self, req: Any) -> bool:
+        """Return True if AMF coordinator reports a snapshot for this request.
+
+        When True, elevates the request to SPEC_HIT lane (highest priority)
+        because prefill will be skipped via AMF restore.
+        """
+        if not _DYNAMO_WORKER or _AMF_CLIENT is None:
+            return False
+        prefix_hash = self._xarg_str(req, "korith_prefix_hash", "").strip()
+        tenant_id = self._xarg_str(req, "korith_tenant_id", "default").strip() or "default"
+        if not prefix_hash:
+            return False
+        try:
+            rows = _AMF_CLIENT.lookup(prefix_hash=prefix_hash, tenant_id=tenant_id)
+            return bool(rows)
+        except Exception:
+            return False
+
+    def _dynamo_apply_amf_priority(self, req: Any) -> bool:
+        """Elevate request to SPEC_HIT lane if AMF has a snapshot.
+
+        Returns True if AMF hit was detected and priority was updated.
+        """
+        if not _DYNAMO_WORKER:
+            return False
+        if self._xarg_int(req, "korith_amf_hit", 0) > 0:
+            return True  # Already marked.
+        if not self._dynamo_check_amf_hit(req):
+            return False
+
+        # Mark AMF hit so subsequent scoring uses SPEC_HIT lane.
+        try:
+            extra = self._request_extra_args(req)
+            extra["korith_amf_hit"] = 1
+            extra["korith_lane"] = "SPEC_HIT"
+            extra["korith_replay_state"] = "restore"
+        except Exception:
+            pass
+        return True
+
+    def _dynamo_emit_metadata(self, req: Any, amf_hit: bool) -> None:
+        """Attach Dynamo-compatible metadata to request extra_args.
+
+        Emits korith_lane, korith_replay_state, and korith_amf_hit so that
+        Dynamo's frontend can consume them for routing feedback.
+        """
+        if not _DYNAMO_WORKER:
+            return
+        try:
+            extra = self._request_extra_args(req)
+            extra.setdefault("korith_lane", self._lane_key(req))
+            extra.setdefault("korith_replay_state", self._request_replay_state(req) or "miss")
+            extra["korith_amf_hit"] = 1 if amf_hit else 0
+        except Exception:
+            pass
+
+    def _dynamo_emit_restore_event(
+        self,
+        req: Any,
+        restore_ms: float,
+        saved_ms: float,
+        tokens_skipped: int,
+    ) -> None:
+        """Emit amf.restore.completed event to NATS (best-effort, non-blocking).
+
+        This feeds back into AMF Coordinator and the Dynamo router so they can
+        learn from actual restore outcomes.
+        """
+        if not _DYNAMO_WORKER or _NATS_LIB is None:
+            return
+        try:
+            import asyncio
+
+            worker_id = os.environ.get("KORITH_WORKER_ID", "")
+            prefix_hash = self._xarg_str(req, "korith_prefix_hash", "")
+            payload = json.dumps({
+                "worker_id": worker_id,
+                "prefix_hash": prefix_hash,
+                "restore_ms": restore_ms,
+                "saved_ms": saved_ms,
+                "tokens_skipped": tokens_skipped,
+                "timestamp_ms": time.time() * 1000,
+            }, ensure_ascii=False).encode("utf-8")
+
+            nats_url = os.environ.get("DYNAMO_NATS_URL", "nats://localhost:4222")
+
+            async def _publish() -> None:
+                global _nats_conn
+                try:
+                    if _nats_conn is None or _nats_conn.is_closed:
+                        _nats_conn = await _NATS_LIB.connect(nats_url)
+                    await _nats_conn.publish("amf.restore.completed", payload)
+                except Exception as exc:
+                    logger.debug("NATS publish amf.restore.completed failed: %s", exc)
+
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.ensure_future(_publish())
+            else:
+                loop.run_until_complete(_publish())
+        except Exception as exc:
+            logger.debug("_dynamo_emit_restore_event error: %s", exc)
+
+    # ------------------------------------------------------------------
+    # schedule() — main hot path
+    # ------------------------------------------------------------------
+
     def schedule(self):
         t0 = time.perf_counter()
         self._korith_reorder_running()
+
+        # Dynamo: check AMF hits for waiting prefill-heavy requests.
+        if _DYNAMO_WORKER:
+            for req in list(self.waiting) if self.waiting is not None else []:
+                try:
+                    prompt_tokens = self._request_prompt_tokens(req)
+                    if prompt_tokens >= 1024:
+                        self._dynamo_apply_amf_priority(req)
+                except Exception:
+                    pass
+
         old_budget = int(self.max_num_scheduled_tokens)
         self.max_num_scheduled_tokens = int(self._korith_effective_budget())
         try:
-            return super().schedule()
+            result = super().schedule()
+
+            # Dynamo: emit metadata and restore events on scheduled requests.
+            if _DYNAMO_WORKER and result is not None:
+                try:
+                    scheduled_reqs = getattr(result, "scheduled_requests", None) or []
+                    for req in scheduled_reqs:
+                        amf_hit = self._xarg_int(req, "korith_amf_hit", 0) > 0
+                        self._dynamo_emit_metadata(req, amf_hit=amf_hit)
+                        if amf_hit and self._xarg_str(req, "korith_replay_state", "") == "restore":
+                            tokens_skipped = self._request_prompt_tokens(req)
+                            self._dynamo_emit_restore_event(
+                                req,
+                                restore_ms=float(self._xarg_int(req, "korith_restore_ms", 0)),
+                                saved_ms=0.0,
+                                tokens_skipped=tokens_skipped,
+                            )
+                except Exception:
+                    pass
+
+            return result
         finally:
             self.max_num_scheduled_tokens = old_budget
             elapsed_ms = (time.perf_counter() - t0) * 1000.0

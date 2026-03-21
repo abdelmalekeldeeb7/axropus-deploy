@@ -1,0 +1,71 @@
+version: "3.9"
+
+# Docker Compose overlay for AMF + NVIDIA Dynamo integration.
+#
+# Usage:
+#   docker compose -f deploy/docker-compose.yml \
+#                  -f deploy/docker-compose.dynamo.yml \
+#                  up
+#
+# Services added:
+#   nats              — NATS event plane (Dynamo uses this for KVBM events)
+#   amf-coordinator   — AMF coordinator with SQLite-backed prefix index
+#   amf-event-subscriber — subscribes to Dynamo KVBM events, triggers AMF persist
+
+services:
+
+  nats:
+    image: nats:latest
+    container_name: korith-nats
+    ports:
+      - "4222:4222"
+      - "8222:8222"   # NATS monitoring endpoint
+    command: ["--jetstream", "--http_port", "8222"]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8222/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  amf-coordinator:
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile.router
+    image: korith-router:latest
+    container_name: korith-amf-coordinator
+    command: ["python", "-m", "platform.runtime.amf_coordinator", "--host", "0.0.0.0", "--port", "8500"]
+    environment:
+      AMF_COORDINATOR_DB: /data/amf/coordinator.db
+    volumes:
+      - ../platform_data/amf:/data/amf
+    ports:
+      - "8500:8500"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8500/health', timeout=2).read()"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  amf-event-subscriber:
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile.dynamo-amf
+    image: korith-dynamo-amf:latest
+    container_name: korith-amf-event-subscriber
+    environment:
+      DYNAMO_NATS_URL: nats://nats:4222
+      DYNAMO_NATS_SUBJECT_PREFIX: dynamo.kv.block
+      AMF_COORDINATOR_URL: http://amf-coordinator:8500
+      AMF_SNAPSHOT_DIR: /data/amf/snapshots
+      AMF_NODE_ID: amf-node-0
+      AMF_MIN_PREFIX_TOKENS: 256
+      AMF_MIN_SAVED_MS_TO_PERSIST: 500
+      AMF_STATS_INTERVAL_S: 60
+    volumes:
+      - ../platform_data/amf:/data/amf
+    depends_on:
+      nats:
+        condition: service_healthy
+      amf-coordinator:
+        condition: service_healthy
+    restart: unless-stopped

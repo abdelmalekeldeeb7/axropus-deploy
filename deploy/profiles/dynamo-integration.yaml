@@ -1,0 +1,42 @@
+# AMF + NVIDIA Dynamo integration deployment profile.
+#
+# All environment variables that control the Dynamo integration layer.
+# Copy to your .env or pass directly to docker compose.
+
+dynamo:
+  # NATS event plane — Dynamo KVBM publishes lifecycle events here.
+  nats_url: nats://nats:4222
+  nats_subject_prefix: dynamo.kv.block
+
+  # Set to "true" inside Dynamo worker containers.
+  worker_mode: "false"
+
+amf:
+  # Coordinator HTTP service — central prefix index.
+  coordinator_url: http://amf-coordinator:8500
+
+  # Node identity for this AMF instance.
+  node_id: amf-node-0
+
+  # Where KV snapshots are written on the local NVMe path.
+  snapshot_dir: /data/amf/snapshots
+
+  # NATS event subscriber thresholds.
+  min_prefix_tokens: 256          # Ignore prefixes shorter than this.
+  min_saved_ms_to_persist: 500    # ROI gate: skip if estimated prefill < 500 ms.
+  stats_interval_s: 60
+
+  # NIXL backend (G3/G4 storage behind Dynamo KVBM).
+  nixl:
+    min_admit_roi: 1.5            # Minimum ROI = prefill_ms / restore_ms.
+    agg_window_ms: 500            # Block aggregation window before snapshot flush.
+    max_storage_bytes: 107374182400  # 100 GiB
+    eviction_watermark: 0.85      # Evict when storage reaches 85% capacity.
+
+  # Router plugin weights.
+  router:
+    enabled: true
+    restore_weight: 0.8
+    kv_overlap_weight: 0.5
+    load_weight: 0.3
+    min_prefix_tokens_for_amf: 4096
