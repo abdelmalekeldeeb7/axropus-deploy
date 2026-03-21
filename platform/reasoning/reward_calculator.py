@@ -62,6 +62,36 @@ import numpy as np
 
 log = logging.getLogger(__name__)
 
+# Prefill / decode keys mirrored from learning_loop to avoid circular import.
+_RC_PREFILL_KEYS = [
+    "cache_admission", "admission_priority", "eviction_target",
+    "pre_warm_predictions", "route_decision", "batch_group", "throttle_back_pressure",
+    "prefer_local_restore", "cross_node_restore_target", "persist_priority",
+    "replicate_to_nodes", "evict_hint_nodes",
+]
+_RC_DECODE_KEYS = [
+    "spec_decode_enable", "spec_decode_depth", "spec_mode", "spec_v3_block_size",
+    "draft_temperature", "kv_compression_enable", "kv_compression_ratio",
+    "decode_batch_priority", "early_stop_confidence", "cuda_graph_hint",
+    "adaptive_depth_override",
+]
+
+
+def _to_two_section(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Ensure a stored decision dict is in two-section ``{"prefill": {}, "decode": {}}``
+    format.  Handles both flat and already-structured inputs transparently.
+    Old flat-format records are lifted into the two-section schema without loss.
+    """
+    if not isinstance(raw, dict):
+        return {"prefill": {}, "decode": {}}
+    if "prefill" in raw and "decode" in raw:
+        return raw  # Already two-section.
+    # Flat format — split into sections.
+    return {
+        "prefill": {k: raw[k] for k in _RC_PREFILL_KEYS if k in raw},
+        "decode":  {k: raw[k] for k in _RC_DECODE_KEYS  if k in raw},
+    }
+
 
 # ── outcome constants ─────────────────────────────────────────────────────────
 
@@ -89,6 +119,11 @@ class Outcome:
     CUDA_GRAPH_SPEEDUP     = "cuda_graph_speedup"      # cuda_graph_hint=True + speedup
     EARLY_STOP_CORRECT     = "early_stop_correct"      # early stop fired, output complete
     EARLY_STOP_PREMATURE   = "early_stop_premature"    # early stop fired, output truncated
+    # Dynamo fleet outcomes
+    REPLICATE_HIT          = "replicate_hit"           # replicated prefix was restored on that node
+    REPLICATE_WASTE        = "replicate_waste"         # replicated prefix was never reused
+    EVICT_HINT_CORRECT     = "evict_hint_correct"      # evict-hinted prefix was not needed
+    EVICT_HINT_WRONG       = "evict_hint_wrong"        # evict-hinted prefix was requested → miss
 
 
 # Reward weights — single source of truth consumed by record_outcome()
@@ -115,6 +150,11 @@ REWARD_WEIGHTS: Dict[str, float] = {
     Outcome.CUDA_GRAPH_SPEEDUP:      +0.3,
     Outcome.EARLY_STOP_CORRECT:      +0.8,
     Outcome.EARLY_STOP_PREMATURE:    -0.6,
+    # Dynamo fleet outcomes
+    Outcome.REPLICATE_HIT:           +0.7,
+    Outcome.REPLICATE_WASTE:         -0.3,
+    Outcome.EVICT_HINT_CORRECT:      +0.4,
+    Outcome.EVICT_HINT_WRONG:        -0.8,
 }
 
 _SCHEMA = """
@@ -393,9 +433,15 @@ class RewardCalculator:
                     tensor = None
 
             try:
-                decision = json.loads(decision_json) if decision_json else {}
+                raw_decision = json.loads(decision_json) if decision_json else {}
             except Exception:
-                decision = {}
+                raw_decision = {}
+
+            # Normalise to two-section format for the LearningLoop.
+            # Old flat-format records (stored before the two-section refactor) are
+            # transparently lifted into {"prefill": {...}, "decode": {...}} so
+            # _build_training_examples() always receives a consistent structure.
+            decision = _to_two_section(raw_decision)
 
             try:
                 overrides = json.loads(overrides_json) if overrides_json else []

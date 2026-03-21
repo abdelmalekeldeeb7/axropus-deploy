@@ -55,10 +55,15 @@ Usage
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import random
+import sqlite3
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional
 
 
@@ -131,6 +136,7 @@ class WorkloadGenerator:
         self,
         difficulty: float,
         seed: Optional[int] = None,
+        n: Optional[int] = None,
     ) -> List[SyntheticRequest]:
         """
         Generate a sequence of synthetic requests at the given difficulty.
@@ -163,6 +169,7 @@ class WorkloadGenerator:
         list[SyntheticRequest]
         """
         difficulty = max(0.0, min(1.0, float(difficulty)))
+        n_requests = int(n) if n is not None else self._n_requests
         rng = random.Random(seed if seed is not None else int(time.time() * 1000) % 2**32)
 
         # ── parameter interpolation ───────────────────────────────────────────
@@ -186,7 +193,7 @@ class WorkloadGenerator:
         time_ms = 0.0
         base_interval_ms = 1000.0 / self._base_tps  # ms between requests at base rate
 
-        for i in range(self._n_requests):
+        for i in range(n_requests):
             # Arrival time with optional burstiness
             if burstiness > 1.0 and rng.random() < 0.1 * difficulty:
                 interval_ms = base_interval_ms / burstiness
@@ -503,3 +510,424 @@ class AdversarialGenerator:
         """
         gen = WorkloadGenerator(n_requests=512)
         return gen.generate_episode(difficulty=1.0, seed=6666)
+
+
+# ── DynamoWorkloadRecorder ────────────────────────────────────────────────────
+
+_RECORDER_SCHEMA = """
+CREATE TABLE IF NOT EXISTS workload_events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts          REAL    NOT NULL,
+    prefix_hash TEXT    NOT NULL,
+    tenant_id   TEXT    NOT NULL,
+    num_tokens  INTEGER NOT NULL,
+    is_hit      INTEGER NOT NULL DEFAULT 0,
+    restore_ms  REAL    NOT NULL DEFAULT 0.0,
+    worker_id   TEXT    NOT NULL DEFAULT '',
+    kv_overlap  REAL    NOT NULL DEFAULT 0.0,
+    extra_json  TEXT    NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_we_ts ON workload_events(ts);
+CREATE INDEX IF NOT EXISTS idx_we_prefix ON workload_events(prefix_hash);
+"""
+
+_REPLAY_BATCH_SIZE = 256
+
+
+class DynamoWorkloadRecorder:
+    """
+    Records live Dynamo workload events to SQLite and replays them as
+    curriculum episodes for self-play training.
+
+    Recording
+    ---------
+    Call ``record(...)`` from the inference hot path after each request
+    completes.  Writes are batched in memory and flushed every ``flush_interval_s``
+    seconds (default 5 s) to avoid per-request I/O overhead.
+
+    Production Replay
+    -----------------
+    Call ``replay_episode(n)`` to return ``n`` recorded events as a list of
+    ``SyntheticRequest`` objects.  The CurriculumScheduler can use these
+    directly as training episodes — the model is trained on its own recent
+    production decisions.
+
+    Usage
+    -----
+        recorder = DynamoWorkloadRecorder(db_path="dynamo_workload.db")
+        recorder.start()
+
+        # From inference hot path:
+        recorder.record(
+            prefix_hash="abc123",
+            tenant_id="t-1",
+            num_tokens=131072,
+            is_hit=True,
+            restore_ms=8.1,
+            worker_id="gpu-0",
+            kv_overlap=0.87,
+        )
+
+        # For training:
+        episode = recorder.replay_episode(n=256)
+        # Use episode as a WorkloadGenerator episode substitute
+
+        recorder.stop()
+    """
+
+    def __init__(
+        self,
+        db_path: str = "dynamo_workload.db",
+        flush_interval_s: float = 5.0,
+        max_buffer_size: int = 4096,
+        max_db_rows: int = 1_000_000,    # rotate DB after this many rows
+    ) -> None:
+        self._db_path         = str(db_path)
+        self._flush_interval  = float(flush_interval_s)
+        self._max_buffer      = int(max_buffer_size)
+        self._max_rows        = int(max_db_rows)
+
+        self._lock    = threading.Lock()
+        self._buffer: List[Dict[str, Any]] = []
+        self._stop    = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+        self._total_recorded = 0
+        self._total_replayed = 0
+
+        self._init_db()
+
+    # ── lifecycle ─────────────────────────────────────────────────────────────
+
+    def start(self) -> None:
+        """Start the background flush thread."""
+        self._thread = threading.Thread(
+            target=self._flush_loop,
+            name="amf-workload-recorder",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Flush remaining buffer and stop."""
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=10.0)
+        self._flush_buffer()  # final flush
+
+    # ── recording API ─────────────────────────────────────────────────────────
+
+    def record(
+        self,
+        prefix_hash: str,
+        tenant_id: str = "default",
+        num_tokens: int = 0,
+        is_hit: bool = False,
+        restore_ms: float = 0.0,
+        worker_id: str = "",
+        kv_overlap: float = 0.0,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """
+        Record one Dynamo request event.  Non-blocking: appends to in-memory buffer.
+        Buffer is flushed to SQLite by the background thread.
+        """
+        event = {
+            "ts":          time.time(),
+            "prefix_hash": str(prefix_hash),
+            "tenant_id":   str(tenant_id),
+            "num_tokens":  max(0, int(num_tokens)),
+            "is_hit":      int(bool(is_hit)),
+            "restore_ms":  max(0.0, float(restore_ms)),
+            "worker_id":   str(worker_id),
+            "kv_overlap":  max(0.0, min(1.0, float(kv_overlap))),
+            "extra_json":  json.dumps(extra or {}),
+        }
+        with self._lock:
+            self._buffer.append(event)
+            self._total_recorded += 1
+            # Prevent unbounded memory growth
+            if len(self._buffer) >= self._max_buffer:
+                self._flush_locked()
+
+    # ── replay API ────────────────────────────────────────────────────────────
+
+    def replay_episode(
+        self,
+        n: int = 256,
+        since_ts: Optional[float] = None,
+        tenant_id: Optional[str] = None,
+    ) -> List[SyntheticRequest]:
+        """
+        Return up to ``n`` recent recorded events as SyntheticRequest objects.
+
+        Parameters
+        ----------
+        n : int
+            Maximum number of requests to return.
+        since_ts : float | None
+            If set, only return events after this Unix timestamp.
+        tenant_id : str | None
+            If set, filter to this tenant only.
+
+        Returns
+        -------
+        list[SyntheticRequest]
+            Ordered by arrival time (ascending).  Context length is derived from
+            num_tokens; difficulty is estimated from kv_overlap (high overlap =
+            easy, low overlap = hard).
+        """
+        rows = self._fetch_rows(n=n, since_ts=since_ts, tenant_id=tenant_id)
+        if not rows:
+            return []
+
+        requests: List[SyntheticRequest] = []
+        first_ts = rows[0]["ts"]
+
+        for row in rows:
+            # Difficulty proxy: low kv_overlap → adversarial (high difficulty)
+            kv_ov = float(row["kv_overlap"])
+            difficulty = max(0.0, min(1.0, 1.0 - kv_ov))
+
+            requests.append(SyntheticRequest(
+                prefix_hash=row["prefix_hash"],
+                context_length=max(1024, int(row["num_tokens"])),
+                is_new_prefix=not bool(row["is_hit"]),
+                arrival_time_ms=round((float(row["ts"]) - first_ts) * 1000.0, 2),
+                tenant_id=row["tenant_id"],
+                difficulty=difficulty,
+            ))
+
+        with self._lock:
+            self._total_replayed += len(requests)
+
+        return requests
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Return recorder statistics."""
+        with self._lock:
+            buf_len = len(self._buffer)
+            total_r = self._total_recorded
+            total_p = self._total_replayed
+
+        row_count = self._count_rows()
+        return {
+            "total_recorded":  total_r,
+            "total_replayed":  total_p,
+            "buffer_pending":  buf_len,
+            "db_rows":         row_count,
+            "db_path":         self._db_path,
+        }
+
+    # ── background flush ──────────────────────────────────────────────────────
+
+    def _flush_loop(self) -> None:
+        while not self._stop.is_set():
+            self._stop.wait(timeout=self._flush_interval)
+            self._flush_buffer()
+
+    def _flush_buffer(self) -> None:
+        with self._lock:
+            if not self._buffer:
+                return
+            self._flush_locked()
+
+    def _flush_locked(self) -> None:
+        """Flush buffer to SQLite. Must hold self._lock."""
+        events = list(self._buffer)
+        self._buffer.clear()
+        if not events:
+            return
+
+        try:
+            conn = sqlite3.connect(self._db_path, timeout=5.0)
+            with conn:
+                conn.executemany(
+                    """INSERT INTO workload_events
+                       (ts, prefix_hash, tenant_id, num_tokens, is_hit,
+                        restore_ms, worker_id, kv_overlap, extra_json)
+                       VALUES (:ts, :prefix_hash, :tenant_id, :num_tokens,
+                               :is_hit, :restore_ms, :worker_id, :kv_overlap,
+                               :extra_json)
+                    """,
+                    events,
+                )
+            conn.close()
+            # Rotate if over limit
+            self._maybe_rotate()
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning(
+                "[recorder] flush error: %s", exc
+            )
+
+    # ── DB helpers ────────────────────────────────────────────────────────────
+
+    def _init_db(self) -> None:
+        try:
+            conn = sqlite3.connect(self._db_path, timeout=5.0)
+            conn.executescript(_RECORDER_SCHEMA)
+            conn.commit()
+            conn.close()
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning(
+                "[recorder] DB init error: %s", exc
+            )
+
+    def _fetch_rows(
+        self,
+        n: int,
+        since_ts: Optional[float],
+        tenant_id: Optional[str],
+    ) -> List[Dict[str, Any]]:
+        try:
+            conn = sqlite3.connect(self._db_path, timeout=5.0)
+            conn.row_factory = sqlite3.Row
+            params: List[Any] = []
+            where_clauses: List[str] = []
+            if since_ts is not None:
+                where_clauses.append("ts >= ?")
+                params.append(float(since_ts))
+            if tenant_id is not None:
+                where_clauses.append("tenant_id = ?")
+                params.append(str(tenant_id))
+            where = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+            params.append(int(n))
+            rows = conn.execute(
+                f"SELECT * FROM workload_events {where} ORDER BY ts DESC LIMIT ?",
+                params,
+            ).fetchall()
+            conn.close()
+            # Reverse to get chronological order
+            return [dict(r) for r in reversed(rows)]
+        except Exception:
+            return []
+
+    def _count_rows(self) -> int:
+        try:
+            conn = sqlite3.connect(self._db_path, timeout=2.0)
+            n = conn.execute(
+                "SELECT COUNT(*) FROM workload_events"
+            ).fetchone()[0]
+            conn.close()
+            return int(n)
+        except Exception:
+            return 0
+
+    def _maybe_rotate(self) -> None:
+        """Delete the oldest 20% of rows when over the row limit."""
+        try:
+            conn = sqlite3.connect(self._db_path, timeout=5.0)
+            n = conn.execute(
+                "SELECT COUNT(*) FROM workload_events"
+            ).fetchone()[0]
+            if n > self._max_rows:
+                delete_n = int(n * 0.20)
+                conn.execute(
+                    """DELETE FROM workload_events WHERE id IN (
+                        SELECT id FROM workload_events ORDER BY ts ASC LIMIT ?
+                    )""",
+                    (delete_n,),
+                )
+                conn.commit()
+            conn.close()
+        except Exception:
+            pass
+
+
+# ── Production replay mode for CurriculumScheduler ────────────────────────────
+
+class ProductionReplayCurriculum:
+    """
+    Replaces synthetic WorkloadGenerator with recorded production events.
+
+    Wraps a DynamoWorkloadRecorder to feed real traffic patterns into the
+    CurriculumScheduler's episode loop.  This is the final convergence step:
+    after the model learns from synthetic and adversarial workloads, training
+    on real production patterns closes the sim-to-real gap.
+
+    Usage
+    -----
+        replay = ProductionReplayCurriculum(
+            recorder=workload_recorder,
+            scheduler=curriculum_scheduler,
+            fallback_generator=WorkloadGenerator(),
+        )
+
+        episode = replay.generate_episode()
+        # Use as drop-in replacement for WorkloadGenerator.generate_episode()
+    """
+
+    def __init__(
+        self,
+        recorder: DynamoWorkloadRecorder,
+        scheduler: Optional[CurriculumScheduler] = None,
+        fallback_generator: Optional[WorkloadGenerator] = None,
+        min_production_rows: int = 1000,
+        production_fraction: float = 0.5,
+    ) -> None:
+        self._recorder    = recorder
+        self._scheduler   = scheduler
+        self._fallback    = fallback_generator or WorkloadGenerator()
+        self._min_rows    = int(min_production_rows)
+        self._prod_frac   = max(0.0, min(1.0, float(production_fraction)))
+        self._rng         = random.Random()
+
+    def generate_episode(
+        self,
+        n: int = 256,
+        force_production: bool = False,
+    ) -> List[SyntheticRequest]:
+        """
+        Generate a training episode mixing production replay and synthetic data.
+
+        If production DB has fewer than ``min_production_rows`` rows, falls back
+        entirely to the synthetic generator at current curriculum difficulty.
+
+        Parameters
+        ----------
+        n : int
+            Total episode length.
+        force_production : bool
+            If True, use only production replay (ignore production_fraction).
+
+        Returns
+        -------
+        list[SyntheticRequest]
+        """
+        db_rows = self._recorder._count_rows()
+        if db_rows < self._min_rows:
+            # Not enough production data; use synthetic curriculum
+            difficulty = self._scheduler.difficulty if self._scheduler else 0.3
+            return self._fallback.generate_episode(difficulty=difficulty, n=n)
+
+        if force_production:
+            return self._recorder.replay_episode(n=n)
+
+        # Mix production and synthetic
+        n_prod = max(1, int(n * self._prod_frac))
+        n_synth = n - n_prod
+
+        prod_ep  = self._recorder.replay_episode(n=n_prod)
+        difficulty = self._scheduler.difficulty if self._scheduler else 0.3
+        synth_ep = self._fallback.generate_episode(difficulty=difficulty, n=n_synth)
+
+        # Merge and sort by arrival time
+        combined = prod_ep + synth_ep
+        combined.sort(key=lambda r: r.arrival_time_ms)
+
+        # Re-number arrival times to be monotonically increasing
+        for i, req in enumerate(combined):
+            req.arrival_time_ms = float(i) * 10.0
+
+        return combined
+
+    def generate_episode_production_only(self, n: int = 256) -> List[SyntheticRequest]:
+        """Return a pure production replay episode."""
+        return self.generate_episode(n=n, force_production=True)
+
+    def generate_episode_synthetic_only(self, n: int = 256) -> List[SyntheticRequest]:
+        """Return a pure synthetic episode at current curriculum difficulty."""
+        difficulty = self._scheduler.difficulty if self._scheduler else 0.3
+        return self._fallback.generate_episode(difficulty=difficulty, n=n)

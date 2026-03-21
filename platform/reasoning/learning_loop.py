@@ -73,6 +73,12 @@ _PREFILL_TARGET_KEYS = [
     "route_decision",
     "batch_group",
     "throttle_back_pressure",
+    # Dynamo fleet fields (added in Prompt 3)
+    "prefer_local_restore",
+    "cross_node_restore_target",
+    "persist_priority",
+    "replicate_to_nodes",
+    "evict_hint_nodes",
 ]
 
 # Decode keys the model outputs in the "decode" section of the two-section JSON
@@ -92,6 +98,46 @@ _DECODE_TARGET_KEYS = [
 
 # Legacy alias kept so external code that imported _TARGET_KEYS keeps working
 _TARGET_KEYS = _PREFILL_TARGET_KEYS + _DECODE_TARGET_KEYS
+
+# Mandatory prefill keys: at least one must be present for an example to be valid.
+_MANDATORY_PREFILL_KEYS = frozenset({"cache_admission", "throttle_back_pressure"})
+
+
+def _extract_two_section(decision: Dict[str, Any]):
+    """Normalise a stored decision dict to (prefill_dict, decode_dict).
+
+    Handles two storage formats:
+
+    1. **Flat** (from ``UnifiedDecisionVector.to_dict()``):
+       All keys live at the top level — e.g. ``{"cache_admission": True, ...}``.
+
+    2. **Two-section** (already structured):
+       ``{"prefill": {...}, "decode": {...}}``.
+
+    Returns ``(None, None)`` when the decision is missing mandatory keys so the
+    caller can skip the record gracefully instead of producing empty training pairs.
+    """
+    if not isinstance(decision, dict):
+        return None, None
+
+    if "prefill" in decision and "decode" in decision:
+        # Two-section format — extract sub-dicts directly.
+        prefill_src = decision.get("prefill") or {}
+        decode_src  = decision.get("decode")  or {}
+        if not isinstance(prefill_src, dict) or not isinstance(decode_src, dict):
+            return None, None
+        prefill_target = {k: prefill_src[k] for k in _PREFILL_TARGET_KEYS if k in prefill_src}
+        decode_target  = {k: decode_src[k]  for k in _DECODE_TARGET_KEYS  if k in decode_src}
+    else:
+        # Flat format — all keys live at the top level.
+        prefill_target = {k: decision[k] for k in _PREFILL_TARGET_KEYS if k in decision}
+        decode_target  = {k: decision[k] for k in _DECODE_TARGET_KEYS  if k in decision}
+
+    # Require at least one mandatory prefill key so we don't train on empty completions.
+    if not _MANDATORY_PREFILL_KEYS.intersection(prefill_target):
+        return None, None
+
+    return prefill_target, decode_target
 
 
 # ── result dataclass ──────────────────────────────────────────────────────────
@@ -296,10 +342,20 @@ class LearningLoop:
             # Build the same two-section prompt that ReasoningModel.decide() produces
             prompt = self._tensor_to_prompt(tensor)
 
-            # Build two-section target matching model output format:
-            # {"prefill": {...}, "decode": {...}}
-            prefill_target = {k: decision[k] for k in _PREFILL_TARGET_KEYS if k in decision}
-            decode_target  = {k: decision[k] for k in _DECODE_TARGET_KEYS  if k in decision}
+            # Normalise decision to two-section format regardless of how it was stored.
+            # Old flat-format decisions (from UnifiedDecisionVector.to_dict()) have all
+            # keys at the top level.  New two-section decisions already have
+            # {"prefill": {...}, "decode": {...}} structure.  If neither mandatory
+            # prefill key is present after normalisation, skip gracefully.
+            prefill_target, decode_target = _extract_two_section(decision)
+            if prefill_target is None:
+                # Malformed or unrecognised format — skip without crashing.
+                log.debug(
+                    "[loop] skipping decision %s: cannot extract two-section target",
+                    item.get("decision_id", "?"),
+                )
+                continue
+
             target_str = json.dumps(
                 {"prefill": prefill_target, "decode": decode_target},
                 separators=(",", ":"),

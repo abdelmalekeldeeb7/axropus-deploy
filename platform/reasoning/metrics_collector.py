@@ -70,7 +70,7 @@ from typing import Any, Deque, Dict, List, Optional, Tuple
 import numpy as np
 
 # ── tensor constants ────────────────────────────────────────────────────────
-TENSOR_SIZE = 64
+TENSOR_SIZE = 80              # extended from 64: slots 54-69 hold Dynamo fleet metrics
 POLL_INTERVAL_S = 0.10        # 100 ms
 RATE_WINDOW_S   = 10.0        # rolling window for rate computations
 ROI_EMA_ALPHA   = 0.05        # EMA smoothing for ROI signals
@@ -135,6 +135,25 @@ class Slot:
     HOLO_FUTURE_SAFE        = 52
     POWER_WATTS_NORM        = 53
     # slots 54-63: reserved for future decode signals
+
+    # ── Dynamo fleet slots (54-69) — filled by DynamoMetricsSource ───────────
+    DYNAMO_FLEET_HIT_RATE      = 54   # KV routing hit rate across fleet [0, 1]
+    DYNAMO_FLEET_MISS_RATE     = 55   # routing miss rate [0, 1]
+    DYNAMO_EVICTION_RATE       = 56   # blocks evicted / second across fleet
+    DYNAMO_BLOCK_COUNT_NORM    = 57   # tracked blocks / 100 000
+    DYNAMO_WORKER_COUNT        = 58   # active Dynamo workers
+    DYNAMO_AVG_WORKER_LOAD     = 59   # mean worker load [0, 1]
+    DYNAMO_MAX_WORKER_LOAD     = 60   # max worker load [0, 1]
+    DYNAMO_PREFILL_QUEUE_DEPTH = 61   # pending prefill requests / 100
+    DYNAMO_DECODE_QUEUE_DEPTH  = 62   # pending decode requests / 100
+    DYNAMO_KV_OVERLAP_AVG      = 63   # mean KV overlap on routed requests [0, 1]
+    DYNAMO_AMF_ROUTED_RATIO    = 64   # fraction routed via AMF vs Dynamo [0, 1]
+    DYNAMO_RESTORE_RATIO       = 65   # AMF restores / cold recomputes [0, inf)
+    DYNAMO_CROSS_NODE_XFERS    = 66   # cross-node KV transfers / second
+    DYNAMO_TIER_G1_PCT         = 67   # fraction of blocks in GPU HBM [0, 1]
+    DYNAMO_TIER_G2_PCT         = 68   # fraction in CPU RAM [0, 1]
+    DYNAMO_TIER_G3G4_PCT       = 69   # fraction in NVMe/remote [0, 1]
+    # slots 70-79: reserved
 
 
 def _safe_float(v: Any, default: float = 0.0) -> float:
@@ -203,6 +222,7 @@ class MetricsCollector:
         poll_interval_s: float = POLL_INTERVAL_S,
         worker_hit_queue: Optional[Any] = None,   # queue.Queue from Worker
         worker_miss_queue: Optional[Any] = None,  # queue.Queue from Worker
+        dynamo_source: Optional["DynamoMetricsSource"] = None,
     ) -> None:
         self._coordinator_url = str(coordinator_url or "").rstrip("/")
         self._coordinator_timeout = max(0.02, coordinator_timeout_s)
@@ -246,6 +266,9 @@ class MetricsCollector:
         # ── current tensor ───────────────────────────────────────────────
         self._tensor_lock = threading.Lock()
         self._tensor: np.ndarray = np.zeros(TENSOR_SIZE, dtype=np.float32)
+
+        # ── Dynamo fleet metrics source (optional) ───────────────────────
+        self._dynamo_source = dynamo_source
 
         # ── background poll thread ───────────────────────────────────────
         self._stop_event = threading.Event()
@@ -555,6 +578,30 @@ class MetricsCollector:
         t[Slot.MEMORY_PRESSURE]    = float(_clamp01(mem_pressure))
         t[Slot.DECODE_LATENCY_NORM] = float(_clamp01(self._decode_ema / 10_000.0))
 
+        # ── Dynamo fleet slots (54-69) ───────────────────────────────────
+        if self._dynamo_source is not None:
+            try:
+                dm = self._dynamo_source.get_dynamo_metrics()
+                t[Slot.DYNAMO_FLEET_HIT_RATE]      = float(_clamp01(dm.get("fleet_hit_rate", 0.0)))
+                t[Slot.DYNAMO_FLEET_MISS_RATE]      = float(_clamp01(dm.get("fleet_miss_rate", 0.0)))
+                t[Slot.DYNAMO_EVICTION_RATE]        = float(_safe_float(dm.get("eviction_rate", 0.0)))
+                t[Slot.DYNAMO_BLOCK_COUNT_NORM]     = float(_safe_float(dm.get("block_count", 0)) / 100_000.0)
+                t[Slot.DYNAMO_WORKER_COUNT]         = float(_safe_float(dm.get("worker_count", 0)))
+                t[Slot.DYNAMO_AVG_WORKER_LOAD]      = float(_clamp01(dm.get("avg_worker_load", 0.0)))
+                t[Slot.DYNAMO_MAX_WORKER_LOAD]      = float(_clamp01(dm.get("max_worker_load", 0.0)))
+                t[Slot.DYNAMO_PREFILL_QUEUE_DEPTH]  = float(_safe_float(dm.get("prefill_queue_depth", 0)) / 100.0)
+                t[Slot.DYNAMO_DECODE_QUEUE_DEPTH]   = float(_safe_float(dm.get("decode_queue_depth", 0)) / 100.0)
+                t[Slot.DYNAMO_KV_OVERLAP_AVG]       = float(_clamp01(dm.get("kv_overlap_avg", 0.0)))
+                t[Slot.DYNAMO_AMF_ROUTED_RATIO]     = float(_clamp01(dm.get("amf_routed_ratio", 0.0)))
+                t[Slot.DYNAMO_RESTORE_RATIO]        = float(_safe_float(dm.get("restore_ratio", 0.0)))
+                t[Slot.DYNAMO_CROSS_NODE_XFERS]     = float(_safe_float(dm.get("cross_node_xfers_per_s", 0.0)))
+                total_blocks = max(1, _safe_float(dm.get("block_count", 1)))
+                t[Slot.DYNAMO_TIER_G1_PCT]          = float(_clamp01(dm.get("tier_g1_blocks", 0) / total_blocks))
+                t[Slot.DYNAMO_TIER_G2_PCT]          = float(_clamp01(dm.get("tier_g2_blocks", 0) / total_blocks))
+                t[Slot.DYNAMO_TIER_G3G4_PCT]        = float(_clamp01(dm.get("tier_g3g4_blocks", 0) / total_blocks))
+            except Exception:
+                pass  # Leave Dynamo slots as zero if source fails.
+
         with self._tensor_lock:
             self._tensor = t
 
@@ -650,3 +697,328 @@ class MetricsCollector:
                     pass
 
         return list(nodes.values())
+
+
+# ── Dynamo fleet metrics source ───────────────────────────────────────────────
+
+class DynamoMetricsSource:
+    """
+    Aggregates Dynamo KVBM fleet-level statistics for the metrics tensor.
+
+    Subscribes to the same NATS event stream used by DynamoEventSubscriber and
+    maintains rolling counters for block lifecycle events.  Optionally queries
+    the Dynamo router HTTP endpoint for per-worker load.
+
+    Usage
+    -----
+        source = DynamoMetricsSource(
+            nats_url="nats://localhost:4222",
+            router_url="http://localhost:8000",
+        )
+        asyncio.create_task(source.start())          # in async context
+        # or call source.start_sync() from a thread
+
+        metrics = source.get_dynamo_metrics()        # always returns a dict
+    """
+
+    # How many seconds of events to keep for rate calculations.
+    _RATE_WINDOW_S: float = 10.0
+
+    def __init__(
+        self,
+        nats_url: str = "nats://localhost:4222",
+        nats_subject_prefix: str = "dynamo.kv.block",
+        router_url: str = "",
+        router_timeout_s: float = 0.25,
+    ) -> None:
+        self._nats_url = nats_url
+        self._subject_prefix = nats_subject_prefix
+        self._router_url = router_url.rstrip("/")
+        self._router_timeout = router_timeout_s
+
+        # ── rolling event windows ─────────────────────────────────────
+        self._rw_created  = _RateWindow(self._RATE_WINDOW_S)
+        self._rw_evicted  = _RateWindow(self._RATE_WINDOW_S)
+        self._rw_stored   = _RateWindow(self._RATE_WINDOW_S)
+        self._rw_xfer     = _RateWindow(self._RATE_WINDOW_S)
+
+        # ── counters maintained from events ───────────────────────────
+        self._lock = threading.Lock()
+        self._block_count:      int   = 0
+        self._hit_count:        int   = 0
+        self._miss_count:       int   = 0
+        self._amf_routed:       int   = 0
+        self._total_routed:     int   = 0
+        self._restore_count:    int   = 0
+        self._recompute_count:  int   = 0
+        self._cross_node_xfers: int   = 0
+
+        # Tier block counts — set by block metadata when available.
+        self._tier_g1_blocks:   int   = 0   # GPU HBM
+        self._tier_g2_blocks:   int   = 0   # CPU RAM
+        self._tier_g3g4_blocks: int   = 0   # NVMe / remote
+
+        # ── KV overlap EMA ────────────────────────────────────────────
+        self._kv_overlap_ema: float = 0.0
+        _KV_OVERLAP_ALPHA = 0.05
+
+        # ── last router snapshot ──────────────────────────────────────
+        self._last_router_snap: Dict[str, Any] = {}
+        self._last_router_ts:   float = 0.0
+        self._router_cache_ttl: float = 2.0   # re-query every 2 s
+
+        # ── background threads / tasks ────────────────────────────────
+        self._stop_event = threading.Event()
+        self._nats_thread: Optional[threading.Thread] = None
+        self._router_thread: Optional[threading.Thread] = None
+
+        # Store KV overlap alpha as instance var for use in _handle_event
+        self._kv_overlap_alpha = _KV_OVERLAP_ALPHA
+
+    # ── lifecycle ─────────────────────────────────────────────────────────────
+
+    def start_sync(self) -> None:
+        """Start background threads (sync entry point for non-async hosts)."""
+        self._nats_thread = threading.Thread(
+            target=self._nats_thread_main,
+            name="dynamo-metrics-nats",
+            daemon=True,
+        )
+        self._nats_thread.start()
+
+        if self._router_url:
+            self._router_thread = threading.Thread(
+                target=self._router_poll_loop,
+                name="dynamo-metrics-router",
+                daemon=True,
+            )
+            self._router_thread.start()
+
+    def stop(self) -> None:
+        """Stop all background threads."""
+        self._stop_event.set()
+        if self._nats_thread:
+            self._nats_thread.join(timeout=2.0)
+        if self._router_thread:
+            self._router_thread.join(timeout=2.0)
+
+    # ── public API ────────────────────────────────────────────────────────────
+
+    def get_dynamo_metrics(self) -> Dict[str, Any]:
+        """
+        Return a snapshot dict consumed by MetricsCollector._refresh().
+
+        Keys match the slot-fill code in MetricsCollector exactly:
+          fleet_hit_rate, fleet_miss_rate, eviction_rate, block_count,
+          worker_count, avg_worker_load, max_worker_load,
+          prefill_queue_depth, decode_queue_depth,
+          kv_overlap_avg, amf_routed_ratio, restore_ratio,
+          cross_node_xfers_per_s,
+          tier_g1_blocks, tier_g2_blocks, tier_g3g4_blocks
+        """
+        with self._lock:
+            total_req = max(1, self._hit_count + self._miss_count)
+            fleet_hit  = _clamp01(self._hit_count  / total_req)
+            fleet_miss = _clamp01(self._miss_count / total_req)
+
+            total_routed = max(1, self._total_routed)
+            amf_ratio = _clamp01(self._amf_routed / total_routed)
+
+            total_decisions = max(1, self._restore_count + self._recompute_count)
+            restore_ratio = self._restore_count / total_decisions
+
+            block_count    = self._block_count
+            tier_g1        = self._tier_g1_blocks
+            tier_g2        = self._tier_g2_blocks
+            tier_g3g4      = self._tier_g3g4_blocks
+            kv_overlap_avg = self._kv_overlap_ema
+            xfers          = self._cross_node_xfers
+
+        eviction_rate = self._rw_evicted.rate()
+        xfer_rate     = self._rw_xfer.rate()
+
+        # Worker load from latest router snapshot
+        router_snap    = self._last_router_snap
+        worker_count   = _safe_float(router_snap.get("worker_count", 0))
+        avg_load       = _safe_float(router_snap.get("avg_worker_load", 0.0))
+        max_load       = _safe_float(router_snap.get("max_worker_load", 0.0))
+        prefill_queue  = _safe_float(router_snap.get("prefill_queue_depth", 0))
+        decode_queue   = _safe_float(router_snap.get("decode_queue_depth", 0))
+
+        return {
+            "fleet_hit_rate":       fleet_hit,
+            "fleet_miss_rate":      fleet_miss,
+            "eviction_rate":        eviction_rate,
+            "block_count":          block_count,
+            "worker_count":         worker_count,
+            "avg_worker_load":      avg_load,
+            "max_worker_load":      max_load,
+            "prefill_queue_depth":  prefill_queue,
+            "decode_queue_depth":   decode_queue,
+            "kv_overlap_avg":       kv_overlap_avg,
+            "amf_routed_ratio":     amf_ratio,
+            "restore_ratio":        restore_ratio,
+            "cross_node_xfers_per_s": xfer_rate,
+            "tier_g1_blocks":       tier_g1,
+            "tier_g2_blocks":       tier_g2,
+            "tier_g3g4_blocks":     tier_g3g4,
+        }
+
+    def record_routing_decision(
+        self,
+        used_amf: bool,
+        kv_overlap: float = 0.0,
+        used_restore: bool = False,
+    ) -> None:
+        """Call from AmfRouterPlugin after scoring a request."""
+        with self._lock:
+            self._total_routed += 1
+            if used_amf:
+                self._amf_routed += 1
+            if used_restore:
+                self._restore_count += 1
+            else:
+                self._recompute_count += 1
+            self._kv_overlap_ema = (
+                self._kv_overlap_alpha * _clamp01(kv_overlap)
+                + (1.0 - self._kv_overlap_alpha) * self._kv_overlap_ema
+            )
+
+    # ── NATS background thread ────────────────────────────────────────────────
+
+    def _nats_thread_main(self) -> None:
+        """Run the asyncio NATS event loop in a dedicated thread."""
+        import asyncio
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(self._nats_subscribe_loop())
+        except Exception:
+            pass
+        finally:
+            loop.close()
+
+    async def _nats_subscribe_loop(self) -> None:
+        try:
+            import nats  # type: ignore[import]
+        except ImportError:
+            # nats-py not installed; silently skip NATS subscription.
+            return
+
+        import asyncio
+
+        nc = await nats.connect(self._nats_url)
+        try:
+            subjects = [
+                f"{self._subject_prefix}.created",
+                f"{self._subject_prefix}.evicted",
+                f"{self._subject_prefix}.stored",
+                f"{self._subject_prefix}.moved",
+            ]
+            for subj in subjects:
+                await nc.subscribe(subj, cb=self._make_nats_callback(subj))
+
+            # Wait until stop requested
+            while not self._stop_event.is_set():
+                await asyncio.sleep(0.5)
+        finally:
+            await nc.drain()
+
+    def _make_nats_callback(self, subject: str):
+        import asyncio
+
+        async def _cb(msg):
+            try:
+                payload = json.loads(msg.data.decode("utf-8", errors="replace"))
+            except Exception:
+                payload = {}
+            self._handle_event(subject, payload)
+
+        return _cb
+
+    def _handle_event(self, subject: str, payload: Dict[str, Any]) -> None:
+        """Update counters from a Dynamo KVBM lifecycle event."""
+        tier = str(payload.get("storage_tier", "")).lower()
+        num_tokens = int(_safe_float(payload.get("num_tokens", 0)))
+
+        with self._lock:
+            if subject.endswith(".created"):
+                self._block_count += 1
+                self._rw_created.record()
+                self._miss_count  += 1
+                # Update tier counters
+                self._update_tier(tier, +1)
+
+            elif subject.endswith(".evicted"):
+                self._block_count = max(0, self._block_count - 1)
+                self._rw_evicted.record()
+                self._update_tier(tier, -1)
+
+            elif subject.endswith(".stored"):
+                self._hit_count += 1
+                self._rw_stored.record()
+
+            elif subject.endswith(".moved"):
+                # Cross-node KV transfer
+                self._cross_node_xfers += 1
+                self._rw_xfer.record()
+                # Update tier if src/dst differ
+                src_tier = str(payload.get("src_tier", "")).lower()
+                dst_tier = str(payload.get("dst_tier", tier)).lower()
+                if src_tier != dst_tier:
+                    self._update_tier(src_tier, -1)
+                    self._update_tier(dst_tier, +1)
+
+    def _update_tier(self, tier: str, delta: int) -> None:
+        """Adjust per-tier block counters (must hold self._lock)."""
+        if tier in ("vram", "hbm", "g1"):
+            self._tier_g1_blocks   = max(0, self._tier_g1_blocks   + delta)
+        elif tier in ("ram", "dram", "g2"):
+            self._tier_g2_blocks   = max(0, self._tier_g2_blocks   + delta)
+        elif tier in ("nvme", "remote", "g3", "g4", "g3g4"):
+            self._tier_g3g4_blocks = max(0, self._tier_g3g4_blocks + delta)
+
+    # ── router poll loop ──────────────────────────────────────────────────────
+
+    def _router_poll_loop(self) -> None:
+        while not self._stop_event.is_set():
+            snap = self._fetch_router_workers()
+            if snap:
+                self._last_router_snap = snap
+            self._stop_event.wait(timeout=self._router_cache_ttl)
+
+    def _fetch_router_workers(self) -> Dict[str, Any]:
+        """GET /v1/workers from the Dynamo router and compute load stats."""
+        if not self._router_url:
+            return {}
+        try:
+            req = urllib.request.Request(
+                f"{self._router_url}/v1/workers", method="GET"
+            )
+            with urllib.request.urlopen(req, timeout=self._router_timeout) as resp:
+                body = resp.read().decode("utf-8", errors="replace")
+            data = json.loads(body)
+        except Exception:
+            return {}
+
+        workers = data if isinstance(data, list) else data.get("workers", [])
+        if not workers:
+            return {}
+
+        loads = [_safe_float(w.get("load", w.get("utilization", 0.0))) for w in workers]
+        prefill_q = sum(
+            _safe_float(w.get("prefill_queue", w.get("pending_prefills", 0)))
+            for w in workers
+        )
+        decode_q = sum(
+            _safe_float(w.get("decode_queue", w.get("pending_decodes", 0)))
+            for w in workers
+        )
+
+        return {
+            "worker_count":       float(len(loads)),
+            "avg_worker_load":    _clamp01(sum(loads) / max(1, len(loads))),
+            "max_worker_load":    _clamp01(max(loads, default=0.0)),
+            "prefill_queue_depth": prefill_q,
+            "decode_queue_depth":  decode_q,
+        }

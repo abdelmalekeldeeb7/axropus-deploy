@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from unittest.mock import MagicMock, patch
 
@@ -427,11 +428,11 @@ class TestRecordDecodeStep:
         t = c.get_metrics_tensor()
         assert t[Slot.POWER_WATTS_NORM] == pytest.approx(0.73)
 
-    def test_tensor_size_is_64(self):
+    def test_tensor_size_is_80(self):
         c = _make_collector()
         t = c.get_metrics_tensor()
-        assert t.shape == (64,)
-        assert TENSOR_SIZE == 64
+        assert t.shape == (80,)
+        assert TENSOR_SIZE == 80
 
     def test_zero_args_leaves_decode_slots_zero(self):
         c = _make_collector()
@@ -439,3 +440,245 @@ class TestRecordDecodeStep:
         t = c.get_metrics_tensor()
         assert t[Slot.ACCEPTANCE_EMA] == pytest.approx(0.0)
         assert t[Slot.ENTROPY_EMA] == pytest.approx(0.0)
+
+
+# ── DynamoMetricsSource ───────────────────────────────────────────────────────
+
+from platform.reasoning.metrics_collector import DynamoMetricsSource  # noqa: E402
+
+
+def _make_dynamo_source(**kwargs) -> DynamoMetricsSource:
+    return DynamoMetricsSource(
+        nats_url="nats://localhost:4222",
+        router_url="",
+        **kwargs,
+    )
+
+
+class TestDynamoMetricsSourceDefaults:
+    def test_get_dynamo_metrics_returns_dict(self):
+        src = _make_dynamo_source()
+        dm = src.get_dynamo_metrics()
+        assert isinstance(dm, dict)
+
+    def test_all_required_keys_present(self):
+        src = _make_dynamo_source()
+        dm = src.get_dynamo_metrics()
+        required = {
+            "fleet_hit_rate", "fleet_miss_rate", "eviction_rate", "block_count",
+            "worker_count", "avg_worker_load", "max_worker_load",
+            "prefill_queue_depth", "decode_queue_depth",
+            "kv_overlap_avg", "amf_routed_ratio", "restore_ratio",
+            "cross_node_xfers_per_s",
+            "tier_g1_blocks", "tier_g2_blocks", "tier_g3g4_blocks",
+        }
+        assert required.issubset(dm.keys())
+
+    def test_initial_values_are_zero_or_finite(self):
+        src = _make_dynamo_source()
+        dm = src.get_dynamo_metrics()
+        for k, v in dm.items():
+            assert math.isfinite(float(v)), f"Non-finite value for key {k}: {v}"
+
+
+class TestDynamoSlotsPopulatedWhenSourceConnected:
+    """Slots 54-69 must be non-zero when the DynamoMetricsSource has data."""
+
+    def _make_collector_with_source(self) -> tuple:
+        src = _make_dynamo_source()
+        # Inject some synthetic data directly
+        with src._lock:
+            src._hit_count  = 80
+            src._miss_count = 20
+            src._block_count = 5000
+            src._tier_g1_blocks = 3000
+            src._tier_g2_blocks = 1500
+            src._tier_g3g4_blocks = 500
+            src._restore_count   = 60
+            src._recompute_count = 10
+        c = MetricsCollector(coordinator_url="", dynamo_source=src)
+        return c, src
+
+    def test_fleet_hit_rate_populated(self):
+        c, _ = self._make_collector_with_source()
+        with patch(
+            "platform.reasoning.metrics_collector.MetricsCollector._read_global_metrics",
+            return_value={"counters": {}, "gauges": {}},
+        ):
+            c._refresh()
+        t = c.get_metrics_tensor()
+        # 80 hits / 100 total = 0.8
+        assert t[Slot.DYNAMO_FLEET_HIT_RATE] == pytest.approx(0.8, abs=0.01)
+
+    def test_fleet_miss_rate_populated(self):
+        c, _ = self._make_collector_with_source()
+        with patch(
+            "platform.reasoning.metrics_collector.MetricsCollector._read_global_metrics",
+            return_value={"counters": {}, "gauges": {}},
+        ):
+            c._refresh()
+        t = c.get_metrics_tensor()
+        assert t[Slot.DYNAMO_FLEET_MISS_RATE] == pytest.approx(0.2, abs=0.01)
+
+    def test_block_count_norm_populated(self):
+        c, _ = self._make_collector_with_source()
+        with patch(
+            "platform.reasoning.metrics_collector.MetricsCollector._read_global_metrics",
+            return_value={"counters": {}, "gauges": {}},
+        ):
+            c._refresh()
+        t = c.get_metrics_tensor()
+        # 5000 / 100 000 = 0.05
+        assert t[Slot.DYNAMO_BLOCK_COUNT_NORM] == pytest.approx(0.05, abs=0.001)
+
+    def test_tier_percentages_sum_to_one(self):
+        c, src = self._make_collector_with_source()
+        with patch(
+            "platform.reasoning.metrics_collector.MetricsCollector._read_global_metrics",
+            return_value={"counters": {}, "gauges": {}},
+        ):
+            c._refresh()
+        t = c.get_metrics_tensor()
+        total = t[Slot.DYNAMO_TIER_G1_PCT] + t[Slot.DYNAMO_TIER_G2_PCT] + t[Slot.DYNAMO_TIER_G3G4_PCT]
+        assert total == pytest.approx(1.0, abs=0.01)
+
+    def test_restore_ratio_populated(self):
+        c, _ = self._make_collector_with_source()
+        with patch(
+            "platform.reasoning.metrics_collector.MetricsCollector._read_global_metrics",
+            return_value={"counters": {}, "gauges": {}},
+        ):
+            c._refresh()
+        t = c.get_metrics_tensor()
+        # 60 restores / (60+10) = ~0.857
+        assert t[Slot.DYNAMO_RESTORE_RATIO] == pytest.approx(60 / 70, abs=0.01)
+
+    def test_no_nan_in_dynamo_slots(self):
+        c, _ = self._make_collector_with_source()
+        with patch(
+            "platform.reasoning.metrics_collector.MetricsCollector._read_global_metrics",
+            return_value={"counters": {}, "gauges": {}},
+        ):
+            c._refresh()
+        t = c.get_metrics_tensor()
+        dynamo_slots = t[Slot.DYNAMO_FLEET_HIT_RATE : Slot.DYNAMO_TIER_G3G4_PCT + 1]
+        assert not np.any(np.isnan(dynamo_slots))
+
+
+class TestDynamoSlotsZeroWhenNoSource:
+    """Slots 54-69 must be zero when dynamo_source=None (default)."""
+
+    def test_dynamo_slots_are_zero(self):
+        c = _make_collector()   # no dynamo_source
+        with patch(
+            "platform.reasoning.metrics_collector.MetricsCollector._read_global_metrics",
+            return_value={"counters": {}, "gauges": {}},
+        ):
+            c._refresh()
+        t = c.get_metrics_tensor()
+        for slot in range(Slot.DYNAMO_FLEET_HIT_RATE, Slot.DYNAMO_TIER_G3G4_PCT + 1):
+            assert t[slot] == pytest.approx(0.0), f"Slot {slot} should be zero without source"
+
+
+class TestDynamoHandleEvent:
+    """Unit tests for DynamoMetricsSource._handle_event."""
+
+    def test_created_event_increments_block_count(self):
+        src = _make_dynamo_source()
+        src._handle_event("dynamo.kv.block.created", {"storage_tier": "vram"})
+        assert src._block_count == 1
+        assert src._tier_g1_blocks == 1
+
+    def test_evicted_event_decrements_block_count(self):
+        src = _make_dynamo_source()
+        with src._lock:
+            src._block_count = 5
+            src._tier_g2_blocks = 5
+        src._handle_event("dynamo.kv.block.evicted", {"storage_tier": "ram"})
+        assert src._block_count == 4
+        assert src._tier_g2_blocks == 4
+
+    def test_stored_event_increments_hit_count(self):
+        src = _make_dynamo_source()
+        src._handle_event("dynamo.kv.block.stored", {})
+        assert src._hit_count == 1
+
+    def test_moved_event_increments_xfer_and_updates_tier(self):
+        src = _make_dynamo_source()
+        with src._lock:
+            src._tier_g1_blocks = 3
+        src._handle_event("dynamo.kv.block.moved", {
+            "src_tier": "vram",
+            "dst_tier": "nvme",
+        })
+        assert src._cross_node_xfers == 1
+        assert src._tier_g1_blocks == 2
+        assert src._tier_g3g4_blocks == 1
+
+    def test_block_count_never_negative(self):
+        src = _make_dynamo_source()
+        src._handle_event("dynamo.kv.block.evicted", {"storage_tier": "vram"})
+        assert src._block_count == 0   # clamp at 0
+
+
+class TestDynamoRecordRoutingDecision:
+    def test_amf_routed_ratio_updates(self):
+        src = _make_dynamo_source()
+        src.record_routing_decision(used_amf=True, kv_overlap=0.9, used_restore=True)
+        src.record_routing_decision(used_amf=False, kv_overlap=0.0, used_restore=False)
+        dm = src.get_dynamo_metrics()
+        # 1 of 2 routed via AMF
+        assert dm["amf_routed_ratio"] == pytest.approx(0.5, abs=0.01)
+
+    def test_restore_ratio_updates(self):
+        src = _make_dynamo_source()
+        for _ in range(3):
+            src.record_routing_decision(used_amf=True, used_restore=True)
+        src.record_routing_decision(used_amf=False, used_restore=False)
+        dm = src.get_dynamo_metrics()
+        # 3 restores / 4 total = 0.75
+        assert dm["restore_ratio"] == pytest.approx(0.75, abs=0.01)
+
+    def test_kv_overlap_ema_updates(self):
+        src = _make_dynamo_source()
+        initial_ema = src._kv_overlap_ema
+        src.record_routing_decision(used_amf=True, kv_overlap=1.0)
+        dm = src.get_dynamo_metrics()
+        assert dm["kv_overlap_avg"] > initial_ema
+
+
+class TestDynamoNormalizationRanges:
+    """All [0,1]-bounded slots must stay within range under extreme inputs."""
+
+    def test_fleet_hit_rate_clamped(self):
+        src = _make_dynamo_source()
+        # overflow hits
+        with src._lock:
+            src._hit_count  = 10_000_000
+            src._miss_count = 0
+        dm = src.get_dynamo_metrics()
+        assert 0.0 <= dm["fleet_hit_rate"] <= 1.0
+
+    def test_amf_routed_ratio_clamped(self):
+        src = _make_dynamo_source()
+        with src._lock:
+            src._amf_routed   = 99_999
+            src._total_routed = 100
+        dm = src.get_dynamo_metrics()
+        assert 0.0 <= dm["amf_routed_ratio"] <= 1.0
+
+    def test_tier_pcts_clamped(self):
+        src = _make_dynamo_source()
+        with src._lock:
+            src._block_count      = 10
+            src._tier_g1_blocks   = 20   # intentionally > total
+            src._tier_g2_blocks   = 0
+            src._tier_g3g4_blocks = 0
+        c = MetricsCollector(coordinator_url="", dynamo_source=src)
+        with patch(
+            "platform.reasoning.metrics_collector.MetricsCollector._read_global_metrics",
+            return_value={"counters": {}, "gauges": {}},
+        ):
+            c._refresh()
+        t = c.get_metrics_tensor()
+        assert 0.0 <= t[Slot.DYNAMO_TIER_G1_PCT] <= 1.0

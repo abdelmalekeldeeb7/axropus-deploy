@@ -50,13 +50,15 @@ from .reasoning_model import DecisionVector, UnifiedDecisionVector
 log = logging.getLogger(__name__)
 
 # ── override reason strings (consumed by RewardCalculator) ───────────────────
-OVERRIDE_ROI_GATE          = "roi_gate:admission_blocked"
-OVERRIDE_HOT_PROTECT       = "hot_protect:eviction_blocked"
-OVERRIDE_THROTTLE_CAP      = "throttle_cap:healthy_cache"
-OVERRIDE_DEPTH_CAP         = "depth_cap_low_acceptance"
-OVERRIDE_ENTROPY_GUARD     = "entropy_guard_high_entropy"
-OVERRIDE_KV_COMPRESS_GUARD = "kv_compression_guard_util_low"
-OVERRIDE_RUST_VETO         = "rust_scheduler_veto"
+OVERRIDE_ROI_GATE              = "roi_gate:admission_blocked"
+OVERRIDE_HOT_PROTECT           = "hot_protect:eviction_blocked"
+OVERRIDE_THROTTLE_CAP          = "throttle_cap:healthy_cache"
+OVERRIDE_DEPTH_CAP             = "depth_cap_low_acceptance"
+OVERRIDE_ENTROPY_GUARD         = "entropy_guard_high_entropy"
+OVERRIDE_KV_COMPRESS_GUARD     = "kv_compression_guard_util_low"
+OVERRIDE_RUST_VETO             = "rust_scheduler_veto"
+OVERRIDE_CROSS_NODE_LOAD_HIGH  = "cross_node_blocked:local_load_high"
+OVERRIDE_REPLICATE_SKIPPED     = "replicate_skipped:no_coordinator_support"
 
 
 # ── context ──────────────────────────────────────────────────────────────────
@@ -89,6 +91,10 @@ class ExecutionResult:
     overrides: List[str]         # override reason strings for reward calculator
     elapsed_ms: float            # wall-clock time to execute all actions
     decision: Dict[str, Any]     # original DecisionVector serialised with to_dict()
+    # fleet action outcomes
+    replication_sent: List[str]  # node_ids replication was dispatched to
+    evict_hints_sent: List[str]  # node_ids eviction hints were sent to
+    cross_node_restore: Optional[str]  # node_id used for cross-node restore, or None
 
 
 # ── executor ─────────────────────────────────────────────────────────────────
@@ -312,6 +318,62 @@ class DecisionExecutor:
                     "[executor] pre_warm lookup error for %s: %s", prefix_hash, exc
                 )
 
+        # ── 6. Fleet actions (UnifiedDecisionVector only) ─────────────────────
+        replication_sent: List[str] = []
+        evict_hints_sent: List[str] = []
+        cross_node_restore: Optional[str] = None
+
+        if is_unified:
+            # 6a. Cross-node restore target
+            cross_node_target = getattr(dv, "cross_node_restore_target", None)
+            prefer_local      = getattr(dv, "prefer_local_restore", True)
+            dynamo_max_load   = _slot(tensor, Slot.DYNAMO_MAX_WORKER_LOAD)
+
+            if cross_node_target and not prefer_local:
+                # Safety: if the whole fleet is overloaded, skip cross-node
+                if dynamo_max_load > 0.95:
+                    overrides.append(OVERRIDE_CROSS_NODE_LOAD_HIGH)
+                    log.info(
+                        "[executor] cross_node_blocked: fleet max_load=%.2f > 0.95",
+                        dynamo_max_load,
+                    )
+                else:
+                    cross_node_restore = cross_node_target
+                    log.debug(
+                        "[executor] cross_node_restore: target=%s", cross_node_restore
+                    )
+
+            # 6b. Replication hints — best-effort; coordinator may not support it
+            replicate_to = getattr(dv, "replicate_to_nodes", [])
+            for node_id in replicate_to:
+                try:
+                    self._coordinator.replicate(
+                        node_id=node_id,
+                        tenant_id=context.tenant_id,
+                    )
+                    replication_sent.append(node_id)
+                    log.debug("[executor] replicate sent to node=%s", node_id)
+                except AttributeError:
+                    overrides.append(OVERRIDE_REPLICATE_SKIPPED)
+                    break  # coordinator doesn't support replication; skip remaining
+                except Exception as exc:
+                    log.debug("[executor] replicate error for node=%s: %s", node_id, exc)
+
+            # 6c. Eviction hints on remote nodes — suggest freeing cold prefixes
+            evict_hints = getattr(dv, "evict_hint_nodes", [])
+            for node_id in evict_hints:
+                try:
+                    self._coordinator.evict_hint(
+                        node_id=node_id,
+                        tenant_id=context.tenant_id,
+                    )
+                    evict_hints_sent.append(node_id)
+                    log.debug("[executor] evict_hint sent to node=%s", node_id)
+                except AttributeError:
+                    break  # coordinator doesn't support evict_hint
+                except Exception as exc:
+                    log.debug("[executor] evict_hint error for node=%s: %s", node_id, exc)
+
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
         result = ExecutionResult(
@@ -324,6 +386,9 @@ class DecisionExecutor:
             overrides=overrides,
             elapsed_ms=elapsed_ms,
             decision=dv.to_dict(),
+            replication_sent=replication_sent,
+            evict_hints_sent=evict_hints_sent,
+            cross_node_restore=cross_node_restore,
         )
 
         log.debug(

@@ -64,12 +64,14 @@ _REQUIRED_PREFILL_KEYS = {"cache_admission", "admission_priority", "throttle_bac
 _REQUIRED_DECODE_KEYS  = {"spec_decode_enable", "spec_decode_depth", "spec_mode", "adaptive_depth_override"}
 
 _SYSTEM_PROMPT = """\
-You are an LLM inference controller for AMF (Adaptive Memory Field).
-Given prefill and decode metrics, output a JSON object with EXACTLY two sections.
+You are an LLM inference controller for AMF (Adaptive Memory Field) with NVIDIA Dynamo fleet awareness.
+Given prefill, Dynamo fleet, and decode metrics, output a JSON object with EXACTLY two sections.
 No extra text, no markdown, no explanation:
 
 {"prefill":{"cache_admission":true,"admission_priority":0.5,"eviction_target":null,\
-"pre_warm_predictions":[],"route_decision":null,"batch_group":null,"throttle_back_pressure":0.0},\
+"pre_warm_predictions":[],"route_decision":null,"batch_group":null,"throttle_back_pressure":0.0,\
+"prefer_local_restore":true,"cross_node_restore_target":null,"persist_priority":0.5,\
+"replicate_to_nodes":[],"evict_hint_nodes":[]},\
 "decode":{"spec_decode_enable":true,"spec_decode_depth":4,"spec_mode":"v2_clean",\
 "spec_v3_block_size":8,"draft_temperature":0.8,"kv_compression_enable":false,\
 "kv_compression_ratio":1.0,"decode_batch_priority":2,"early_stop_confidence":0.0,\
@@ -83,6 +85,17 @@ Prefill field rules:
 - route_decision: node_id string, or null.
 - batch_group: group_id string, or null.
 - throttle_back_pressure: float 0-1. 0=no throttle.
+- prefer_local_restore: bool. True=restore from local AMF node before cross-node.
+- cross_node_restore_target: node_id string to restore from cross-node, or null.
+- persist_priority: float 0-1. Higher=persist to NIXL storage with higher priority.
+- replicate_to_nodes: list of up to 3 node_id strings to replicate this prefix to.
+- evict_hint_nodes: list of up to 3 node_id strings to hint eviction on (cold nodes).
+
+Dynamo fleet field guidance (from dyn_* metrics in input):
+- High dyn_max_load (>0.8): prefer_local_restore=false, cross_node_restore_target to a less loaded node.
+- High dyn_restore_ratio (>0.5): increase persist_priority, replicate_to popular nodes.
+- High dyn_xfers: reduce cross_node_restore_target usage to cut bandwidth.
+- Low dyn_g1_pct + high dyn_g3g4_pct: data in slow tiers, increase persist_priority.
 
 Decode field rules:
 - spec_decode_enable: bool. Enable speculative decode?
@@ -123,6 +136,21 @@ _PREFILL_SLOT_KEYS: Dict[int, str] = {
     Slot.MEMORY_PRESSURE:    "mem_pressure",
     Slot.REUSE_RATIO:        "reuse_ratio",
     Slot.MISS_QUEUE_NORM:    "miss_queue",
+    # Dynamo fleet slots
+    Slot.DYNAMO_FLEET_HIT_RATE:      "dyn_fleet_hit",
+    Slot.DYNAMO_FLEET_MISS_RATE:     "dyn_fleet_miss",
+    Slot.DYNAMO_EVICTION_RATE:       "dyn_evict_rate",
+    Slot.DYNAMO_BLOCK_COUNT_NORM:    "dyn_blocks",
+    Slot.DYNAMO_WORKER_COUNT:        "dyn_workers",
+    Slot.DYNAMO_AVG_WORKER_LOAD:     "dyn_avg_load",
+    Slot.DYNAMO_MAX_WORKER_LOAD:     "dyn_max_load",
+    Slot.DYNAMO_KV_OVERLAP_AVG:      "dyn_kv_overlap",
+    Slot.DYNAMO_AMF_ROUTED_RATIO:    "dyn_amf_ratio",
+    Slot.DYNAMO_RESTORE_RATIO:       "dyn_restore_ratio",
+    Slot.DYNAMO_CROSS_NODE_XFERS:    "dyn_xfers",
+    Slot.DYNAMO_TIER_G1_PCT:         "dyn_g1_pct",
+    Slot.DYNAMO_TIER_G2_PCT:         "dyn_g2_pct",
+    Slot.DYNAMO_TIER_G3G4_PCT:       "dyn_g3g4_pct",
 }
 
 # Decode slot → compact prompt key
@@ -200,6 +228,13 @@ class UnifiedDecisionVector:
     is_fallback: bool
     domain: str                      # "unified"
 
+    # --- Dynamo fleet fields ---
+    prefer_local_restore: bool            # restore from local AMF before cross-node
+    cross_node_restore_target: Optional[str]  # node_id to restore from cross-node, or None
+    persist_priority: float               # [0, 1] priority to persist to NIXL
+    replicate_to_nodes: List[str]         # up to 3 node_ids to replicate to
+    evict_hint_nodes: List[str]           # up to 3 node_ids to hint eviction on
+
     # --- decode / speculative fields ---
     spec_decode_enable: bool
     spec_decode_depth: int           # [1, 16]
@@ -215,27 +250,36 @@ class UnifiedDecisionVector:
 
     def to_dict(self) -> Dict[str, Any]:
         return {
-            "cache_admission":        self.cache_admission,
-            "admission_priority":     round(self.admission_priority, 4),
-            "eviction_target":        self.eviction_target,
-            "pre_warm_predictions":   self.pre_warm_predictions,
-            "route_decision":         self.route_decision,
-            "batch_group":            self.batch_group,
-            "throttle_back_pressure": round(self.throttle_back_pressure, 4),
-            "inference_ms":           round(self.inference_ms, 2),
-            "is_fallback":            self.is_fallback,
-            "domain":                 self.domain,
-            "spec_decode_enable":     self.spec_decode_enable,
-            "spec_decode_depth":      self.spec_decode_depth,
-            "spec_mode":              self.spec_mode,
-            "spec_v3_block_size":     self.spec_v3_block_size,
-            "draft_temperature":      round(self.draft_temperature, 4),
-            "kv_compression_enable":  self.kv_compression_enable,
-            "kv_compression_ratio":   round(self.kv_compression_ratio, 4),
-            "decode_batch_priority":  self.decode_batch_priority,
-            "early_stop_confidence":  round(self.early_stop_confidence, 4),
-            "cuda_graph_hint":        self.cuda_graph_hint,
-            "adaptive_depth_override": self.adaptive_depth_override,
+            "prefill": {
+                "cache_admission":           self.cache_admission,
+                "admission_priority":        round(self.admission_priority, 4),
+                "eviction_target":           self.eviction_target,
+                "pre_warm_predictions":      self.pre_warm_predictions,
+                "route_decision":            self.route_decision,
+                "batch_group":               self.batch_group,
+                "throttle_back_pressure":    round(self.throttle_back_pressure, 4),
+                "prefer_local_restore":      self.prefer_local_restore,
+                "cross_node_restore_target": self.cross_node_restore_target,
+                "persist_priority":          round(self.persist_priority, 4),
+                "replicate_to_nodes":        self.replicate_to_nodes,
+                "evict_hint_nodes":          self.evict_hint_nodes,
+            },
+            "decode": {
+                "spec_decode_enable":     self.spec_decode_enable,
+                "spec_decode_depth":      self.spec_decode_depth,
+                "spec_mode":              self.spec_mode,
+                "spec_v3_block_size":     self.spec_v3_block_size,
+                "draft_temperature":      round(self.draft_temperature, 4),
+                "kv_compression_enable":  self.kv_compression_enable,
+                "kv_compression_ratio":   round(self.kv_compression_ratio, 4),
+                "decode_batch_priority":  self.decode_batch_priority,
+                "early_stop_confidence":  round(self.early_stop_confidence, 4),
+                "cuda_graph_hint":        self.cuda_graph_hint,
+                "adaptive_depth_override": self.adaptive_depth_override,
+            },
+            "inference_ms": round(self.inference_ms, 2),
+            "is_fallback":  self.is_fallback,
+            "domain":       self.domain,
         }
 
 
@@ -255,6 +299,11 @@ def _safe_fallback(inference_ms: float = 0.0) -> UnifiedDecisionVector:
         route_decision=None,
         batch_group=None,
         throttle_back_pressure=0.0,
+        prefer_local_restore=True,
+        cross_node_restore_target=None,
+        persist_priority=0.5,
+        replicate_to_nodes=[],
+        evict_hint_nodes=[],
         inference_ms=inference_ms,
         is_fallback=True,
         domain="unified",
@@ -603,6 +652,20 @@ class ReasoningModel:
         batch_group = p.get("batch_group")
         batch_group = str(batch_group) if batch_group else None
 
+        # Fleet fields
+        cross_node_target = p.get("cross_node_restore_target")
+        cross_node_target = str(cross_node_target) if cross_node_target else None
+
+        replicate_to = p.get("replicate_to_nodes", [])
+        if not isinstance(replicate_to, list):
+            replicate_to = []
+        replicate_to = [str(x) for x in replicate_to[:3]]
+
+        evict_hints = p.get("evict_hint_nodes", [])
+        if not isinstance(evict_hints, list):
+            evict_hints = []
+        evict_hints = [str(x) for x in evict_hints[:3]]
+
         return UnifiedDecisionVector(
             cache_admission=bool(p.get("cache_admission", True)),
             admission_priority=clamp01(p.get("admission_priority", 0.5), 0.5),
@@ -611,6 +674,11 @@ class ReasoningModel:
             route_decision=route_decision,
             batch_group=batch_group,
             throttle_back_pressure=clamp01(p.get("throttle_back_pressure", 0.0)),
+            prefer_local_restore=bool(p.get("prefer_local_restore", True)),
+            cross_node_restore_target=cross_node_target,
+            persist_priority=clamp01(p.get("persist_priority", 0.5), 0.5),
+            replicate_to_nodes=replicate_to,
+            evict_hint_nodes=evict_hints,
             inference_ms=inference_ms,
             is_fallback=False,
             domain="unified",

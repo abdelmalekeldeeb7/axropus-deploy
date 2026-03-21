@@ -537,3 +537,199 @@ class TestPolicyGradientExamples:
         src = inspect.getsource(loop._fine_tune_policy_gradient)
         assert "clip_grad_norm_" in src
         assert "max_norm=1.0" in src
+
+
+# ── Two-section training format tests (Prompt 1 fix) ─────────────────────────
+
+class TestTwoSectionFormat:
+    """Verify the training format fix — decisions are correctly normalised to
+    two-section {"prefill": {...}, "decode": {...}} regardless of storage format."""
+
+    def _item_two_section(self, decision_id: str = "d-ts", reward: float = 1.0) -> dict:
+        """Return a batch item whose decision is already in two-section format."""
+        decision = {
+            "prefill": {
+                "cache_admission": True,
+                "admission_priority": 0.8,
+                "eviction_target": None,
+                "pre_warm_predictions": ["hash-a"],
+                "route_decision": None,
+                "batch_group": None,
+                "throttle_back_pressure": 0.0,
+            },
+            "decode": {
+                "spec_decode_enable": True,
+                "spec_decode_depth": 6,
+                "spec_mode": "v2_clean",
+                "spec_v3_block_size": 8,
+                "draft_temperature": 0.8,
+                "kv_compression_enable": False,
+                "kv_compression_ratio": 1.0,
+                "decode_batch_priority": 2,
+                "early_stop_confidence": 0.0,
+                "cuda_graph_hint": True,
+                "adaptive_depth_override": False,
+            },
+        }
+        return {
+            "decision_id": decision_id,
+            "tensor": np.zeros(64, dtype=np.float32),
+            "decision": decision,
+            "total_reward": reward,
+            "outcome_count": 1,
+            "overrides": [],
+            "timestamp": time.time(),
+        }
+
+    def _item_flat(self, decision_id: str = "d-flat", reward: float = 1.0) -> dict:
+        """Return a batch item in old flat format (from UnifiedDecisionVector.to_dict())."""
+        return _positive_item(decision_id, reward)
+
+    def _item_malformed(self, decision_id: str = "d-bad") -> dict:
+        """Return a batch item with an unrecognisable decision structure."""
+        return {
+            "decision_id": decision_id,
+            "tensor": np.zeros(64, dtype=np.float32),
+            "decision": {"random_key": 42},
+            "total_reward": 2.0,
+            "outcome_count": 1,
+            "overrides": [],
+            "timestamp": time.time(),
+        }
+
+    def test_two_section_input_produces_valid_target(self):
+        """Two-section decision → target is valid two-section JSON."""
+        loop, _, _ = _make_loop(min_positive_examples=1)
+        items = [self._item_two_section()]
+        exs = loop._build_training_examples(items)
+        assert len(exs) == 1
+        target = json.loads(exs[0]["target"])
+        assert "prefill" in target
+        assert "decode" in target
+        assert isinstance(target["prefill"], dict)
+        assert isinstance(target["decode"], dict)
+
+    def test_flat_input_produces_valid_target(self):
+        """Flat decision → target is valid two-section JSON."""
+        loop, _, _ = _make_loop(min_positive_examples=1)
+        items = [self._item_flat()]
+        exs = loop._build_training_examples(items)
+        assert len(exs) == 1
+        target = json.loads(exs[0]["target"])
+        assert "prefill" in target
+        assert "decode" in target
+
+    def test_two_section_target_contains_required_prefill_keys(self):
+        """Both cache_admission and throttle_back_pressure must be in prefill."""
+        loop, _, _ = _make_loop(min_positive_examples=1)
+        exs = loop._build_training_examples([self._item_two_section()])
+        target = json.loads(exs[0]["target"])
+        assert "cache_admission" in target["prefill"]
+        assert "throttle_back_pressure" in target["prefill"]
+
+    def test_two_section_target_contains_required_decode_keys(self):
+        """spec_decode_enable and spec_decode_depth must appear in decode section."""
+        loop, _, _ = _make_loop(min_positive_examples=1)
+        exs = loop._build_training_examples([self._item_two_section()])
+        target = json.loads(exs[0]["target"])
+        assert "spec_decode_enable" in target["decode"]
+        assert "spec_decode_depth" in target["decode"]
+
+    def test_malformed_decision_skipped_gracefully(self):
+        """A decision with neither flat keys nor two-section structure is silently skipped."""
+        loop, _, _ = _make_loop(min_positive_examples=1)
+        items = [self._item_malformed()]
+        exs = loop._build_training_examples(items)
+        # Malformed item must not crash — it should simply be excluded.
+        assert len(exs) == 0
+
+    def test_mixed_batch_handles_both_formats(self):
+        """A batch with both flat and two-section items should produce correct examples."""
+        loop, _, _ = _make_loop(min_positive_examples=1)
+        items = [
+            self._item_flat("d-flat"),
+            self._item_two_section("d-ts"),
+            self._item_malformed("d-bad"),
+        ]
+        exs = loop._build_training_examples(items)
+        # Malformed item skipped; the two valid items produce examples.
+        assert len(exs) == 2
+        ids = {e["decision_id"] for e in exs}
+        assert "d-flat" in ids
+        assert "d-ts" in ids
+        assert "d-bad" not in ids
+        # All targets are valid two-section JSON.
+        for ex in exs:
+            obj = json.loads(ex["target"])
+            assert "prefill" in obj and "decode" in obj
+
+    def test_end_to_end_via_reward_calculator(self):
+        """Full cycle: record_decision (flat) → record_outcome → get_training_batch →
+        verify the returned decision is in two-section format."""
+        from platform.reasoning.reward_calculator import RewardCalculator, Outcome
+
+        calc = RewardCalculator(db_path=":memory:")
+
+        # Simulate what record_decision stores (flat from to_dict()).
+        flat_decision = {
+            "cache_admission": True,
+            "admission_priority": 0.7,
+            "eviction_target": None,
+            "pre_warm_predictions": [],
+            "route_decision": None,
+            "batch_group": None,
+            "throttle_back_pressure": 0.0,
+            "inference_ms": 30.0,
+            "is_fallback": False,
+            "domain": "unified",
+            "spec_decode_enable": True,
+            "spec_decode_depth": 4,
+            "spec_mode": "v2_clean",
+            "spec_v3_block_size": 8,
+            "draft_temperature": 0.8,
+            "kv_compression_enable": False,
+            "kv_compression_ratio": 1.0,
+            "decode_batch_priority": 2,
+            "early_stop_confidence": 0.0,
+            "cuda_graph_hint": True,
+            "adaptive_depth_override": False,
+        }
+
+        # Build a minimal ExecutionResult mock.
+        result = MagicMock()
+        result.admitted = True
+        result.decision = flat_decision
+        result.overrides = []
+        result.throttle_applied = 0.0
+        result.spec_k_applied = 4
+
+        context = MagicMock()
+        context.tenant_id = "test-tenant"
+        context.node_id = "node-0"
+        context.tensor = np.zeros(64, dtype=np.float32)
+
+        calc.record_decision("did-001", result, context)
+        calc.record_outcome("did-001", Outcome.HIT_ADMITTED)
+
+        batch = calc.get_training_batch(limit=10)
+        assert len(batch) == 1
+        decision = batch[0]["decision"]
+        # Must be two-section now.
+        assert "prefill" in decision
+        assert "decode" in decision
+        assert isinstance(decision["prefill"], dict)
+        assert isinstance(decision["decode"], dict)
+        # Key content must be preserved.
+        assert decision["prefill"].get("cache_admission") is True
+        assert decision["decode"].get("spec_decode_enable") is True
+
+        # LearningLoop must produce valid two-section target from this batch.
+        loop, _, _ = _make_loop(min_positive_examples=1)
+        exs = loop._build_training_examples(batch)
+        assert len(exs) == 1
+        target = json.loads(exs[0]["target"])
+        assert "prefill" in target and "decode" in target
+        assert target["prefill"]["cache_admission"] is True
+        assert target["decode"]["spec_decode_enable"] is True
+
+        calc.close()
