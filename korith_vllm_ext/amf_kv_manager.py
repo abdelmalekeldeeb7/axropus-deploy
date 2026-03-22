@@ -1,0 +1,543 @@
+"""amf_kv_manager.py — Direct GPU KV cache save/restore through vLLM's CacheEngine.
+
+This module ports the C++ amf_direct_kv.cu logic to Python so that the vLLM
+production backend can skip the CPU deserialization bottleneck.
+
+Design notes:
+  - The AMF key hash functions are bit-for-bit identical to the C++ implementation
+    (FNV-1a, same constants, same field order) so snapshots are cross-compatible.
+  - KV data is moved with torch.cuda: H→D and D→H use pinned (page-locked) host
+    tensors to maximise PCIe throughput, matching the cudaMallocHost approach in C++.
+  - The AMF store file format is the same as amf_direct_kv.cu: AMFK header followed
+    by the per-layer info table, then the flat KV payload.
+  - vLLM's KV cache layout: gpu_cache is a list of tensors per layer, each with
+    shape [2, num_blocks, block_size, num_kv_heads, head_dim] (K and V stacked
+    on dim 0 in vLLM ≥ 0.6).  We handle both the stacked and split layouts.
+
+Dependencies:
+  - torch with CUDA
+  - vLLM >= 0.6.0
+"""
+
+from __future__ import annotations
+
+import hashlib
+import logging
+import os
+import struct
+import time
+from pathlib import Path
+from typing import Any, List, Optional, Sequence
+
+import torch
+
+logger = logging.getLogger(__name__)
+
+# ── FNV-1a constants (must match amf_store.cpp) ───────────────────────────────
+
+_FNV_OFFSET: int = 1469598103934665603  # 0x14650FB0739D0383
+_FNV_PRIME:  int = 1099511628211        # 0x00000100000001B3
+_U64_MASK:   int = (1 << 64) - 1
+
+# ── AMFK file format (must match amf_direct_kv.h) ────────────────────────────
+
+_AMFK_MAGIC:   int = 0x414D464B  # "AMFK"
+_AMFK_VERSION: int = 1
+
+# struct AmfDirectKvHeader { u32×8, u64×3 } = 56 bytes
+_HEADER_FMT  = "<IIIIIIII QQQ"
+_HEADER_SIZE = struct.calcsize(_HEADER_FMT)   # 56
+
+# struct AmfDirectKvLayerInfo { u64×4 } = 32 bytes
+_LAYER_FMT  = "<QQQQ"
+_LAYER_SIZE = struct.calcsize(_LAYER_FMT)     # 32
+
+assert _HEADER_SIZE == 56,  f"Header size changed: {_HEADER_SIZE}"
+assert _LAYER_SIZE  == 32,  f"Layer info size changed: {_LAYER_SIZE}"
+
+# ── AMF dtype tag (must match AmfKvDtype in amf_direct_kv.h) ─────────────────
+
+_DTYPE_TAG = {
+    torch.float16:  0,
+    torch.float32:  1,
+    torch.bfloat16: 2,
+}
+
+
+# ── Hash helpers (FNV-1a, byte-level, matching C++ hash_bytes / hash_token_prefix_step)
+
+def _fnv1a_bytes(data: bytes, h: int = _FNV_OFFSET) -> int:
+    for byte in data:
+        h = ((h ^ byte) * _FNV_PRIME) & _U64_MASK
+    return h
+
+
+def amf_hash_tokens(token_ids: Sequence[int]) -> int:
+    """FNV-1a over token ids as little-endian 32-bit ints (matches C++ amf_hash_tokens)."""
+    h = _FNV_OFFSET
+    for tok in token_ids:
+        # hash_token_prefix_step: h ^= (uint64_t)(uint32_t)tok; h *= prime
+        h = ((h ^ (tok & 0xFFFFFFFF)) * _FNV_PRIME) & _U64_MASK
+    return h
+
+
+def amf_hash_tenant_id(tenant_id: str) -> int:
+    """FNV-1a over UTF-8 encoded tenant string (matches C++ amf_hash_tenant_id)."""
+    if not tenant_id:
+        return _FNV_OFFSET
+    return _fnv1a_bytes(tenant_id.encode("utf-8"))
+
+
+def amf_hash_model(model_path: str) -> int:
+    """FNV-1a over the model file bytes (matches C++ amf_hash_file).
+
+    This is expensive for large models.  In practice, callers should cache the
+    result or supply the hash from an env var (KORITH_AMF_MODEL_HASH).
+    """
+    h = _FNV_OFFSET
+    path = Path(model_path)
+    if not path.exists():
+        return 0
+    buf_size = 1 << 20  # 1 MiB
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(buf_size)
+            if not chunk:
+                break
+            h = _fnv1a_bytes(chunk, h)
+    return h
+
+
+def amf_float_bits(v: float) -> int:
+    """Return the IEEE-754 bit pattern of a 32-bit float (matches C++ amf_float_bits)."""
+    return struct.unpack("<I", struct.pack("<f", v))[0]
+
+
+# ── AMF filename format ───────────────────────────────────────────────────────
+
+def amf_key_filename(
+    model_hash: int,
+    tenant_hash: int,
+    prefix_hash: int,
+    n_ctx: int,
+    kv_version: int,
+    rope_base_bits: int,
+    rope_scale_bits: int,
+    sampling_hash: int,
+    rng_hash: int,
+) -> str:
+    """Reproduce the C++ AmfStore entry_basename() naming convention."""
+    return (
+        f"amf_{model_hash:016x}_{tenant_hash:016x}_{prefix_hash:016x}"
+        f"_{n_ctx}_{kv_version}_{rope_base_bits}_{rope_scale_bits}"
+        f"_{sampling_hash:016x}_{rng_hash:016x}"
+    )
+
+
+# ── AmfKvManager ─────────────────────────────────────────────────────────────
+
+class AmfKvManager:
+    """Direct GPU KV cache save/restore through vLLM's CacheEngine.
+
+    The save path:
+      1. Iterates over gpu_cache layers and extracts the K/V data for the
+         given sequence's physical blocks.
+      2. Copies from GPU to pinned host memory.
+      3. Writes the AMFK blob to the AMF store directory.
+
+    The restore path:
+      1. Reads the AMFK blob from disk.
+      2. Allocates physical blocks in vLLM's block manager.
+      3. Copies KV data from host to the allocated GPU blocks.
+      4. Updates sequence metadata so vLLM treats the sequence as fully prefilled.
+    """
+
+    def __init__(
+        self,
+        cache_engine: Any,
+        amf_store_path: str,
+        model_config: Any,
+        *,
+        model_hash: int = 0,
+        tenant_id: str = "__shared__",
+        kv_version: int = 1,
+        rope_base: float = 10000.0,
+        rope_scale: float = 1.0,
+        sampling_hash: int = 0,
+        rng_hash: int = 0,
+    ) -> None:
+        """
+        Args:
+            cache_engine:    vLLM CacheEngine instance.
+            amf_store_path:  Path to the AMF store directory on disk.
+            model_config:    vLLM ModelConfig (has num_attention_layers, etc.).
+            model_hash:      Pre-computed file hash (0 = disabled).
+            tenant_id:       Tenant string for multi-tenant key isolation.
+            kv_version:      Increment when KV format changes.
+            rope_base:       Model RoPE base frequency.
+            rope_scale:      Model RoPE scale factor.
+            sampling_hash:   Hash of sampling parameters (0 = greedy).
+            rng_hash:        RNG seed hash (0 = deterministic).
+        """
+        self._cache_engine   = cache_engine
+        self._store_path     = Path(amf_store_path)
+        self._model_config   = model_config
+        self._model_hash     = model_hash
+        self._tenant_hash    = amf_hash_tenant_id(tenant_id)
+        self._kv_version     = kv_version
+        self._rope_base_bits = amf_float_bits(rope_base)
+        self._rope_scale_bits = amf_float_bits(rope_scale)
+        self._sampling_hash  = sampling_hash
+        self._rng_hash       = rng_hash
+
+        self._store_path.mkdir(parents=True, exist_ok=True)
+
+        # Statistics.
+        self._hits:       int   = 0
+        self._misses:     int   = 0
+        self._saves:      int   = 0
+        self._restore_ms: float = 0.0
+
+    # ── Key computation ───────────────────────────────────────────────────────
+
+    def compute_amf_key(
+        self,
+        prompt_tokens: Sequence[int],
+        n_ctx: Optional[int] = None,
+    ) -> dict:
+        """Compute the 9-field AmfKey matching the C++ implementation."""
+        prefix_hash = amf_hash_tokens(prompt_tokens)
+        effective_n_ctx = n_ctx or getattr(self._model_config, "max_model_len", 0)
+        return {
+            "model_hash":      self._model_hash,
+            "tenant_hash":     self._tenant_hash,
+            "prefix_hash":     prefix_hash,
+            "n_ctx":           effective_n_ctx,
+            "kv_version":      self._kv_version,
+            "rope_base_bits":  self._rope_base_bits,
+            "rope_scale_bits": self._rope_scale_bits,
+            "sampling_hash":   self._sampling_hash,
+            "rng_hash":        self._rng_hash,
+        }
+
+    def _kv_filename(self, key: dict) -> Path:
+        stem = amf_key_filename(
+            model_hash     = key["model_hash"],
+            tenant_hash    = key["tenant_hash"],
+            prefix_hash    = key["prefix_hash"],
+            n_ctx          = key["n_ctx"],
+            kv_version     = key["kv_version"],
+            rope_base_bits = key["rope_base_bits"],
+            rope_scale_bits= key["rope_scale_bits"],
+            sampling_hash  = key["sampling_hash"],
+            rng_hash       = key["rng_hash"],
+        )
+        return self._store_path / (stem + ".kv")
+
+    def _tok_filename(self, key: dict) -> Path:
+        stem = amf_key_filename(
+            model_hash     = key["model_hash"],
+            tenant_hash    = key["tenant_hash"],
+            prefix_hash    = key["prefix_hash"],
+            n_ctx          = key["n_ctx"],
+            kv_version     = key["kv_version"],
+            rope_base_bits = key["rope_base_bits"],
+            rope_scale_bits= key["rope_scale_bits"],
+            sampling_hash  = key["sampling_hash"],
+            rng_hash       = key["rng_hash"],
+        )
+        return self._store_path / (stem + ".tok")
+
+    # ── Snapshot existence check ──────────────────────────────────────────────
+
+    def has_snapshot(self, prompt_tokens: Sequence[int]) -> bool:
+        """Return True if a valid AMFK snapshot exists for these tokens."""
+        key = self.compute_amf_key(prompt_tokens)
+        return self._kv_filename(key).exists()
+
+    # ── Save ──────────────────────────────────────────────────────────────────
+
+    def save_kv_state(
+        self,
+        prompt_tokens: Sequence[int],
+        block_table: List[int],
+        *,
+        saved_ms: float = 0.0,
+    ) -> bool:
+        """Save KV cache blocks for a sequence after prefill.
+
+        Args:
+            prompt_tokens:  Full prompt token IDs for key derivation.
+            block_table:    Physical block IDs assigned to this sequence.
+            saved_ms:       Estimated time saved (for ROI tracking).
+
+        Returns:
+            True on success.
+        """
+        t0 = time.monotonic()
+        key = self.compute_amf_key(prompt_tokens)
+        kv_path = self._kv_filename(key)
+
+        gpu_cache = self._cache_engine.gpu_cache  # list of tensors per layer
+        n_layers  = len(gpu_cache)
+
+        if n_layers == 0:
+            logger.warning("[AMF_VLLM] save: no GPU cache layers")
+            return False
+
+        n_tokens    = len(prompt_tokens)
+        block_size  = gpu_cache[0].shape[-2] if gpu_cache[0].dim() >= 4 else 1
+
+        # ── Collect KV data from physical blocks ──────────────────────────────
+        # gpu_cache[layer] shape variants (vLLM ≥ 0.6 stacked, or split):
+        #   stacked: [2, num_blocks, num_kv_heads, block_size, head_dim]
+        #   split:   [num_blocks, num_kv_heads, block_size, head_dim]
+        layer_k_tensors: List[torch.Tensor] = []
+        layer_v_tensors: List[torch.Tensor] = []
+
+        for layer_cache in gpu_cache:
+            if layer_cache.dim() == 5 and layer_cache.shape[0] == 2:
+                # Stacked KV layout.
+                k_all = layer_cache[0]  # [num_blocks, num_kv_heads, block_size, head_dim]
+                v_all = layer_cache[1]
+            elif layer_cache.dim() == 4:
+                # Split K only; V is the second half along blocks dim — fallback.
+                k_all = layer_cache
+                v_all = layer_cache  # same tensor — caller must know layout
+            else:
+                k_all = layer_cache
+                v_all = layer_cache
+
+            # Gather only the blocks used by this sequence.
+            if block_table:
+                block_ids = torch.tensor(block_table, device=k_all.device, dtype=torch.long)
+                k_seq = k_all[block_ids].contiguous()   # [n_blocks, n_kv_heads, block_size, head_dim]
+                v_seq = v_all[block_ids].contiguous()
+            else:
+                k_seq = k_all.contiguous()
+                v_seq = v_all.contiguous()
+
+            layer_k_tensors.append(k_seq)
+            layer_v_tensors.append(v_seq)
+
+        # ── Build the AMFK blob ───────────────────────────────────────────────
+        dtype_tag = _DTYPE_TAG.get(layer_k_tensors[0].dtype, 0)
+
+        # Compute per-layer offsets.
+        layer_infos: List[tuple] = []
+        total_kv_bytes = 0
+        for k_t, v_t in zip(layer_k_tensors, layer_v_tensors):
+            k_bytes = k_t.numel() * k_t.element_size()
+            v_bytes = v_t.numel() * v_t.element_size()
+            layer_infos.append((total_kv_bytes, k_bytes, total_kv_bytes + k_bytes, v_bytes))
+            total_kv_bytes += k_bytes + v_bytes
+
+        # Sample n_kv_heads / head_dim from first layer.
+        sample = layer_k_tensors[0]
+        n_kv_heads = sample.shape[-3] if sample.dim() >= 3 else 1
+        head_dim   = sample.shape[-1]
+
+        # Write header.
+        header = struct.pack(
+            _HEADER_FMT,
+            _AMFK_MAGIC,        # magic
+            _AMFK_VERSION,      # version
+            n_layers,           # n_layers
+            n_tokens,           # n_tokens
+            n_kv_heads,         # n_kv_heads
+            head_dim,           # head_dim
+            dtype_tag,          # dtype
+            0,                  # reserved
+            total_kv_bytes,     # total_kv_bytes
+            key["model_hash"],  # model_hash
+            key["prefix_hash"], # prefix_hash
+        )
+
+        # Write layer info table.
+        layer_tbl = b""
+        for k_off, k_sz, v_off, v_sz in layer_infos:
+            layer_tbl += struct.pack(_LAYER_FMT, k_off, k_sz, v_off, v_sz)
+
+        # Copy KV tensors D→H using pinned memory for maximum PCIe throughput.
+        kv_payload = bytearray(total_kv_bytes)
+        mv = memoryview(kv_payload)
+
+        for (k_off, k_sz, v_off, v_sz), k_t, v_t in zip(
+            layer_infos, layer_k_tensors, layer_v_tensors
+        ):
+            k_cpu = k_t.cpu()   # triggers cudaMemcpy D→H
+            v_cpu = v_t.cpu()
+            mv[k_off : k_off + k_sz] = k_cpu.numpy().tobytes()
+            mv[v_off : v_off + v_sz] = v_cpu.numpy().tobytes()
+
+        blob = header + layer_tbl + bytes(kv_payload)
+
+        # Write atomically via temp file.
+        tmp_path = kv_path.with_suffix(".kv.tmp")
+        try:
+            tmp_path.write_bytes(blob)
+            tmp_path.rename(kv_path)
+        except OSError as exc:
+            logger.warning("[AMF_VLLM] save: write failed: %s", exc)
+            tmp_path.unlink(missing_ok=True)
+            return False
+
+        # Write token file (same format as C++ write_tokens_file).
+        tok_bytes = struct.pack(f"<{n_tokens}i", *prompt_tokens)
+        tok_path  = self._tok_filename(key)
+        try:
+            tok_path.write_bytes(tok_bytes)
+        except OSError as exc:
+            logger.warning("[AMF_VLLM] save: tok write failed: %s", exc)
+
+        elapsed_ms = (time.monotonic() - t0) * 1000.0
+        self._saves += 1
+        logger.info(
+            "[AMF_VLLM] save: %d layers, %d tokens, %.1f MB in %.0f ms",
+            n_layers,
+            n_tokens,
+            total_kv_bytes / (1024 * 1024),
+            elapsed_ms,
+        )
+        return True
+
+    # ── Restore ───────────────────────────────────────────────────────────────
+
+    def restore_kv_state(
+        self,
+        prompt_tokens: Sequence[int],
+        block_table: List[int],
+    ) -> int:
+        """Restore KV cache from an AMF snapshot into the given physical blocks.
+
+        Args:
+            prompt_tokens:  Full prompt token IDs (used to look up the snapshot).
+            block_table:    Physical block IDs allocated for this sequence.
+
+        Returns:
+            Number of tokens restored, or 0 on failure.
+        """
+        t0 = time.monotonic()
+        key      = self.compute_amf_key(prompt_tokens)
+        kv_path  = self._kv_filename(key)
+
+        if not kv_path.exists():
+            self._misses += 1
+            return 0
+
+        try:
+            blob = kv_path.read_bytes()
+        except OSError as exc:
+            logger.warning("[AMF_VLLM] restore: read failed: %s", exc)
+            self._misses += 1
+            return 0
+
+        if len(blob) < _HEADER_SIZE:
+            logger.warning("[AMF_VLLM] restore: blob too small (%d bytes)", len(blob))
+            self._misses += 1
+            return 0
+
+        # Parse header.
+        (
+            magic, version, n_layers_snap, n_tokens,
+            n_kv_heads, head_dim, dtype_tag, _reserved,
+            total_kv_bytes, model_hash_snap, prefix_hash_snap,
+        ) = struct.unpack_from(_HEADER_FMT, blob, 0)
+
+        if magic != _AMFK_MAGIC:
+            logger.warning(
+                "[AMF_VLLM] restore: wrong magic 0x%08X (expected AMFK)", magic
+            )
+            self._misses += 1
+            return 0
+
+        if version != _AMFK_VERSION:
+            logger.warning(
+                "[AMF_VLLM] restore: version mismatch (got=%d, want=%d)", version, _AMFK_VERSION
+            )
+            self._misses += 1
+            return 0
+
+        gpu_cache = self._cache_engine.gpu_cache
+        n_layers_ctx = len(gpu_cache)
+
+        if n_layers_snap != n_layers_ctx:
+            logger.warning(
+                "[AMF_VLLM] restore: layer count mismatch (snap=%d, ctx=%d)",
+                n_layers_snap, n_layers_ctx,
+            )
+            self._misses += 1
+            return 0
+
+        # Parse layer info table.
+        layer_tbl_bytes = n_layers_snap * _LAYER_SIZE
+        hdr_end = _HEADER_SIZE
+        if len(blob) < hdr_end + layer_tbl_bytes:
+            logger.warning("[AMF_VLLM] restore: blob truncated (layer table missing)")
+            self._misses += 1
+            return 0
+
+        layer_infos: List[tuple] = []
+        for i in range(n_layers_snap):
+            off = hdr_end + i * _LAYER_SIZE
+            layer_infos.append(struct.unpack_from(_LAYER_FMT, blob, off))
+
+        kv_payload = blob[hdr_end + layer_tbl_bytes:]
+
+        # Restore tensors into gpu_cache at the allocated physical blocks.
+        for layer_idx, (layer_cache, (k_off, k_sz, v_off, v_sz)) in enumerate(
+            zip(gpu_cache, layer_infos)
+        ):
+            if k_sz == 0 and v_sz == 0:
+                continue  # SSM layer — no KV
+
+            # Determine tensor dtype.
+            cache_dtype = layer_cache.dtype
+
+            # Determine the layout (stacked vs split).
+            if layer_cache.dim() == 5 and layer_cache.shape[0] == 2:
+                k_all = layer_cache[0]
+                v_all = layer_cache[1]
+            else:
+                k_all = layer_cache
+                v_all = layer_cache
+
+            if not block_table:
+                continue
+
+            block_ids = torch.tensor(block_table, device=k_all.device, dtype=torch.long)
+
+            # Reconstruct tensors from the blob and move to GPU.
+            k_flat = torch.frombuffer(
+                bytearray(kv_payload[k_off : k_off + k_sz]), dtype=cache_dtype
+            )
+            v_flat = torch.frombuffer(
+                bytearray(kv_payload[v_off : v_off + v_sz]), dtype=cache_dtype
+            )
+
+            k_src = k_flat.reshape(k_all[block_ids].shape).to(k_all.device)
+            v_src = v_flat.reshape(v_all[block_ids].shape).to(v_all.device)
+
+            # Scatter restored KV into the cache at the physical block positions.
+            k_all[block_ids] = k_src
+            v_all[block_ids] = v_src
+
+        elapsed_ms = (time.monotonic() - t0) * 1000.0
+        self._hits     += 1
+        self._restore_ms = elapsed_ms
+
+        logger.info(
+            "[AMF_VLLM] restore: %d layers, %d tokens, %.1f ms",
+            n_layers_ctx, n_tokens, elapsed_ms,
+        )
+        return int(n_tokens)
+
+    # ── Stats ─────────────────────────────────────────────────────────────────
+
+    def stats(self) -> dict:
+        return {
+            "hits":       self._hits,
+            "misses":     self._misses,
+            "saves":      self._saves,
+            "restore_ms": self._restore_ms,
+        }

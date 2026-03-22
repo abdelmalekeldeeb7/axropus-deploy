@@ -9,6 +9,15 @@ from typing import Any
 from vllm.logger import init_logger
 from vllm.v1.core.sched.scheduler import Scheduler
 
+# AMF hook (lazy import to avoid hard dependency when not configured).
+_AMF_HOOK_AVAILABLE = False
+try:
+    from .amf_scheduler_hook import AmfSchedulerHook  # noqa: F401
+    from .amf_kv_manager import AmfKvManager          # noqa: F401
+    _AMF_HOOK_AVAILABLE = True
+except ImportError:
+    pass
+
 logger = init_logger(__name__)
 _TRUTHY = ("1", "true", "yes", "on")
 
@@ -140,6 +149,26 @@ class KorithDecodeScheduler(Scheduler):
         self._korith_sched_total_ms = 0.0
         self._korith_sched_max_ms = 0.0
         self._korith_base_max_num_scheduled_tokens = int(self.max_num_scheduled_tokens)
+
+        # ── AMF scheduler hook (optional) ─────────────────────────────────────
+        self._amf_hook: Any = None
+        amf_path = str(os.environ.get("KORITH_AMF_PATH", "")).strip()
+        if _AMF_HOOK_AVAILABLE and _env_truthy("KORITH_ENABLE_AMF") and amf_path:
+            try:
+                cache_engine = getattr(self, "cache_engine", None)
+                model_config = getattr(self, "model_config", None)
+                if cache_engine is not None and model_config is not None:
+                    kv_manager = AmfKvManager(
+                        cache_engine=cache_engine,
+                        amf_store_path=amf_path,
+                        model_config=model_config,
+                        tenant_id=str(os.environ.get("KORITH_TENANT_ID", "__shared__")),
+                    )
+                    self._amf_hook = AmfSchedulerHook(kv_manager)
+                    logger.info("KorithDecodeScheduler: AMF hook enabled (path=%s)", amf_path)
+            except Exception as _amf_exc:
+                logger.warning("KorithDecodeScheduler: AMF hook init failed: %s", _amf_exc)
+
         logger.info(
             "KorithDecodeScheduler enabled decode_first=%s adaptive_budget=%s base_tokens=%d full_budget_on_hit=%s",
             self._korith_decode_first,
@@ -231,6 +260,57 @@ class KorithDecodeScheduler(Scheduler):
         if hinted > 0:
             return hinted
         return int(getattr(req, "num_prompt_tokens", 0) or 0)
+
+    # ── AMF hook helpers ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _get_prompt_token_ids(req: Any) -> Any:
+        """Return prompt token IDs from a vLLM request, or None."""
+        try:
+            seqs = req.get_seqs()
+            if seqs:
+                return list(seqs[0].data.prompt_token_ids)
+        except AttributeError:
+            pass
+        try:
+            return list(req.prompt_token_ids)
+        except AttributeError:
+            return None
+
+    @staticmethod
+    def _get_block_table(req: Any) -> list:
+        """Return physical block IDs for the first sequence in req."""
+        try:
+            blocks = req.get_block_table()
+            return [b.block_number for b in blocks] if blocks else []
+        except AttributeError:
+            return []
+
+    @staticmethod
+    def _promote_to_running(req: Any) -> None:
+        """Mark request status as RUNNING (prefill-complete) for vLLM routing."""
+        try:
+            from vllm.sequence import SequenceStatus  # type: ignore[import]
+            for seq in req.get_seqs(status=SequenceStatus.WAITING):
+                seq.status = SequenceStatus.RUNNING
+        except Exception:
+            pass
+
+    def _notify_after_prefill(self, result: Any) -> None:
+        """Call AMF after_prefill hook for sequences that just completed prefill."""
+        if self._amf_hook is None or result is None:
+            return
+        try:
+            newly_prefilled = getattr(result, "newly_prefilled", None) or []
+            for req in newly_prefilled:
+                prompt_tokens = self._get_prompt_token_ids(req)
+                if prompt_tokens:
+                    block_table = self._get_block_table(req)
+                    self._amf_hook.after_prefill(req, block_table)
+        except Exception as exc:
+            logger.debug("AMF hook after_prefill error: %s", exc)
+
+    # ─────────────────────────────────────────────────────────────────────────
 
     def _dominant_decode_shape(self) -> str:
         counts: dict[str, int] = {}
@@ -543,6 +623,21 @@ class KorithDecodeScheduler(Scheduler):
                 except Exception:
                     pass
 
+        # ── AMF pre-prefill check ─────────────────────────────────────────────
+        if self._amf_hook is not None:
+            waiting_queue = self.waiting if self.waiting is not None else []
+            for req in list(waiting_queue):
+                try:
+                    prompt_tokens_list = self._get_prompt_token_ids(req)
+                    if prompt_tokens_list is not None:
+                        block_table = self._get_block_table(req)
+                        hit = self._amf_hook.before_prefill(req, block_table)
+                        if hit:
+                            # Sequence is prefill-complete — move to running.
+                            self._promote_to_running(req)
+                except Exception as _hook_exc:
+                    logger.debug("AMF hook before_prefill error: %s", _hook_exc)
+
         old_budget = int(self.max_num_scheduled_tokens)
         self.max_num_scheduled_tokens = int(self._korith_effective_budget())
         try:
@@ -566,8 +661,20 @@ class KorithDecodeScheduler(Scheduler):
                 except Exception:
                     pass
 
+            # ── AMF post-prefill save ─────────────────────────────────────────
+            self._notify_after_prefill(result)
+
             return result
         finally:
             self.max_num_scheduled_tokens = old_budget
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
             self._emit_sched_trace(elapsed_ms)
+
+    def shutdown(self) -> None:
+        """Emit AMF summary on shutdown."""
+        if self._amf_hook is not None:
+            self._amf_hook.log_summary()
+        try:
+            super().shutdown()  # type: ignore[misc]
+        except AttributeError:
+            pass
