@@ -214,6 +214,12 @@ public:
                                       AmfEntry * out_entry,
                                       std::vector<llama_token> * out_tokens);
   bool load_kv(const AmfEntry & entry, std::vector<std::uint8_t> * out) const;
+  // Load KV blob directly into a caller-provided buffer (e.g. pinned memory),
+  // avoiding the intermediate heap allocation in load_kv().  buf must be at
+  // least entry.size_bytes bytes.  Sets *out_size to the actual bytes read.
+  bool load_kv_into(const AmfEntry & entry,
+                    void * buf, std::size_t buf_size,
+                    std::size_t * out_size) const;
   bool store_entry(const AmfContext & ctx,
                    const std::vector<llama_token> & tokens,
                    const std::uint8_t * kv_data,

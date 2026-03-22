@@ -309,22 +309,41 @@ bool amf_direct_kv_restore(AmfDirectKvCtx * dkv,
 #else
   if (!dkv || !lctx) return false;
 
-  // ── Load the blob from disk ────────────────────────────────────────────────
-  std::vector<std::uint8_t> blob;
-  if (!store.load_kv(entry, &blob)) {
-    std::fprintf(stderr, "[AMF_DIRECT_KV] restore: load_kv failed\n");
+  // ── Pre-size pinned buffer using the stored size, then load directly ───────
+  // entry.size_bytes is set on admission and is the exact file size, so we
+  // can allocate before opening the file — eliminating the intermediate heap
+  // vector and the extra memcpy that the old load_kv() path required.
+  const std::size_t expected_size = static_cast<std::size_t>(entry.size_bytes);
+  if (expected_size < sizeof(AmfDirectKvHeader)) {
+    std::fprintf(stderr, "[AMF_DIRECT_KV] restore: entry.size_bytes too small (%zu)\n",
+                 expected_size);
+    return false;
+  }
+  if (!ensure_pinned(dkv, expected_size)) {
+    std::fprintf(stderr, "[AMF_DIRECT_KV] restore: pinned alloc failed for %zu MB\n",
+                 expected_size / (1024 * 1024));
     return false;
   }
 
-  if (blob.size() < sizeof(AmfDirectKvHeader)) {
-    std::fprintf(stderr, "[AMF_DIRECT_KV] restore: blob too small (%zu bytes)\n",
-                 blob.size());
+  std::size_t blob_size = 0;
+  if (!store.load_kv_into(entry, dkv->pinned_buf, dkv->pinned_size, &blob_size)) {
+    std::fprintf(stderr, "[AMF_DIRECT_KV] restore: load_kv_into failed\n");
     return false;
   }
+
+  if (blob_size < sizeof(AmfDirectKvHeader)) {
+    std::fprintf(stderr, "[AMF_DIRECT_KV] restore: blob too small (%zu bytes)\n",
+                 blob_size);
+    return false;
+  }
+
+  // The full blob is now in pinned memory — parse header directly from there.
+  const std::uint8_t * pinned_base =
+      reinterpret_cast<const std::uint8_t *>(dkv->pinned_buf);
 
   // ── Parse header ──────────────────────────────────────────────────────────
   AmfDirectKvHeader hdr{};
-  std::memcpy(&hdr, blob.data(), sizeof(hdr));
+  std::memcpy(&hdr, pinned_base, sizeof(hdr));
 
   if (hdr.magic != kAmfDirectKvMagic) {
     std::fprintf(stderr,
@@ -339,18 +358,18 @@ bool amf_direct_kv_restore(AmfDirectKvCtx * dkv,
     return false;
   }
 
-  const std::uint32_t n_layers_saved = hdr.n_layers;
-  const std::size_t   layer_tbl_bytes = n_layers_saved * sizeof(AmfDirectKvLayerInfo);
+  const std::uint32_t n_layers_saved  = hdr.n_layers;
   const std::size_t   hdr_bytes       = sizeof(AmfDirectKvHeader);
+  const std::size_t   layer_tbl_bytes = n_layers_saved * sizeof(AmfDirectKvLayerInfo);
 
-  if (blob.size() < hdr_bytes + layer_tbl_bytes) {
+  if (blob_size < hdr_bytes + layer_tbl_bytes) {
     std::fprintf(stderr, "[AMF_DIRECT_KV] restore: blob truncated (layer table missing)\n");
     return false;
   }
 
-  // ── Parse layer info table ─────────────────────────────────────────────────
+  // ── Parse layer info table directly from pinned memory ────────────────────
   std::vector<AmfDirectKvLayerInfo> layer_infos(n_layers_saved);
-  std::memcpy(layer_infos.data(), blob.data() + hdr_bytes, layer_tbl_bytes);
+  std::memcpy(layer_infos.data(), pinned_base + hdr_bytes, layer_tbl_bytes);
 
   // ── Validate against current KV cache layout ──────────────────────────────
   llama_kv_cache & kv = lctx->kv_self;
@@ -365,22 +384,9 @@ bool amf_direct_kv_restore(AmfDirectKvCtx * dkv,
     return false;
   }
 
-  // ── Copy blob KV payload into pinned buffer for H→D transfer ──────────────
-  const std::uint8_t * kv_payload =
-      blob.data() + hdr_bytes + layer_tbl_bytes;
-  const std::size_t kv_payload_size =
-      blob.size() - hdr_bytes - layer_tbl_bytes;
-
-  if (!ensure_pinned(dkv, kv_payload_size)) {
-    std::fprintf(stderr, "[AMF_DIRECT_KV] restore: pinned alloc failed for %zu MB\n",
-                 kv_payload_size / (1024 * 1024));
-    return false;
-  }
-
-  std::memcpy(dkv->pinned_buf, kv_payload, kv_payload_size);
-
-  const std::uint8_t * pinned_kv =
-      reinterpret_cast<const std::uint8_t *>(dkv->pinned_buf);
+  // KV payload is already in pinned memory — issue H→D copies directly.
+  const std::uint8_t * pinned_kv = pinned_base + hdr_bytes + layer_tbl_bytes;
+  const std::size_t kv_payload_size = blob_size - hdr_bytes - layer_tbl_bytes;
 
   // ── Issue H→D copies for each attention layer ─────────────────────────────
   for (std::uint32_t il = 0; il < n_layers_ctx; il++) {
