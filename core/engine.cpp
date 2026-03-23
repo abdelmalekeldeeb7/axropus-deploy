@@ -12,6 +12,7 @@
 // - Tokens are printed to stdout as detokenized pieces; the return value is the number of decoded tokens
 //   advanced this step (including tokens that render to an empty string).
 
+#include "amf_direct_kv.h"
 #include "amf_store.h"
 #include "bindings.h"
 #include "cuda_graph_decode.h"
@@ -840,6 +841,9 @@ struct EngineState {
   korith::core::AmfStore amf;
   korith::core::AmfContext amf_ctx{};
   bool amf_ready = false;
+  // Direct-GPU KV path (KORITH_AMF_DIRECT_GPU=1).
+  korith::core::AmfDirectKvCtx * amf_direct_kv_ctx = nullptr;
+  bool amf_direct_gpu_enabled = false;
   float amf_reuse_score = 0.0f;
   float amf_avg_prefix_len = 0.0f;
   float amf_accept_rate = 0.0f;
@@ -1153,6 +1157,11 @@ void fallback_decode_cb(korith::core::Context & ctx) {
 
 void shutdown_unlocked() {
   g.amf.shutdown();
+  if (g.amf_direct_kv_ctx) {
+    korith::core::amf_direct_kv_free(g.amf_direct_kv_ctx);
+    g.amf_direct_kv_ctx = nullptr;
+    g.amf_direct_gpu_enabled = false;
+  }
   korith::core::cuda_graph_decode_invalidate_all();
 
   if (g.batch_draft_inited) {
@@ -2492,6 +2501,23 @@ bool engine_init(const char * model_path) {
       }
     }
 
+    // Direct-GPU KV path — enabled via KORITH_AMF_DIRECT_GPU=1.
+    {
+      const char * dkv_env = std::getenv("KORITH_AMF_DIRECT_GPU");
+      const bool want_direct = dkv_env && dkv_env[0] == '1';
+      if (want_direct && g.amf_ready) {
+        // Allocate a 32 GB pinned buffer by default; resize on first save if
+        // needed (ensure_pinned will grow it).  Zero means allocate-on-demand.
+        constexpr std::size_t kDefaultPinnedBytes = 0;
+        g.amf_direct_kv_ctx =
+            korith::core::amf_direct_kv_init(kDefaultPinnedBytes);
+        g.amf_direct_gpu_enabled = (g.amf_direct_kv_ctx != nullptr);
+        std::fprintf(stderr, "[AMF_DIRECT_GPU] %s\n",
+                     g.amf_direct_gpu_enabled ? "enabled" : "init_failed");
+        (void) std::fflush(stderr);
+      }
+    }
+
     reset_runtime_state_unlocked();
     korith::core::cuda_graph_log_config_once();
     g.memory_field.last.min_admit_roi = g.amf.min_admit_roi();
@@ -2731,10 +2757,34 @@ bool engine_init(const char * model_path) {
             }
             const auto load_t0 = std::chrono::steady_clock::now();
             double suffix_ms = 0.0;
-            std::vector<std::uint8_t> kv_blob;
-            if (g.amf.load_kv(hit_entry, &kv_blob)) {
-              const std::size_t got = llama_state_set_data(g.ctx_target, kv_blob.data(), kv_blob.size());
-              if (got == kv_blob.size()) {
+            // ── Restore path: direct-GPU (fast) or legacy llama_state_set_data ──
+            bool restore_ok = false;
+            if (g.amf_direct_gpu_enabled && g.amf_direct_kv_ctx) {
+              // Peek at the blob header to decide which format it is.
+              std::vector<std::uint8_t> peek;
+              if (g.amf.load_kv(hit_entry, &peek)) {
+                if (korith::core::amf_direct_kv_is_direct_format(peek.data(), peek.size())) {
+                  // Direct-GPU path: write blob back to a temp entry, then restore.
+                  // Since load_kv already read the data, we pass it via a temporary
+                  // store operation.  For the direct path the blob IS the snapshot.
+                  restore_ok = korith::core::amf_direct_kv_restore(
+                      g.amf_direct_kv_ctx, g.ctx_target, hit_entry, g.amf);
+                } else {
+                  // Legacy blob — fall through to llama_state_set_data below.
+                  const std::size_t got =
+                      llama_state_set_data(g.ctx_target, peek.data(), peek.size());
+                  restore_ok = (got == peek.size());
+                }
+              }
+            } else {
+              std::vector<std::uint8_t> kv_blob;
+              if (g.amf.load_kv(hit_entry, &kv_blob)) {
+                const std::size_t got =
+                    llama_state_set_data(g.ctx_target, kv_blob.data(), kv_blob.size());
+                restore_ok = (got == kv_blob.size());
+              }
+            }
+            if (restore_ok) {
                 const auto load_t1 = std::chrono::steady_clock::now();
                 const double load_ms =
                     std::chrono::duration<double, std::milli>(load_t1 - load_t0).count();
@@ -2915,9 +2965,6 @@ bool engine_init(const char * model_path) {
               } else {
                 amf_fallback = true;
               }
-            } else {
-              amf_fallback = true;
-            }
           } else {
             g.amf.note_miss();
             const char * reason = korith::core::amf_lookup_reason_name(lookup);
@@ -3000,27 +3047,45 @@ amf_skip_lookup:
       if (g.amf_ready &&
           amf_store_tokens.size() >= g.amf.min_tokens() &&
           (!used_amf || amf_prefix_extended)) {
-        const std::size_t size = llama_state_get_size(g.ctx_target);
-        if (size > 0) {
-          std::vector<std::uint8_t> kv_blob(size);
-          const std::size_t got = llama_state_get_data(g.ctx_target, kv_blob.data(), kv_blob.size());
-          if (got == kv_blob.size()) {
-            if (g.amf.store_entry(
-                amf_ctx_request,
-                amf_store_tokens,
-                kv_blob.data(),
-                kv_blob.size(),
-                admit_saved_ms)) {
-              g.amf.note_store(admit_saved_ms);
-              if (amf_prefix_extended) {
-                std::fprintf(stderr,
-                             "[AMF_ADMIT_UPGRADE] old_prefix=%u new_prefix=%zu\n",
-                             hit_entry.prefix_len,
-                             amf_store_tokens.size());
-                (void) std::fflush(stderr);
+        bool stored = false;
+        if (g.amf_direct_gpu_enabled && g.amf_direct_kv_ctx) {
+          // Direct-GPU save path: bypass llama_state_get_data serialization.
+          stored = korith::core::amf_direct_kv_save(
+              g.amf_direct_kv_ctx,
+              g.ctx_target,
+              amf_ctx_request,
+              amf_store_tokens,
+              g.amf,
+              admit_saved_ms);
+          if (stored) {
+            g.amf.note_store(admit_saved_ms);
+          }
+        } else {
+          // Legacy path: serialize via llama_state_get_data.
+          const std::size_t size = llama_state_get_size(g.ctx_target);
+          if (size > 0) {
+            std::vector<std::uint8_t> kv_blob(size);
+            const std::size_t got =
+                llama_state_get_data(g.ctx_target, kv_blob.data(), kv_blob.size());
+            if (got == kv_blob.size()) {
+              stored = g.amf.store_entry(
+                  amf_ctx_request,
+                  amf_store_tokens,
+                  kv_blob.data(),
+                  kv_blob.size(),
+                  admit_saved_ms);
+              if (stored) {
+                g.amf.note_store(admit_saved_ms);
               }
             }
           }
+        }
+        if (stored && amf_prefix_extended) {
+          std::fprintf(stderr,
+                       "[AMF_ADMIT_UPGRADE] old_prefix=%u new_prefix=%zu\n",
+                       hit_entry.prefix_len,
+                       amf_store_tokens.size());
+          (void) std::fflush(stderr);
         }
       }
 

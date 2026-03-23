@@ -104,6 +104,7 @@ if(KORITH_HAS_CUDA_ACCEPT_SCAN)
     core/kernels/accept_scan.cu
     core/kernels/spec_verify.cu
     core/cuda_graph_decode.cu
+    core/amf_direct_kv.cu
   )
 endif()
 
@@ -164,6 +165,9 @@ target_include_directories(korith_dynamic PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/core"
   "${LLAMA_INCLUDE_DIR}"
   "${GGML_INCLUDE_DIR}"
+  # Internal llama.cpp headers needed by amf_direct_kv.cu for KV cache struct access.
+  # These are optional — amf_direct_kv.cu guards with __has_include and degrades gracefully.
+  "${LLAMA_ROOT}/src"
 )
 
 set_target_properties(korith_dynamic PROPERTIES

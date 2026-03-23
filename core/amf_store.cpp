@@ -1446,6 +1446,44 @@ bool AmfStore::load_kv(const AmfEntry & entry, std::vector<std::uint8_t> * out) 
   return true;
 }
 
+bool AmfStore::load_kv_into(const AmfEntry & entry,
+                             void * buf, std::size_t buf_size,
+                             std::size_t * out_size) const {
+  *out_size = 0;
+  const std::string path = entry_kv_path(entry);
+  std::ifstream in(path, std::ios::binary);
+  if (!in) {
+    return false;
+  }
+  in.seekg(0, std::ios::end);
+  const std::streamsize size = in.tellg();
+  if (size <= 0) {
+    return false;
+  }
+  const std::size_t n = static_cast<std::size_t>(size);
+  if (n > buf_size) {
+    std::fprintf(stderr,
+                 "[AMF_STORE] load_kv_into: buf too small (%zu < %zu)\n",
+                 buf_size, n);
+    return false;
+  }
+  in.seekg(0, std::ios::beg);
+  in.read(reinterpret_cast<char *>(buf), static_cast<std::streamsize>(n));
+  if (!in) {
+    return false;
+  }
+  if (entry.kv_checksum > 0) {
+    std::uint64_t checksum = kFNVOffset;
+    hash_bytes(checksum, reinterpret_cast<const std::uint8_t *>(buf), n);
+    if (checksum != entry.kv_checksum) {
+      std::fprintf(stderr, "[AMF_STORE] load_kv_into: checksum mismatch\n");
+      return false;
+    }
+  }
+  *out_size = n;
+  return true;
+}
+
 bool AmfStore::store_entry(const AmfContext & ctx,
                            const std::vector<llama_token> & tokens,
                            const std::uint8_t * kv_data,
