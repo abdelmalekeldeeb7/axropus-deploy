@@ -33,7 +33,14 @@ namespace korith::core {
 // ── File-format header ────────────────────────────────────────────────────────
 
 constexpr std::uint32_t kAmfDirectKvMagic   = 0x414D464Bu;  // "AMFK"
-constexpr std::uint32_t kAmfDirectKvVersion = 1u;
+constexpr std::uint32_t kAmfDirectKvVersion = 2u;  // v2: reserved repurposed as compression codec
+
+// Compression codec IDs stored in AmfDirectKvHeader::compression.
+// Must stay in sync with turboquant_codec.py CODEC_* constants.
+enum class AmfKvCompression : std::uint32_t {
+  kNone       = 0,  // raw FP16/BF16 — legacy v1 and uncompressed v2
+  kTurboQuant = 2,  // PolarQuant + QJL (Google Research, ICLR 2026)
+};
 
 // dtype tag stored in the header so restore can sanity-check against current
 // model configuration.
@@ -54,8 +61,8 @@ struct AmfDirectKvHeader {
   std::uint32_t n_kv_heads;      // KV head count (post-GQA)
   std::uint32_t head_dim;        // dimension per head
   std::uint32_t dtype;           // AmfKvDtype cast to uint32
-  std::uint32_t reserved;        // padding — must be 0
-  std::uint64_t total_kv_bytes;  // bytes of KV data following header
+  std::uint32_t compression;     // AmfKvCompression: 0=none, 2=TurboQuant (was: reserved)
+  std::uint64_t total_kv_bytes;  // UNCOMPRESSED bytes — used for VRAM allocation on restore
   std::uint64_t model_hash;      // from AmfKey (sanity-check on restore)
   std::uint64_t prefix_hash;     // from AmfKey (sanity-check on restore)
 };

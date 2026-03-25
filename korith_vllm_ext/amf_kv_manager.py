@@ -31,6 +31,8 @@ from typing import Any, List, Optional, Sequence
 
 import torch
 
+from .turboquant_codec import CODEC_NONE, CODEC_TURBOQUANT, get_codec
+
 logger = logging.getLogger(__name__)
 
 # ── FNV-1a constants (must match amf_store.cpp) ───────────────────────────────
@@ -370,7 +372,49 @@ class AmfKvManager:
             mv[k_off : k_off + k_sz] = k_cpu.numpy().tobytes()
             mv[v_off : v_off + v_sz] = v_cpu.numpy().tobytes()
 
-        blob = header + layer_tbl + bytes(kv_payload)
+        # ── TurboQuant compression (optional) ─────────────────────────────────
+        # layer_infos store UNCOMPRESSED offsets — restore uses them after
+        # decompressing. total_kv_bytes in the header stays as the uncompressed
+        # size so VRAM allocation on restore is correct. The codec ID written
+        # into the reserved/compression field tells restore whether to decompress.
+        codec      = get_codec()
+        kv_dtype   = layer_k_tensors[0].dtype
+        codec_id   = CODEC_NONE
+        payload_bytes: bytes = bytes(kv_payload)
+
+        if codec is not None and total_kv_bytes > 0:
+            try:
+                compressed = codec.compress(payload_bytes, head_dim, kv_dtype)
+                if len(compressed) < len(payload_bytes):
+                    ratio = len(payload_bytes) / len(compressed)
+                    logger.info(
+                        "[AMF_VLLM] TurboQuant: %.1f MB → %.1f MB (%.1fx)",
+                        len(payload_bytes) / (1024 * 1024),
+                        len(compressed) / (1024 * 1024),
+                        ratio,
+                    )
+                    payload_bytes = compressed
+                    codec_id      = CODEC_TURBOQUANT
+            except Exception as exc:  # compression is best-effort
+                logger.warning("[AMF_VLLM] TurboQuant compress failed: %s", exc)
+
+        # Rebuild header with codec_id in the reserved field.
+        header = struct.pack(
+            _HEADER_FMT,
+            _AMFK_MAGIC,
+            _AMFK_VERSION,
+            n_layers,
+            n_tokens,
+            n_kv_heads,
+            head_dim,
+            dtype_tag,
+            codec_id,           # was: 0 (reserved); now carries compression codec
+            total_kv_bytes,     # always UNCOMPRESSED size
+            key["model_hash"],
+            key["prefix_hash"],
+        )
+
+        blob = header + layer_tbl + payload_bytes
 
         # Write atomically via temp file.
         tmp_path = kv_path.with_suffix(".kv.tmp")
@@ -440,7 +484,7 @@ class AmfKvManager:
         # Parse header.
         (
             magic, version, n_layers_snap, n_tokens,
-            n_kv_heads, head_dim, dtype_tag, _reserved,
+            n_kv_heads, head_dim, dtype_tag, compression_codec,
             total_kv_bytes, model_hash_snap, prefix_hash_snap,
         ) = struct.unpack_from(_HEADER_FMT, blob, 0)
 
@@ -482,7 +526,24 @@ class AmfKvManager:
             off = hdr_end + i * _LAYER_SIZE
             layer_infos.append(struct.unpack_from(_LAYER_FMT, blob, off))
 
-        kv_payload = blob[hdr_end + layer_tbl_bytes:]
+        kv_payload_raw = blob[hdr_end + layer_tbl_bytes:]
+
+        # ── TurboQuant decompression (if snapshot was compressed) ──────────────
+        if compression_codec == CODEC_TURBOQUANT:
+            try:
+                from .turboquant_codec import TurboQuantCodec
+                # Reconstruct target dtype from the dtype_tag.
+                _TAG_TO_DTYPE = {0: torch.float16, 1: torch.float32, 2: torch.bfloat16}
+                snap_dtype = _TAG_TO_DTYPE.get(dtype_tag, torch.float16)
+                _tq = TurboQuantCodec()
+                kv_payload_raw = _tq.decompress(bytes(kv_payload_raw), snap_dtype)
+                logger.debug("[AMF_VLLM] TurboQuant: decompressed %d bytes", len(kv_payload_raw))
+            except Exception as exc:
+                logger.warning("[AMF_VLLM] TurboQuant decompress failed: %s — falling back to miss", exc)
+                self._misses += 1
+                return 0
+
+        kv_payload = kv_payload_raw
 
         # Restore tensors into gpu_cache at the allocated physical blocks.
         for layer_idx, (layer_cache, (k_off, k_sz, v_off, v_sz)) in enumerate(
