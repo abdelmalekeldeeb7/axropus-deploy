@@ -25,7 +25,10 @@ import hashlib
 import logging
 import os
 import struct
+import threading
 import time
+from collections import OrderedDict
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, List, Optional, Sequence
 
@@ -136,6 +139,98 @@ def amf_key_filename(
     )
 
 
+# ── VRAM snapshot cache ───────────────────────────────────────────────────────
+
+@dataclass
+class _VRAMEntry:
+    """One compressed KV snapshot resident in GPU VRAM."""
+    payload_gpu: "torch.Tensor"          # uint8 CUDA tensor — TurboQuant compressed blob
+    snap_dtype:  "torch.dtype"
+    n_tokens:    int
+    layer_infos: list                    # [(k_off, k_sz, v_off, v_sz), ...]
+
+
+class VRAMSnapshotCache:
+    """LRU cache of TurboQuant-compressed KV snapshots stored as GPU tensors.
+
+    Enable via:
+        KORITH_VRAM_CACHE_GB=120          # VRAM budget in GB (0 = disabled)
+        KORITH_VRAM_CACHE_DEVICE=cuda:0   # which GPU to use
+
+    On restore the compressed payload is already on GPU → decompress with zero
+    H→D transfer → ~10-50 ms total vs ~3,044 ms for the NVMe+TQ path.
+    """
+
+    def __init__(self, max_bytes: int, device: str) -> None:
+        self._max    = max_bytes
+        self._device = device
+        self._cache: OrderedDict[str, _VRAMEntry] = OrderedDict()
+        self._used   = 0
+        self._lock   = threading.Lock()
+
+    @property
+    def device(self) -> str:
+        return self._device
+
+    def put(
+        self,
+        key:         str,
+        compressed:  bytes,
+        snap_dtype:  "torch.dtype",
+        n_tokens:    int,
+        layer_infos: list,
+    ) -> bool:
+        """Store compressed KV blob as a GPU tensor.  Returns True if cached."""
+        if len(compressed) > self._max:
+            return False
+
+        gpu_t = torch.frombuffer(bytearray(compressed), dtype=torch.uint8).to(self._device)
+
+        with self._lock:
+            # Replace existing entry for this key
+            if key in self._cache:
+                self._used -= self._cache[key].payload_gpu.nbytes
+                del self._cache[key]
+
+            # Evict LRU until there is space
+            while self._used + gpu_t.nbytes > self._max and self._cache:
+                _, evicted = self._cache.popitem(last=False)
+                self._used -= evicted.payload_gpu.nbytes
+
+            if self._used + gpu_t.nbytes > self._max:
+                return False  # still no room (single entry exceeds budget)
+
+            entry = _VRAMEntry(
+                payload_gpu=gpu_t,
+                snap_dtype=snap_dtype,
+                n_tokens=n_tokens,
+                layer_infos=layer_infos,
+            )
+            self._cache[key] = entry
+            self._used += gpu_t.nbytes
+            return True
+
+    def get(self, key: str) -> Optional[_VRAMEntry]:
+        """Return the VRAM entry if cached, else None.  Refreshes LRU order."""
+        with self._lock:
+            entry = self._cache.get(key)
+            if entry is not None:
+                self._cache.move_to_end(key)
+            return entry
+
+    def contains(self, key: str) -> bool:
+        with self._lock:
+            return key in self._cache
+
+    def stats(self) -> dict:
+        with self._lock:
+            return {
+                "entries":  len(self._cache),
+                "used_gb":  self._used / (1024 ** 3),
+                "max_gb":   self._max  / (1024 ** 3),
+            }
+
+
 # ── AmfKvManager ─────────────────────────────────────────────────────────────
 
 class AmfKvManager:
@@ -194,11 +289,26 @@ class AmfKvManager:
 
         self._store_path.mkdir(parents=True, exist_ok=True)
 
+        # VRAM snapshot cache (primary tier — zero H→D on restore)
+        _vram_gb  = float(os.environ.get("KORITH_VRAM_CACHE_GB", "0"))
+        _vram_dev = os.environ.get("KORITH_VRAM_CACHE_DEVICE", "cuda:0")
+        if _vram_gb > 0 and torch.cuda.is_available():
+            self._vram_cache: Optional[VRAMSnapshotCache] = VRAMSnapshotCache(
+                max_bytes=int(_vram_gb * (1024 ** 3)),
+                device=_vram_dev,
+            )
+            logger.info(
+                "[AMF_VLLM] VRAM cache enabled: %.0f GB on %s", _vram_gb, _vram_dev
+            )
+        else:
+            self._vram_cache = None
+
         # Statistics.
-        self._hits:       int   = 0
-        self._misses:     int   = 0
-        self._saves:      int   = 0
-        self._restore_ms: float = 0.0
+        self._hits:        int   = 0
+        self._misses:      int   = 0
+        self._saves:       int   = 0
+        self._restore_ms:  float = 0.0
+        self._vram_hits:   int   = 0
 
     # ── Key computation ───────────────────────────────────────────────────────
 
@@ -253,8 +363,11 @@ class AmfKvManager:
     # ── Snapshot existence check ──────────────────────────────────────────────
 
     def has_snapshot(self, prompt_tokens: Sequence[int]) -> bool:
-        """Return True if a valid AMFK snapshot exists for these tokens."""
+        """Return True if a snapshot exists in VRAM cache or on disk."""
         key = self.compute_amf_key(prompt_tokens)
+        if self._vram_cache is not None:
+            if self._vram_cache.contains(self._kv_filename(key).stem):
+                return True
         return self._kv_filename(key).exists()
 
     # ── Save ──────────────────────────────────────────────────────────────────
@@ -416,6 +529,22 @@ class AmfKvManager:
 
         blob = header + layer_tbl + payload_bytes
 
+        # ── Populate VRAM cache (TurboQuant only — raw payloads are too large) ──
+        if self._vram_cache is not None and codec_id == CODEC_TURBOQUANT:
+            vram_key = kv_path.stem
+            stored = self._vram_cache.put(
+                key=vram_key,
+                compressed=payload_bytes,
+                snap_dtype=kv_dtype,
+                n_tokens=n_tokens,
+                layer_infos=layer_infos,
+            )
+            if stored:
+                logger.debug(
+                    "[AMF_VLLM] VRAM cache: stored %s (%.1f MB)",
+                    vram_key, len(payload_bytes) / (1024 * 1024),
+                )
+
         # Write atomically via temp file.
         tmp_path = kv_path.with_suffix(".kv.tmp")
         try:
@@ -464,6 +593,24 @@ class AmfKvManager:
         t0 = time.monotonic()
         key      = self.compute_amf_key(prompt_tokens)
         kv_path  = self._kv_filename(key)
+        vram_key = kv_path.stem
+
+        # ── Fast path: VRAM cache hit — zero H→D transfer ─────────────────────
+        if self._vram_cache is not None:
+            vram_entry = self._vram_cache.get(vram_key)
+            if vram_entry is not None:
+                result = self._restore_from_vram(vram_entry, block_table)
+                elapsed_ms = (time.monotonic() - t0) * 1000.0
+                if result > 0:
+                    self._hits       += 1
+                    self._vram_hits  += 1
+                    self._restore_ms  = elapsed_ms
+                    logger.info(
+                        "[AMF_VLLM] VRAM restore: %d tokens in %.1f ms (zero H→D)",
+                        result, elapsed_ms,
+                    )
+                    return result
+                # VRAM decompress failed — fall through to NVMe path
 
         if not kv_path.exists():
             self._misses += 1
@@ -626,6 +773,20 @@ class AmfKvManager:
             k_all[block_ids] = k_src
             v_all[block_ids] = v_src
 
+        # ── Promote to VRAM cache for future zero-copy restores ───────────────
+        if (
+            self._vram_cache is not None
+            and compression_codec == CODEC_TURBOQUANT
+            and not self._vram_cache.contains(vram_key)
+        ):
+            self._vram_cache.put(
+                key=vram_key,
+                compressed=bytes(kv_payload_raw),
+                snap_dtype=snap_dtype,
+                n_tokens=int(n_tokens),
+                layer_infos=layer_infos,
+            )
+
         elapsed_ms = (time.monotonic() - t0) * 1000.0
         self._hits     += 1
         self._restore_ms = elapsed_ms
@@ -636,12 +797,66 @@ class AmfKvManager:
         )
         return int(n_tokens)
 
+    # ── VRAM restore helper ───────────────────────────────────────────────────
+
+    def _restore_from_vram(self, entry: "_VRAMEntry", block_table: List[int]) -> int:
+        """Scatter KV from a VRAM cache entry into the engine's KV blocks.
+
+        Returns the number of tokens restored, or 0 on failure.
+        The compressed payload is already on GPU — this method calls
+        TurboQuantCodec.decompress_from_gpu_tensor() which does zero H→D I/O.
+        """
+        from .turboquant_codec import TurboQuantCodec
+        _tq  = TurboQuantCodec()
+        _dev = entry.payload_gpu.device
+
+        try:
+            kv_gpu_tensor = _tq.decompress_from_gpu_tensor(
+                entry.payload_gpu, entry.snap_dtype
+            )
+        except Exception as exc:
+            logger.warning("[AMF_VLLM] VRAM decompress failed: %s", exc)
+            return 0
+
+        gpu_cache = self._cache_engine.gpu_cache
+
+        for layer_cache, (k_off, k_sz, v_off, v_sz) in zip(gpu_cache, entry.layer_infos):
+            if k_sz == 0 and v_sz == 0:
+                continue  # SSM/recurrent layer — no KV
+
+            cache_dtype = layer_cache.dtype
+
+            if layer_cache.dim() == 5 and layer_cache.shape[0] == 2:
+                k_all = layer_cache[0]
+                v_all = layer_cache[1]
+            else:
+                k_all = layer_cache
+                v_all = layer_cache
+
+            if not block_table:
+                continue
+
+            block_ids = torch.tensor(block_table, device=k_all.device, dtype=torch.long)
+
+            _esz    = cache_dtype.itemsize
+            k_flat  = kv_gpu_tensor[k_off // _esz : (k_off + k_sz) // _esz].to(cache_dtype)
+            v_flat  = kv_gpu_tensor[v_off // _esz : (v_off + v_sz) // _esz].to(cache_dtype)
+
+            k_all[block_ids] = k_flat.reshape(k_all[block_ids].shape)
+            v_all[block_ids] = v_flat.reshape(v_all[block_ids].shape)
+
+        return entry.n_tokens
+
     # ── Stats ─────────────────────────────────────────────────────────────────
 
     def stats(self) -> dict:
-        return {
+        base = {
             "hits":       self._hits,
             "misses":     self._misses,
             "saves":      self._saves,
             "restore_ms": self._restore_ms,
+            "vram_hits":  self._vram_hits,
         }
+        if self._vram_cache is not None:
+            base["vram_cache"] = self._vram_cache.stats()
+        return base
