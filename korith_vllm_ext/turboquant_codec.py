@@ -307,6 +307,113 @@ class TurboQuantCodec:
             )
         return result
 
+    def decompress_to_gpu(
+        self,
+        compressed: bytes,
+        dtype: torch.dtype,
+        device: str = "cuda",
+    ) -> torch.Tensor:
+        """Decompress directly onto the GPU — eliminates the CPU float32 bottleneck.
+
+        Flow:
+          compressed bytes (CPU)
+            → H→D of small quantised buffer  (~10 GB for Llama-70B 128K)
+            → INT4 unpack + dequantise on GPU (vectorised, no Python loop)
+            → FP16 matmul on GPU              (~5 ms on H200 for 163M×128)
+            → 1-D FP16 GPU tensor ready for scatter into vLLM cache blocks
+
+        Compared to decompress() (CPU path):
+          CPU  path: 40 GB H→D  +  ~2 s CPU matmul  +  ~84 GB CPU RAM peak
+          GPU  path: 10 GB H→D  +  ~5 ms GPU matmul +  ~10 GB VRAM peak
+
+        Args:
+            compressed:  Bytes produced by compress().
+            dtype:       Target dtype (torch.float16 or torch.bfloat16).
+            device:      CUDA device string, e.g. "cuda" or "cuda:0".
+
+        Returns:
+            1-D tensor on *device* with the same number of elements as the
+            original uncompressed KV payload.  Byte length == original_size.
+        """
+        if len(compressed) < _TQ_HDR_SIZE + _TQ_SUB_SIZE:
+            raise ValueError("TurboQuant GPU: compressed blob too small")
+
+        # ── Parse headers on CPU (trivial) ────────────────────────────────────
+        magic, bits, dtype_id, _res, original_size, head_dim = struct.unpack_from(
+            _TQ_HDR_FMT, compressed, 0
+        )
+        if magic != _TQ_MAGIC:
+            raise ValueError(f"TurboQuant GPU: bad magic {magic!r}")
+
+        n_vectors, n_quant_val, pad = struct.unpack_from(
+            _TQ_SUB_FMT, compressed, _TQ_HDR_SIZE
+        )
+
+        offset      = _TQ_HDR_SIZE + _TQ_SUB_SIZE
+        norms_size  = n_vectors * 2   # FP16 = 2 bytes each
+        scales_size = n_vectors * 2
+
+        # ── H→D: norms and scales (small — 2 × n_vectors × 2 bytes) ──────────
+        norms = torch.frombuffer(
+            bytearray(compressed[offset : offset + norms_size]),
+            dtype=torch.float16,
+        ).to(device)                                # [n_vectors]  FP16 on GPU
+        offset += norms_size
+
+        scales = torch.frombuffer(
+            bytearray(compressed[offset : offset + scales_size]),
+            dtype=torch.float16,
+        ).to(device)                                # [n_vectors]  FP16 on GPU
+        offset += scales_size
+
+        q_data  = compressed[offset:]
+        max_int = (1 << (bits - 1)) - 1
+
+        # ── H→D: packed quantised data, unpack entirely on GPU ────────────────
+        if bits == 4:
+            packed = torch.frombuffer(
+                bytearray(q_data), dtype=torch.uint8
+            ).to(device)                            # H→D of ~10 GB compressed
+            lo     = (packed & 0x0F).to(torch.float16)
+            hi     = ((packed >> 4) & 0x0F).to(torch.float16)
+            q_uint = torch.stack([lo, hi], dim=1).reshape(-1)[:n_quant_val]
+        elif bits == 3:
+            # 3-bit packing has no simple GPU bitop path — unpack on CPU then move
+            q_uint = self._unpack_int3(q_data, n_quant_val).to(device, dtype=torch.float16)
+        else:  # bits == 8
+            q_uint = torch.frombuffer(
+                bytearray(q_data), dtype=torch.uint8
+            ).to(device, dtype=torch.float16)[:n_quant_val]
+
+        # ── Dequantise on GPU (FP16 throughout — no float32 blowup) ──────────
+        q_signed   = q_uint - max_int                           # FP16 [-max_int, max_int]
+        scales_exp = scales.repeat_interleave(head_dim)         # [n_vectors * head_dim] FP16
+        q_scaled   = (q_signed / max_int) * scales_exp          # FP16
+
+        x_proj = q_scaled.reshape(n_vectors, head_dim)          # [n_vectors, head_dim] FP16
+
+        # ── Inverse QJL matmul on GPU (~5 ms on H200 for Llama-70B 128K) ─────
+        R_gpu  = self._rademacher(head_dim).to(device, dtype=torch.float16)
+        x_unit = torch.mm(x_proj, R_gpu)                        # [n_vectors, head_dim] FP16
+
+        # ── Restore radii ─────────────────────────────────────────────────────
+        x    = x_unit * norms.unsqueeze(-1)                     # [n_vectors, head_dim]
+        flat = x.reshape(-1)
+        if pad:
+            flat = flat[:-pad]
+
+        # Cast to caller's target dtype (float16 → bfloat16 if needed)
+        result = flat.to(dtype)
+
+        # Sanity check element count
+        elem_size    = torch.finfo(dtype).bits // 8
+        n_expected   = original_size // elem_size
+        if result.numel() != n_expected:
+            raise ValueError(
+                f"TurboQuant GPU: element count {result.numel()} != expected {n_expected}"
+            )
+        return result                                            # 1-D GPU tensor
+
 
 # ── Module-level convenience ───────────────────────────────────────────────────
 

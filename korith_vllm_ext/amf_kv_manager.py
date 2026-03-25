@@ -528,22 +528,49 @@ class AmfKvManager:
 
         kv_payload_raw = blob[hdr_end + layer_tbl_bytes:]
 
-        # ── TurboQuant decompression (if snapshot was compressed) ──────────────
+        # ── TurboQuant decompression ───────────────────────────────────────────
+        # Two paths depending on CUDA availability:
+        #
+        #   GPU path (preferred): H→D of compressed buffer (~10 GB for 70B 128K),
+        #     unpack + matmul on GPU (~5 ms), return 1-D GPU tensor.
+        #     Avoids the 84 GB CPU float32 intermediate and the 40 GB H→D copy.
+        #
+        #   CPU fallback: full decompress on CPU, then per-layer H→D as before.
+        #
+        _TAG_TO_DTYPE = {0: torch.float16, 1: torch.float32, 2: torch.bfloat16}
+        snap_dtype    = _TAG_TO_DTYPE.get(dtype_tag, torch.float16)
+
+        # kv_gpu_tensor: 1-D GPU tensor when GPU decompress succeeds, else None.
+        kv_gpu_tensor: Optional[torch.Tensor] = None
+        kv_payload    = kv_payload_raw   # default: CPU bytes (uncompressed or fallback)
+
         if compression_codec == CODEC_TURBOQUANT:
+            from .turboquant_codec import TurboQuantCodec
+            _tq = TurboQuantCodec()
+            _cuda_ok = torch.cuda.is_available()
             try:
-                from .turboquant_codec import TurboQuantCodec
-                # Reconstruct target dtype from the dtype_tag.
-                _TAG_TO_DTYPE = {0: torch.float16, 1: torch.float32, 2: torch.bfloat16}
-                snap_dtype = _TAG_TO_DTYPE.get(dtype_tag, torch.float16)
-                _tq = TurboQuantCodec()
-                kv_payload_raw = _tq.decompress(bytes(kv_payload_raw), snap_dtype)
-                logger.debug("[AMF_VLLM] TurboQuant: decompressed %d bytes", len(kv_payload_raw))
+                if _cuda_ok:
+                    # ── Fast path: decompress directly onto GPU ────────────────
+                    _dev = gpu_cache[0].device if gpu_cache else torch.device("cuda")
+                    kv_gpu_tensor = _tq.decompress_to_gpu(
+                        bytes(kv_payload_raw), snap_dtype, str(_dev)
+                    )
+                    logger.debug(
+                        "[AMF_VLLM] TurboQuant GPU: decompressed %d elems on %s",
+                        kv_gpu_tensor.numel(), _dev,
+                    )
+                else:
+                    # ── Slow path: CPU decompress (small models / no GPU) ──────
+                    kv_payload = _tq.decompress(bytes(kv_payload_raw), snap_dtype)
+                    logger.debug(
+                        "[AMF_VLLM] TurboQuant CPU fallback: %d bytes", len(kv_payload)
+                    )
             except Exception as exc:
-                logger.warning("[AMF_VLLM] TurboQuant decompress failed: %s — falling back to miss", exc)
+                logger.warning(
+                    "[AMF_VLLM] TurboQuant decompress failed: %s — treating as miss", exc
+                )
                 self._misses += 1
                 return 0
-
-        kv_payload = kv_payload_raw
 
         # Restore tensors into gpu_cache at the allocated physical blocks.
         for layer_idx, (layer_cache, (k_off, k_sz, v_off, v_sz)) in enumerate(
@@ -568,16 +595,32 @@ class AmfKvManager:
 
             block_ids = torch.tensor(block_table, device=k_all.device, dtype=torch.long)
 
-            # Reconstruct tensors from the blob and move to GPU.
-            k_flat = torch.frombuffer(
-                bytearray(kv_payload[k_off : k_off + k_sz]), dtype=cache_dtype
-            )
-            v_flat = torch.frombuffer(
-                bytearray(kv_payload[v_off : v_off + v_sz]), dtype=cache_dtype
-            )
+            if kv_gpu_tensor is not None:
+                # ── GPU tensor path: slice by element index, no H→D needed ────
+                # layer_infos offsets are in bytes; convert to element indices.
+                _esz    = cache_dtype.itemsize
+                k_start = k_off // _esz
+                k_count = k_sz  // _esz
+                v_start = v_off // _esz
+                v_count = v_sz  // _esz
 
-            k_src = k_flat.reshape(k_all[block_ids].shape).to(k_all.device)
-            v_src = v_flat.reshape(v_all[block_ids].shape).to(v_all.device)
+                k_flat = kv_gpu_tensor[k_start : k_start + k_count].to(cache_dtype)
+                v_flat = kv_gpu_tensor[v_start : v_start + v_count].to(cache_dtype)
+            else:
+                # ── CPU bytes path: frombuffer + H→D (uncompressed or CPU decomp)
+                k_flat = torch.frombuffer(
+                    bytearray(kv_payload[k_off : k_off + k_sz]), dtype=cache_dtype
+                )
+                v_flat = torch.frombuffer(
+                    bytearray(kv_payload[v_off : v_off + v_sz]), dtype=cache_dtype
+                )
+
+            k_src = k_flat.reshape(k_all[block_ids].shape)
+            v_src = v_flat.reshape(v_all[block_ids].shape)
+
+            if kv_gpu_tensor is None:
+                k_src = k_src.to(k_all.device)
+                v_src = v_src.to(v_all.device)
 
             # Scatter restored KV into the cache at the physical block positions.
             k_all[block_ids] = k_src
