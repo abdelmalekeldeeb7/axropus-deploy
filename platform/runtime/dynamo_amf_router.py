@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from .amf_coordinator_client import AmfCoordinatorClient
+from .lmcache_bridge import LMCacheCoverage, estimate_lmcache_cost_ms, query_coverage
 from .prompt_canonicalization import canonicalize_prompt_text
 
 logger = logging.getLogger(__name__)
@@ -72,10 +73,11 @@ def estimate_recompute_cost_ms(num_tokens: int) -> float:
 
 
 _RESTORE_TIER_MULTIPLIERS: Dict[str, float] = {
-    "vram":   0.5,
-    "ram":    1.0,
-    "nvme":   2.0,
-    "remote": 5.0,
+    "vram":     0.5,
+    "lmcache":  0.8,   # LMCache GPU/CPU block cache (~100-500 ms at 120K)
+    "ram":      1.0,
+    "nvme":     2.0,
+    "remote":   5.0,
     # Accept Dynamo tier labels too.
     "G1": 0.5,
     "G2": 1.0,
@@ -113,13 +115,15 @@ class WorkerScore:
 
     worker_id: str
     node_id: str
-    kv_overlap: float          # Dynamo's native in-memory KV overlap [0, 1]
-    load: float                # Worker load estimate [0, 1]
+    kv_overlap: float              # Dynamo's native in-memory KV overlap [0, 1]
+    load: float                    # Worker load estimate [0, 1]
     amf_restore_savings_ms: float  # Expected savings from AMF restore
-    combined_score: float      # Final weighted score (higher is better)
-    routed_by: str             # "dynamo" | "amf" — which signal dominated
+    combined_score: float          # Final weighted score (higher is better)
+    routed_by: str                 # "vram" | "lmcache" | "amf" | "dynamo"
     estimated_restore_ms: float
     estimated_recompute_ms: float
+    lmcache_coverage: float = 0.0  # LMCache block coverage [0, 1]
+    lmcache_savings_ms: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -217,24 +221,54 @@ class AmfRouterPlugin:
 
         for w in dynamo_worker_scores:
             worker_id = str(w.get("worker_id", "") or "")
-            node_id = str(w.get("node_id", "") or "")
+            node_id   = str(w.get("node_id",   "") or "")
             kv_overlap = float(w.get("kv_overlap", 0.0) or 0.0)
-            load = float(w.get("load", 0.0) or 0.0)
+            load       = float(w.get("load",       0.0) or 0.0)
 
-            has_amf = node_id in amf_nodes
-            storage_tier = "nvme"  # Conservative default.
-            if has_amf:
-                # Try to find the best storage tier for this node.
-                for r in (self._coordinator.lookup(prefix_hash=prefix_hash, tenant_id=tenant_id) if self._coordinator else []):
+            # ── AMF snapshot check ─────────────────────────────────────────
+            has_amf      = node_id in amf_nodes
+            storage_tier = "nvme"  # conservative default
+            if has_amf and self._coordinator:
+                for r in self._coordinator.lookup(prefix_hash=prefix_hash, tenant_id=tenant_id):
                     if str(r.get("node_id", "")) == node_id:
-                        tier_raw = str((r.get("metadata") or {}).get("storage_tier", "G3") or "G3")
+                        tier_raw     = str((r.get("metadata") or {}).get("storage_tier", "G3") or "G3")
                         storage_tier = tier_raw
                         break
 
             restore_ms = estimate_restore_cost_ms(request_tokens, storage_tier) if has_amf else 0.0
             savings_ms = max(0.0, recompute_ms - restore_ms) if has_amf else 0.0
-            # Normalise savings to [0, 1] for weighted scoring.
-            savings_pct = min(1.0, savings_ms / max(1.0, recompute_ms))
+
+            # ── LMCache block-coverage check ───────────────────────────────
+            # Only query when AMF misses — LMCache is the fallback tier.
+            lm_coverage   = LMCacheCoverage(0.0, "none", float("inf"), 0, 1)
+            lm_savings_ms = 0.0
+            if use_amf and not has_amf:
+                try:
+                    lm_coverage = query_coverage(
+                        prefix_hash=prefix_hash,
+                        num_tokens=request_tokens,
+                        worker_id=worker_id,
+                    )
+                    if lm_coverage.coverage > 0.0:
+                        lm_cost    = estimate_lmcache_cost_ms(request_tokens, lm_coverage)
+                        lm_savings_ms = max(0.0, recompute_ms - lm_cost)
+                except Exception as exc:
+                    logger.debug("LMCache coverage query failed: %s", exc)
+
+            # ── Combined savings: AMF dominates, LMCache fills gaps ────────
+            total_savings_ms = savings_ms if has_amf else lm_savings_ms
+            savings_pct = min(1.0, total_savings_ms / max(1.0, recompute_ms))
+
+            # ── Routing label ──────────────────────────────────────────────
+            if has_amf:
+                if storage_tier in ("vram", "G1"):
+                    routed_by = "vram"
+                else:
+                    routed_by = "amf"
+            elif lm_savings_ms > 0.0:
+                routed_by = "lmcache"
+            else:
+                routed_by = "dynamo"
 
             if use_amf:
                 combined = (
@@ -242,7 +276,6 @@ class AmfRouterPlugin:
                     + savings_pct * self._restore_weight
                     - load * self._load_weight
                 )
-                routed_by = "amf" if has_amf else "dynamo"
             else:
                 combined = kv_overlap * self._kv_overlap_weight - load * self._load_weight
                 routed_by = "dynamo"
@@ -258,6 +291,8 @@ class AmfRouterPlugin:
                     routed_by=routed_by,
                     estimated_restore_ms=restore_ms,
                     estimated_recompute_ms=recompute_ms,
+                    lmcache_coverage=lm_coverage.coverage,
+                    lmcache_savings_ms=lm_savings_ms,
                 )
             )
 
@@ -265,9 +300,12 @@ class AmfRouterPlugin:
 
         if scored:
             best = scored[0]
-            if best.routed_by == "amf":
+            if best.routed_by in ("amf", "vram"):
                 self._amf_routed += 1
                 self._total_savings_ms += best.amf_restore_savings_ms
+            elif best.routed_by == "lmcache":
+                self._amf_routed += 1   # counts as a cache hit
+                self._total_savings_ms += best.lmcache_savings_ms
             else:
                 self._dynamo_routed += 1
 
@@ -296,13 +334,16 @@ class AmfRouterPlugin:
         best = scored[0]
         logger.info(
             "AmfRouterPlugin routed: worker=%s node=%s by=%s score=%.3f "
-            "kv_overlap=%.2f amf_savings_ms=%.0f recompute_ms=%.0f tokens=%d",
+            "kv_overlap=%.2f amf_savings_ms=%.0f lm_coverage=%.0f%% lm_savings_ms=%.0f "
+            "recompute_ms=%.0f tokens=%d",
             best.worker_id,
             best.node_id,
             best.routed_by,
             best.combined_score,
             best.kv_overlap,
             best.amf_restore_savings_ms,
+            best.lmcache_coverage * 100,
+            best.lmcache_savings_ms,
             best.estimated_recompute_ms,
             request_tokens,
         )
