@@ -15,7 +15,7 @@ class BTC15MinStrategy:
     Edge: more time for LLM context = better AMF hit rate.
     """
 
-    MIN_CONFIDENCE = 0.62
+    MIN_CONFIDENCE = 0.60
     MIN_VOLUME = 1000.0
 
     def __init__(self, feed: BinanceFeed, amf: AMFBridge):

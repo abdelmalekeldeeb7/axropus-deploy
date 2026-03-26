@@ -341,7 +341,7 @@ class MLPredictionStrategy:
     N_FEATURES    = 8
     MIN_VOTES     = 4       # out of 6
     MIN_CONFIDENCE = 0.60
-    TRAIN_WARMUP  = 50      # trades before trusting ML
+    TRAIN_WARMUP  = 20      # trades before trusting ML
 
     def __init__(self, feed: BinanceFeed, amf: AMFBridge):
         self.feed = feed

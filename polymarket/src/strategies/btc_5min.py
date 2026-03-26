@@ -151,7 +151,7 @@ class BTC5MinStrategy:
     10-signal consensus confidence >= 0.65 + LLM confirms.
     """
 
-    MIN_CONFIDENCE = 0.65
+    MIN_CONFIDENCE = 0.61
     MIN_VOLUME = 500.0
 
     def __init__(self, feed: BinanceFeed, amf: AMFBridge):

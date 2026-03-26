@@ -63,14 +63,16 @@ class RiskState:
 class RiskManager:
     """Kelly sizing + circuit breakers — used by every strategy."""
 
-    MAX_DRAWDOWN = 0.20        # halt if down 20%
-    DAILY_LOSS_LIMIT = 0.08    # halt if daily loss > 8%
-    MAX_POSITIONS = 12
-    LOSS_STREAK_PAUSE = 5      # pause after 5 consecutive losses
-    MIN_CONFIDENCE = 0.55      # never trade below this
+    MAX_DRAWDOWN = 0.15        # halt if down 15% (tighter — protects compound)
+    DAILY_LOSS_LIMIT = 0.06    # halt if daily loss > 6%
+    MAX_POSITIONS = 15         # allow up to 15 concurrent (10 trades/cycle)
+    LOSS_STREAK_PAUSE = 3      # pause after 3 consecutive losses (was 5)
+    LOSS_STREAK_PAUSE_SECS = 15  # only 15s pause (was 30s)
+    MIN_CONFIDENCE = 0.58      # never trade below this
 
-    def __init__(self, initial_bankroll: float):
-        self.state = RiskState(bankroll=initial_bankroll, initial=initial_bankroll)
+    def __init__(self, bankroll: float, initial_bankroll: float = 0.0):
+        br = bankroll or initial_bankroll
+        self.state = RiskState(bankroll=br, initial=br)
         self._open_positions = 0
         self._paused_until = 0.0
 
@@ -122,7 +124,7 @@ class RiskManager:
             return False, "max positions"
         if self.state.streak <= -self.LOSS_STREAK_PAUSE:
             import time
-            self._paused_until = time.time() + 30
+            self._paused_until = time.time() + self.LOSS_STREAK_PAUSE_SECS
             self.state.streak = 0
             return False, "loss streak pause"
         return True, "ok"

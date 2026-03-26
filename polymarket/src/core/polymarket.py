@@ -50,13 +50,19 @@ class PolymarketClient:
     GAMMA_URL = "https://gamma-api.polymarket.com"
     DATA_URL  = "https://data-api.polymarket.com"
 
-    def __init__(self, private_key: str, proxy_wallet: str, mode: str = "paper"):
-        self.private_key = private_key
+    def __init__(self, private_key: str, proxy_wallet: str,
+                 paper_mode: bool = True, mode: str = "paper"):
+        self.private_key  = private_key
         self.proxy_wallet = proxy_wallet
-        self.mode = mode
+        self.mode         = "paper" if paper_mode else mode
+        self._paper_mode  = paper_mode
         self._positions: dict[str, Position] = {}
         self._session = requests.Session()
         self._session.headers.update({"Content-Type": "application/json"})
+
+    def set_paper_mode(self, paper: bool):
+        self._paper_mode = paper
+        self.mode = "paper" if paper else "live"
 
     # ── Market Discovery ──────────────────────────────────────────────────────
 
