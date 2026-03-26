@@ -1,4 +1,4 @@
-"""Strategy 1: BTC 5-Minute — 10-signal momentum consensus."""
+"""Strategy 1: BTC 5-Minute — 10-signal momentum consensus + elite quant stack."""
 import time
 import logging
 from dataclasses import dataclass
@@ -9,18 +9,21 @@ from ..core.polymarket import PolymarketClient
 
 logger = logging.getLogger(__name__)
 
+
 @dataclass
 class Signal:
-    direction: str      # UP or DOWN
-    confidence: float
+    direction:   str      # UP or DOWN
+    confidence:  float
     entry_price: float
-    token_id: str
+    token_id:    str
     market_slug: str
-    question: str
-    tp_pct: float = 0.18
-    sl_pct: float = 0.10
-    max_hold: float = 290.0
-    source: str = "btc_5min"
+    question:    str
+    tp1_pct:     float = 0.12   # partial exit at +12%
+    tp2_pct:     float = 0.18   # full exit at +18%
+    tp_pct:      float = 0.18   # legacy alias (used by expiring/other strategies)
+    sl_pct:      float = 0.10
+    max_hold:    float = 290.0
+    source:      str   = "btc_5min"
 
 
 def _ema(prices: list, period: int) -> float:
@@ -33,8 +36,11 @@ def _ema(prices: list, period: int) -> float:
     return ema
 
 
-def compute_momentum_signals(prices: list[float], klines: list[dict],
-                              feed: BinanceFeed) -> dict:
+def compute_momentum_signals(
+    prices: list[float],
+    klines: list[dict],
+    feed: BinanceFeed
+) -> dict:
     """10-signal consensus — same engine as poly_hft but fixed and tuned."""
     if len(prices) < 30:
         return {"direction": None, "confidence": 0}
@@ -129,18 +135,18 @@ def compute_momentum_signals(prices: list[float], klines: list[dict],
     if total == 0:
         return {"direction": None, "confidence": 0}
 
-    max_w  = max(up_w, down_w)
+    max_w     = max(up_w, down_w)
     agreement = (max_w - min(up_w, down_w)) / total
-    n_agree = sum(1 for v, w, _ in votes if (v > 0) == (up_w >= down_w))
+    n_agree   = sum(1 for v, w, _ in votes if (v > 0) == (up_w >= down_w))
     depth_bonus = min(n_agree / 8.0, 1.0)
-    confidence = agreement * (0.5 + 0.5 * depth_bonus)
-    direction  = "UP" if up_w >= down_w else "DOWN"
+    confidence  = agreement * (0.5 + 0.5 * depth_bonus)
+    direction   = "UP" if up_w >= down_w else "DOWN"
 
     return {
-        "direction": direction,
-        "confidence": round(confidence, 3),
-        "votes": len(votes),
-        "up_weight": round(up_w, 2),
+        "direction":   direction,
+        "confidence":  round(confidence, 3),
+        "votes":       len(votes),
+        "up_weight":   round(up_w, 2),
         "down_weight": round(down_w, 2),
     }
 
@@ -149,17 +155,36 @@ class BTC5MinStrategy:
     """
     Strategy 1: BTC 5-Minute momentum.
     Scans Polymarket for active BTC 5-min markets, fires when
-    10-signal consensus confidence >= 0.65 + LLM confirms.
+    10-signal consensus confidence >= 0.61 + LLM confirms + Bayesian posterior.
+
+    Elite quant stack:
+      - Kalman velocity replaces raw momentum as price evidence
+      - VPIN detects if informed traders are behind the move
+      - Regime confirms we're in a trending (not volatile) market
+      - Bayesian updater fuses all signals into posterior probability
     """
 
     MIN_CONFIDENCE = 0.61
-    MIN_VOLUME = 500.0
+    MIN_VOLUME     = 500.0
 
-    def __init__(self, feed: BinanceFeed, amf: AMFBridge, poly: Optional[PolymarketClient] = None):
-        self.feed = feed
-        self.amf  = amf
-        self.poly = poly
-        self.name = "btc_5min"
+    def __init__(
+        self,
+        feed:   BinanceFeed,
+        amf:    AMFBridge,
+        poly:   Optional[PolymarketClient] = None,
+        kalman  = None,   # KalmanFilter instance
+        vpin    = None,   # VPINCalculator instance
+        regime  = None,   # RegimeDetector instance
+        bayesian = None,  # BayesianUpdater instance
+    ):
+        self.feed    = feed
+        self.amf     = amf
+        self.poly    = poly
+        self.kalman  = kalman
+        self.vpin    = vpin
+        self.regime  = regime
+        self.bayesian = bayesian
+        self.name    = "btc_5min"
 
     def scan(self, markets: list) -> list[Signal]:
         """Return signals for all tradeable 5-min BTC markets."""
@@ -173,15 +198,53 @@ class BTC5MinStrategy:
         if not result["direction"] or result["confidence"] < self.MIN_CONFIDENCE:
             return []
 
-        direction = result["direction"]
+        direction  = result["direction"]
         confidence = result["confidence"]
-        btc_now = prices[-1]
-        btc_1m = prices[-30] if len(prices) >= 30 else prices[0]
+        btc_now    = prices[-1]
+        btc_1m     = prices[-30] if len(prices) >= 30 else prices[0]
         btc_change = (btc_now - btc_1m) / btc_1m * 100
 
+        # ── Kalman velocity signal ─────────────────────────────────────────
+        kalman_velocity = 0.0
+        if self.kalman:
+            self.kalman.update("btcusdt", btc_now)
+            ks = self.kalman.get_state("btcusdt")
+            if ks:
+                kalman_velocity = ks.velocity
+                kt = self.kalman.get_trend("btcusdt")
+                # If Kalman disagrees with momentum direction, reduce confidence
+                if kt["direction"] and kt["direction"] != direction:
+                    confidence *= 0.80
+
+        # ── VPIN — informed trading filter ────────────────────────────────
+        vpin_signal = {}
+        if self.vpin:
+            self.vpin.update("btcusdt", btc_now)
+            vpin_signal = self.vpin.get_signal("btcusdt")
+            # If VPIN is informed AND opposes direction → skip trade
+            if (vpin_signal.get("informed") and
+                    vpin_signal.get("direction") not in ("NEUTRAL", direction) and
+                    vpin_signal.get("confidence", 0) > 0.60):
+                logger.debug("VPIN blocks %s signal (informed %s detected)",
+                             direction, vpin_signal["direction"])
+                return []
+
+        # ── Regime filter ─────────────────────────────────────────────────
+        regime_state = None
+        if self.regime:
+            regime_state = self.regime.update("btcusdt", list(prices))
+            from ..core.regime import Regime
+            # Don't trade momentum in volatile or ranging regimes
+            if regime_state.regime == Regime.VOLATILE:
+                logger.debug("Regime=VOLATILE → skip btc_5min")
+                return []
+            if regime_state.regime == Regime.RANGING and confidence < 0.72:
+                logger.debug("Regime=RANGING → skip low-conf btc_5min")
+                return []
+
         eth_prices = self.feed.get_prices("ethusdt")
-        eth_now = eth_prices[-1] if eth_prices else 0
-        eth_1m = eth_prices[-30] if len(eth_prices) >= 30 else eth_now
+        eth_now    = eth_prices[-1] if eth_prices else 0
+        eth_1m     = eth_prices[-30] if len(eth_prices) >= 30 else eth_now
         eth_change = (eth_now - eth_1m) / eth_1m * 100 if eth_1m > 0 else 0
 
         signals = []
@@ -191,22 +254,16 @@ class BTC5MinStrategy:
             if m.volume < self.MIN_VOLUME:
                 continue
 
-            # Pick correct token
-            if direction == "UP":
-                token = m.yes_token
-                price = m.yes_price
-            else:
-                token = m.no_token
-                price = m.no_price
+            token = m.yes_token if direction == "UP" else m.no_token
+            price = m.yes_price if direction == "UP" else m.no_price
 
             if price <= 0 or price >= 0.95:
                 continue
 
-            # Real order book scan
+            # ── Real order book scan ───────────────────────────────────────
             ob = {}
             if self.poly:
                 ob = self.poly.book_signal(m, direction)
-                # Order book disagrees strongly — skip
                 if ob.get("ob_available") and ob["ob_direction"] not in ("NEUTRAL", direction):
                     if ob["ob_strength"] > 0.4:
                         continue
@@ -215,11 +272,10 @@ class BTC5MinStrategy:
             spread          = ob.get("spread", abs(m.yes_price - m.no_price))
             depth_imbalance = ob.get("depth_imbalance", 0.0)
 
-            # Boost confidence if order book agrees
             if ob.get("ob_direction") == direction and ob.get("ob_strength", 0) > 0.3:
                 confidence = min(0.92, confidence + ob["ob_strength"] * 0.05)
 
-            # LLM confirmation (AMF full stack — TQ compressed, VRAM cached)
+            # ── LLM confirmation (AMF full stack) ─────────────────────────
             llm = self.amf.analyze(
                 question=m.question, yes_price=m.yes_price, no_price=m.no_price,
                 btc_price=btc_now, btc_change=btc_change,
@@ -230,13 +286,53 @@ class BTC5MinStrategy:
                 time_elapsed=0, window_duration=300
             )
 
-            # Blend momentum + LLM confidence
             if llm.direction and llm.direction != direction:
-                continue  # LLM disagrees — skip
-            combined = confidence * 0.6 + (llm.confidence if llm.direction else 0.5) * 0.4
+                continue
+
+            # ── Bayesian posterior fusion ──────────────────────────────────
+            if self.bayesian:
+                # Build evidence from each signal source
+                price_ev = self.bayesian.build_price_evidence(
+                    kalman_velocity, direction=direction
+                ) if kalman_velocity != 0 else None
+
+                book_ev = self.bayesian.build_book_evidence(
+                    book_ratio, depth_imbalance, direction=direction
+                ) if ob else None
+
+                vpin_ev = self.bayesian.build_vpin_evidence(
+                    vpin_signal, direction=direction
+                ) if vpin_signal else None
+
+                regime_ev = self.bayesian.build_regime_evidence(
+                    regime_state, direction=direction
+                ) if regime_state else None
+
+                # LLM signal as prior
+                llm_prior = (llm.confidence if llm.direction == direction
+                             else (1.0 - llm.confidence if llm.direction else 0.60))
+                prior = max(llm_prior, confidence) * 0.5 + min(llm_prior, confidence) * 0.5
+
+                posterior = self.bayesian.update(
+                    m.slug, prior=prior,
+                    price_evidence=price_ev,
+                    book_evidence=book_ev,
+                    vpin_evidence=vpin_ev,
+                    regime_evidence=regime_ev,
+                )
+                combined = posterior.posterior
+                if not posterior.is_strong and combined < self.MIN_CONFIDENCE + 0.03:
+                    continue
+            else:
+                combined = confidence * 0.6 + (llm.confidence if llm.direction else 0.5) * 0.4
 
             if combined < self.MIN_CONFIDENCE:
                 continue
+
+            logger.info("BTC5MIN %s conf=%.2f [Kalman=%.4f VPIN=%s regime=%s]",
+                        direction, combined, kalman_velocity,
+                        vpin_signal.get("vpin", "N/A"),
+                        regime_state.regime.value if regime_state else "N/A")
 
             signals.append(Signal(
                 direction=direction, confidence=combined,
@@ -248,7 +344,7 @@ class BTC5MinStrategy:
         return signals
 
     def _is_5min_btc(self, m) -> bool:
-        q = m.question.lower()
+        q    = m.question.lower()
         slug = m.slug.lower()
         return ("btc" in q or "bitcoin" in q) and (
             "5" in slug or "5-min" in q or "5min" in q or "5 min" in q
