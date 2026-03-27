@@ -3044,6 +3044,19 @@ amf_skip_lookup:
           used_amf &&
           hit_entry.prefix_len > 0 &&
           static_cast<std::size_t>(hit_entry.prefix_len) < amf_store_tokens.size();
+      if (!g.amf_ready) {
+        std::fprintf(stderr, "[AMF_SKIP] reason=not_ready\n");
+        (void) std::fflush(stderr);
+      } else if (amf_store_tokens.size() < g.amf.min_tokens()) {
+        std::fprintf(stderr,
+                     "[AMF_SKIP] reason=too_short tokens=%zu min=%zu "
+                     "(set KORITH_AMF_MIN_TOKENS to lower threshold)\n",
+                     amf_store_tokens.size(), g.amf.min_tokens());
+        (void) std::fflush(stderr);
+      } else if (used_amf && !amf_prefix_extended) {
+        std::fprintf(stderr, "[AMF_SKIP] reason=full_hit_no_extension\n");
+        (void) std::fflush(stderr);
+      }
       if (g.amf_ready &&
           amf_store_tokens.size() >= g.amf.min_tokens() &&
           (!used_amf || amf_prefix_extended)) {

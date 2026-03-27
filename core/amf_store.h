@@ -278,7 +278,7 @@ private:
   bool enabled_ = false;
   mutable bool disabled_logged_ = false;
   AmfDisableReason disable_reason_ = AmfDisableReason::kNone;
-  std::size_t min_tokens_ = 64;
+  std::size_t min_tokens_ = 16;
   double min_prompt_ms_ = 0.0;
   double min_roi_ = 0.0;
   double min_admit_roi_ = 0.0;
