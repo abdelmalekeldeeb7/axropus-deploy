@@ -169,8 +169,9 @@ bool amf_direct_kv_save(AmfDirectKvCtx            * dkv,
   if (!dkv || !lctx) return false;
 
   // Access the KV cache through the internal context struct.
-  const llama_kv_cache & kv = lctx->kv_self;
-  const std::uint32_t n_layers = static_cast<std::uint32_t>(kv.k_l.size());
+  // llama_context no longer has kv_self; memory is a unique_ptr<llama_memory_i>.
+  llama_kv_cache & kv = *static_cast<llama_kv_cache *>(lctx->memory.get());
+  const std::uint32_t n_layers = static_cast<std::uint32_t>(kv.layers.size());
 
   if (n_layers == 0) {
     std::fprintf(stderr, "[AMF_DIRECT_KV] save: no attention layers found\n");
@@ -182,8 +183,8 @@ bool amf_direct_kv_save(AmfDirectKvCtx            * dkv,
   std::vector<AmfDirectKvLayerInfo> layer_infos(n_layers);
 
   for (std::uint32_t il = 0; il < n_layers; il++) {
-    ggml_tensor * k = kv.k_l[il];
-    ggml_tensor * v = kv.v_l[il];
+    ggml_tensor * k = kv.layers[il].k;
+    ggml_tensor * v = kv.layers[il].v;
     if (!k || !v) {
       // SSM/recurrent layer — no KV tensor, record zero-size entry.
       layer_infos[il] = {total_kv_bytes, 0, total_kv_bytes, 0};
@@ -216,14 +217,14 @@ bool amf_direct_kv_save(AmfDirectKvCtx            * dkv,
   // ── Determine KV dtype from first valid layer ──────────────────────────────
   AmfKvDtype kv_dtype = AmfKvDtype::kF16;
   for (std::uint32_t il = 0; il < n_layers; il++) {
-    if (kv.k_l[il]) { kv_dtype = dtype_from_ggml(kv.k_l[il]); break; }
+    if (kv.layers[il].k) { kv_dtype = dtype_from_ggml(kv.layers[il].k); break; }
   }
 
   // ── KV head / dim metadata from first valid K tensor ──────────────────────
   std::uint32_t n_kv_heads = 0;
   std::uint32_t head_dim   = 0;
   for (std::uint32_t il = 0; il < n_layers; il++) {
-    ggml_tensor * k = kv.k_l[il];
+    ggml_tensor * k = kv.layers[il].k;
     if (!k) continue;
     // In llama.cpp's layout the K cache tensor shape for a layer is typically
     // [head_dim, n_kv_heads, n_ctx_cells] — pick from ne[0] and ne[1].
@@ -241,7 +242,7 @@ bool amf_direct_kv_save(AmfDirectKvCtx            * dkv,
   hdr.n_kv_heads     = n_kv_heads;
   hdr.head_dim       = head_dim;
   hdr.dtype          = static_cast<std::uint32_t>(kv_dtype);
-  hdr.reserved       = 0;
+  hdr.compression    = 0;
   hdr.total_kv_bytes = total_kv_bytes;
   hdr.model_hash     = amf_ctx.model_hash;
   hdr.prefix_hash    = amf_hash_tokens(tokens);
@@ -254,8 +255,8 @@ bool amf_direct_kv_save(AmfDirectKvCtx            * dkv,
   std::uint8_t * kv_payload = buf + hdr_bytes + layer_tbl_bytes;
 
   for (std::uint32_t il = 0; il < n_layers; il++) {
-    ggml_tensor * k = kv.k_l[il];
-    ggml_tensor * v = kv.v_l[il];
+    ggml_tensor * k = kv.layers[il].k;
+    ggml_tensor * v = kv.layers[il].v;
     if (!k || !v) continue;
 
     const AmfDirectKvLayerInfo & li = layer_infos[il];
@@ -372,9 +373,10 @@ bool amf_direct_kv_restore(AmfDirectKvCtx * dkv,
   std::memcpy(layer_infos.data(), pinned_base + hdr_bytes, layer_tbl_bytes);
 
   // ── Validate against current KV cache layout ──────────────────────────────
-  llama_kv_cache & kv = lctx->kv_self;
+  // llama_context no longer has kv_self; memory is a unique_ptr<llama_memory_i>.
+  llama_kv_cache & kv = *static_cast<llama_kv_cache *>(lctx->memory.get());
   const std::uint32_t n_layers_ctx =
-      static_cast<std::uint32_t>(kv.k_l.size());
+      static_cast<std::uint32_t>(kv.layers.size());
 
   if (n_layers_saved != n_layers_ctx) {
     std::fprintf(stderr,
@@ -390,8 +392,8 @@ bool amf_direct_kv_restore(AmfDirectKvCtx * dkv,
 
   // ── Issue H→D copies for each attention layer ─────────────────────────────
   for (std::uint32_t il = 0; il < n_layers_ctx; il++) {
-    ggml_tensor * k = kv.k_l[il];
-    ggml_tensor * v = kv.v_l[il];
+    ggml_tensor * k = kv.layers[il].k;
+    ggml_tensor * v = kv.layers[il].v;
     if (!k || !v) continue;  // SSM/recurrent layer — skip
 
     const AmfDirectKvLayerInfo & li = layer_infos[il];
@@ -434,21 +436,13 @@ bool amf_direct_kv_restore(AmfDirectKvCtx * dkv,
   // ── Update KV cache metadata (replicate what llama_state_set_data does) ───
   // After the tensor data is in place, llama.cpp needs its bookkeeping updated
   // so that decode starts from the right position.
+  // kv.head/used/cells no longer exist — the new struct uses per-stream
+  // v_heads and v_cells.  Set stream 0's head position to n_tokens; leave
+  // v_cells as-is for now (the GPU tensor data is the critical part).
   const std::uint32_t n_tokens = hdr.n_tokens;
 
-  // Mark the first n_tokens cells as occupied by sequence 0.
-  // This is the minimal metadata update needed for decode to resume correctly.
-  kv.head = n_tokens;
-  kv.used = n_tokens;
-
-  for (std::uint32_t i = 0; i < n_tokens && i < kv.cells.size(); i++) {
-    kv.cells[i].pos = static_cast<llama_pos>(i);
-    kv.cells[i].seq_id.insert(0);  // sequence 0
-  }
-  // Clear any cells beyond n_tokens that might have stale data.
-  for (std::uint32_t i = n_tokens; i < kv.cells.size(); i++) {
-    kv.cells[i].pos = -1;
-    kv.cells[i].seq_id.clear();
+  if (!kv.v_heads.empty()) {
+    kv.v_heads[0] = n_tokens;
   }
 
   std::fprintf(stderr,
