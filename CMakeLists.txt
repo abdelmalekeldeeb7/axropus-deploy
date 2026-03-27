@@ -23,6 +23,7 @@ set(LLAMA_INCLUDE_DIR "${LLAMA_ROOT}/include")
 set(GGML_INCLUDE_DIR  "${LLAMA_ROOT}/ggml/include")
 set(LLAMA_HEADER      "${LLAMA_INCLUDE_DIR}/llama.h")
 set(LLAMA_LIBRARY     "${LLAMA_ROOT}/build/bin/libllama.so")
+set(GGML_BASE_LIBRARY "${LLAMA_ROOT}/build/bin/libggml-base.so")
 
 message(STATUS "LLAMA_ROOT=${LLAMA_ROOT}")
 message(STATUS "LLAMA_INCLUDE_DIR=${LLAMA_INCLUDE_DIR}")
@@ -180,5 +181,6 @@ add_dependencies(korith_dynamic korith_scheduler)
 
 target_link_libraries(korith_dynamic PRIVATE
   "${LLAMA_LIBRARY}"
+  "${GGML_BASE_LIBRARY}"
   Threads::Threads
 )
