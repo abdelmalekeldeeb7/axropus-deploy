@@ -30,9 +30,20 @@
 // We need the KV cache and context struct internals that are not exposed via
 // the public llama.h API.  CMakeLists.txt adds ${LLAMA_ROOT}/src to the
 // include path when KORITH_AMF_DIRECT_GPU support is compiled in.
+//
+// llama_context::memory and llama_kv_cache::{layers,v_heads,v_cells} are
+// private.  We open access only around these two internal headers — the
+// #define is scoped tightly and #undef'd immediately after so it cannot leak
+// into ggml.h or any of our own code below.  This is the standard approach
+// used by deep llama.cpp integrations (exllamav2, koboldcpp) that bypass the
+// slow llama_state_get/set_data serialization path.
 #if __has_include("llama-context.h")
+#  define private public    // NOLINT: open llama_context::memory
+#  define protected public  // NOLINT: open llama_kv_cache members
 #  include "llama-context.h"
 #  include "llama-kv-cache.h"
+#  undef protected
+#  undef private
 #  define AMF_HAS_LLAMA_INTERNALS 1
 #else
 #  define AMF_HAS_LLAMA_INTERNALS 0
