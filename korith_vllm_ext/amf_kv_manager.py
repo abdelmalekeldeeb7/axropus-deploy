@@ -859,3 +859,100 @@ class AmfKvManager:
         if self._vram_cache is not None:
             base["vram_cache"] = self._vram_cache.stats()
         return base
+
+
+# ── V1 KV cache proxy ───────────────────────────────────────────────────────
+
+class _KvCacheProxy:
+    """Wraps vLLM V1 model_runner.kv_caches (list[Tensor]) into the
+    CacheEngine.gpu_cache interface that AmfKvManager expects.
+
+    V1 kv_caches are already shaped [2, num_blocks, block_size, num_kv_heads,
+    head_dim] (FlashAttn/Tree) or [num_blocks, 2, ...] (FlashInfer).
+    For FlashInfer, we permute so AmfKvManager always sees dim-0 == 2.
+    """
+
+    def __init__(self, kv_caches: list) -> None:
+        self.gpu_cache: List[torch.Tensor] = []
+        for t in kv_caches:
+            if not isinstance(t, torch.Tensor):
+                continue
+            if t.dim() == 5 and t.shape[0] == 2:
+                # FlashAttn / ROCm / Tree: [2, num_blocks, block_size, ...]
+                self.gpu_cache.append(t)
+            elif t.dim() == 5 and t.shape[1] == 2:
+                # FlashInfer: [num_blocks, 2, block_size, ...] → view as
+                # stacked [2, num_blocks, ...] using a non-contiguous view so
+                # that writes through the view mutate the original tensor.
+                self.gpu_cache.append(t.permute(1, 0, 2, 3, 4))
+            elif isinstance(t, torch.Tensor):
+                self.gpu_cache.append(t)
+
+
+# ── collective_rpc worker functions ──────────────────────────────────────────
+# These module-level functions are passed as callables to
+# llm.collective_rpc(fn, args=(...)).  vLLM calls fn(worker, *args, **kwargs)
+# inside the GPU worker process where kv_caches are accessible.
+
+
+def worker_save_kv(
+    worker: "Any",
+    amf_store_path: str,
+    prompt_tokens: list,
+    model_hash: int = 0,
+    tenant_id: str = "__shared__",
+) -> dict:
+    """Save KV cache snapshot from inside the worker subprocess.
+
+    Returns dict with ``saved`` (bool), ``n_layers`` (int), ``n_tokens`` (int).
+    """
+    kv_caches = worker.model_runner.kv_caches
+    if not kv_caches:
+        return {"saved": False, "n_layers": 0, "n_tokens": 0}
+
+    proxy = _KvCacheProxy(kv_caches)
+    if not proxy.gpu_cache:
+        return {"saved": False, "n_layers": 0, "n_tokens": 0}
+
+    mgr = AmfKvManager(
+        cache_engine=proxy,
+        amf_store_path=amf_store_path,
+        model_config=worker.vllm_config.model_config,
+        model_hash=model_hash,
+        tenant_id=tenant_id,
+    )
+    saved = mgr.save_kv_state(prompt_tokens, block_table=[])
+    return {
+        "saved": saved,
+        "n_layers": len(proxy.gpu_cache),
+        "n_tokens": len(prompt_tokens),
+    }
+
+
+def worker_restore_kv(
+    worker: "Any",
+    amf_store_path: str,
+    prompt_tokens: list,
+    model_hash: int = 0,
+    tenant_id: str = "__shared__",
+) -> int:
+    """Restore KV cache snapshot inside the worker subprocess.
+
+    Returns number of tokens restored (0 on failure).
+    """
+    kv_caches = worker.model_runner.kv_caches
+    if not kv_caches:
+        return 0
+
+    proxy = _KvCacheProxy(kv_caches)
+    if not proxy.gpu_cache:
+        return 0
+
+    mgr = AmfKvManager(
+        cache_engine=proxy,
+        amf_store_path=amf_store_path,
+        model_config=worker.vllm_config.model_config,
+        model_hash=model_hash,
+        tenant_id=tenant_id,
+    )
+    return mgr.restore_kv_state(prompt_tokens, block_table=[])
