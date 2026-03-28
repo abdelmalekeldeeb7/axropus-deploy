@@ -117,11 +117,18 @@ class AmfWorkerExtension:
 
         block_table = _get_block_size_and_table(proxy.gpu_cache, len(prompt_tokens))
 
+        # Extract block_size for the caller (needed for prefix cache registration).
+        t = proxy.gpu_cache[0]
+        block_size = t.shape[2] if t.dim() == 5 else 16
+
         saved = mgr.save_kv_state(prompt_tokens, block_table=block_table)
         return {
             "saved": saved,
             "n_layers": len(proxy.gpu_cache),
             "n_tokens": len(prompt_tokens),
+            "block_size": block_size,
+            "n_blocks": len(block_table),
+            "block_ids": block_table,
         }
 
     def amf_restore_kv(

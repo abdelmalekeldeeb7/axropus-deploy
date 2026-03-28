@@ -89,6 +89,22 @@ def run_benchmark(args: argparse.Namespace) -> None:
 
     tenant_id = str(os.environ.get("KORITH_TENANT_ID", "__shared__"))
 
+    # ── Verify EngineCore patch ──────────────────────────────────────────────
+    try:
+        verify = llm.llm_engine.engine_core.call_utility("amf_verify_patch")
+        print(
+            f"[AMF_VERIFY] patch_ok={verify.get('patch_ok')} "
+            f"block_size={verify.get('block_size')} "
+            f"prefix_caching={verify.get('prefix_caching')} "
+            f"has_block_pool={verify.get('has_block_pool')}",
+            flush=True,
+        )
+        if not verify.get("patch_ok"):
+            print("[AMF_WARN] EngineCore patch failed — prefix skip disabled",
+                  flush=True)
+    except Exception as exc:
+        print(f"[AMF_WARN] patch verify failed: {exc}", flush=True)
+
     # ── Cold run ──────────────────────────────────────────────────────────────
     print("[KORITH_VLLM] cold run — full prefill...", flush=True)
     t_cold0 = time.monotonic()
@@ -182,23 +198,31 @@ def run_benchmark(args: argparse.Namespace) -> None:
     except Exception as exc:
         print(f"[AMF_WARN] restore failed: {exc}", file=sys.stderr, flush=True)
 
+    # Get block_ids from save_info (worker knows the real block_size).
+    block_ids = save_info.get("block_ids", [])
+    if not block_ids:
+        import math
+        bs = save_info.get("block_size", 16)
+        block_ids = list(range(math.ceil(len(token_ids) / bs)))
+
     register_ms = 0.0
     if restored_tokens > 0:
         try:
-            # Step 2: Register restored blocks in vLLM's prefix cache
-            # (EngineCore side) so generate() skips prefill.
-            import math
-            block_size = 16  # default; register method auto-detects
-            n_blocks = math.ceil(len(token_ids) / block_size)
-            block_ids = list(range(n_blocks))
 
             t_reg0 = time.monotonic()
-            llm.llm_engine.engine_core.call_utility(
+            reg_result = llm.llm_engine.engine_core.call_utility(
                 "amf_register_prefix",
                 list(token_ids),
                 block_ids,
             )
             register_ms = (time.monotonic() - t_reg0) * 1000.0
+            reg_info = reg_result if isinstance(reg_result, dict) else {}
+            print(
+                f"[AMF_REGISTER] registered={reg_info.get('registered', '?')} "
+                f"block_size={reg_info.get('block_size', '?')} "
+                f"register_ms={register_ms:.2f}",
+                flush=True,
+            )
             print(
                 f"[AMF_HIT] prefix_tokens={restored_tokens} "
                 f"restore_ms={restore_ms:.2f} "

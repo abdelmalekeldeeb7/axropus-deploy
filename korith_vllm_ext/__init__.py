@@ -67,17 +67,15 @@ def _patch_engine_core() -> None:
             cache_config.prefix_caching_hash_algo
         )
 
-        # Determine block_size from the coordinator's managers.
-        managers = coordinator.single_type_managers
-        if not managers:
-            return {"registered": 0, "error": "no kv cache managers"}
-        block_size = managers[0].block_size
+        # Determine block_size from the scheduler (authoritative source).
+        block_size = self.scheduler.block_size
 
         # Compute chain-hashed block hashes (same algorithm as vLLM's
         # request_block_hasher but without needing a Request object).
         n_full_blocks = len(token_ids) // block_size
         if n_full_blocks == 0:
-            return {"registered": 0, "error": "no full blocks"}
+            return {"registered": 0, "error": "no full blocks",
+                    "block_size": block_size, "n_tokens": len(token_ids)}
         n_full_blocks = min(n_full_blocks, len(block_ids))
 
         block_hashes: list[BlockHash] = []
@@ -93,11 +91,14 @@ def _patch_engine_core() -> None:
             parent_hash = bh
 
         # Get all kv_cache_group_ids from the managers.
-        group_ids = [mgr.kv_cache_group_id for mgr in managers]
+        managers = coordinator.single_type_managers
+        group_ids = [mgr.kv_cache_group_id for mgr in managers] if managers else [0]
 
         registered = 0
         for i in range(n_full_blocks):
             bid = block_ids[i]
+            if bid >= len(block_pool.blocks):
+                continue  # safety: skip out-of-range block IDs
             blk = block_pool.blocks[bid]
 
             # Block might still have a hash from a previous cache entry —
@@ -114,16 +115,45 @@ def _patch_engine_core() -> None:
                 key = make_block_hash_with_group_id(block_hashes[i], gid)
                 blk.block_hash = key
                 block_pool.cached_block_hash_to_block.insert(key, blk)
-                # Only set hash once (first group sets it, subsequent groups
-                # would need separate block objects for multi-group models).
-                # For standard models with one attention group, this is fine.
                 break
 
             registered += 1
 
-        return {"registered": registered, "n_full_blocks": n_full_blocks}
+        return {
+            "registered": registered,
+            "n_full_blocks": n_full_blocks,
+            "block_size": block_size,
+            "group_ids": group_ids,
+        }
+
+    def amf_verify_patch(self: "EngineCore") -> dict:
+        """Verify that amf_register_prefix is callable and the scheduler is
+        accessible.  Call this after LLM creation to confirm the patch worked.
+        """
+        has_scheduler = hasattr(self, "scheduler")
+        has_kv_mgr = (
+            has_scheduler and hasattr(self.scheduler, "kv_cache_manager")
+        )
+        has_block_pool = (
+            has_kv_mgr
+            and hasattr(self.scheduler.kv_cache_manager, "block_pool")
+        )
+        block_size = self.scheduler.block_size if has_scheduler else 0
+        prefix_caching = (
+            self.scheduler.kv_cache_manager.enable_caching
+            if has_kv_mgr
+            else False
+        )
+        return {
+            "patch_ok": True,
+            "has_scheduler": has_scheduler,
+            "has_block_pool": has_block_pool,
+            "block_size": block_size,
+            "prefix_caching": prefix_caching,
+        }
 
     EngineCore.amf_register_prefix = amf_register_prefix
+    EngineCore.amf_verify_patch = amf_verify_patch
 
 
 # Apply patch on import.
