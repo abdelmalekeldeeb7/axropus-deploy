@@ -480,10 +480,12 @@ class AmfKvManager:
         for (k_off, k_sz, v_off, v_sz), k_t, v_t in zip(
             layer_infos, layer_k_tensors, layer_v_tensors
         ):
-            k_cpu = k_t.cpu()   # triggers cudaMemcpy D→H
-            v_cpu = v_t.cpu()
-            mv[k_off : k_off + k_sz] = k_cpu.numpy().tobytes()
-            mv[v_off : v_off + v_sz] = v_cpu.numpy().tobytes()
+            k_cpu = k_t.cpu().contiguous()   # triggers cudaMemcpy D→H
+            v_cpu = v_t.cpu().contiguous()
+            # Use raw storage bytes instead of .numpy() to support bfloat16
+            # and other dtypes that NumPy cannot represent.
+            mv[k_off : k_off + k_sz] = bytes(k_cpu.untyped_storage())
+            mv[v_off : v_off + v_sz] = bytes(v_cpu.untyped_storage())
 
         # ── TurboQuant compression (optional) ─────────────────────────────────
         # layer_infos store UNCOMPRESSED offsets — restore uses them after
