@@ -71,11 +71,16 @@ def run_benchmark(args: argparse.Namespace) -> None:
         print("[ERROR] --model or KORITH_MODEL required", file=sys.stderr)
         sys.exit(1)
 
+    # Register AMF worker extension so save/restore methods are available
+    # on the GPU worker via string-name collective_rpc (no serialization issues).
+    ext_cls = "korith_vllm_ext.amf_worker_ext.AmfWorkerExtension"
+
     print(f"[KORITH_VLLM] loading model={model_path}", flush=True)
     llm = LLM(
         model=model_path,
         trust_remote_code=True,
         enforce_eager=True,  # disable CUDA graph so KV tensors stay accessible
+        worker_extension_cls=ext_cls,
     )
     sampling = SamplingParams(
         temperature=0.0,  # greedy — required for deterministic AMF replay
@@ -98,13 +103,11 @@ def run_benchmark(args: argparse.Namespace) -> None:
     save_info: dict = {}
     if enable_amf and amf_path:
         try:
-            from .amf_kv_manager import worker_save_kv  # type: ignore[import]
-
             tokenizer  = llm.get_tokenizer()
             token_ids  = tokenizer.encode(prompt)
 
             results = llm.collective_rpc(
-                worker_save_kv,
+                "amf_save_kv",
                 timeout=120,
                 args=(amf_path, list(token_ids), 0, tenant_id),
             )
@@ -154,11 +157,9 @@ def run_benchmark(args: argparse.Namespace) -> None:
     restored_tokens = 0
     if has_snap:
         try:
-            from .amf_kv_manager import worker_restore_kv  # type: ignore[import]
-
             t_restore0 = time.monotonic()
             results = llm.collective_rpc(
-                worker_restore_kv,
+                "amf_restore_kv",
                 timeout=120,
                 args=(amf_path, list(token_ids), 0, tenant_id),
             )
