@@ -737,22 +737,11 @@ class AmfKvManager:
                 k_all = layer_cache
                 v_all = layer_cache
 
-            if not block_table:
-                continue
-
-            block_ids = torch.tensor(block_table, device=k_all.device, dtype=torch.long)
-
             if kv_gpu_tensor is not None:
                 # ── GPU tensor path: slice by element index, no H→D needed ────
-                # layer_infos offsets are in bytes; convert to element indices.
                 _esz    = cache_dtype.itemsize
-                k_start = k_off // _esz
-                k_count = k_sz  // _esz
-                v_start = v_off // _esz
-                v_count = v_sz  // _esz
-
-                k_flat = kv_gpu_tensor[k_start : k_start + k_count].to(cache_dtype)
-                v_flat = kv_gpu_tensor[v_start : v_start + v_count].to(cache_dtype)
+                k_flat = kv_gpu_tensor[k_off // _esz : (k_off + k_sz) // _esz].to(cache_dtype)
+                v_flat = kv_gpu_tensor[v_off // _esz : (v_off + v_sz) // _esz].to(cache_dtype)
             else:
                 # ── CPU bytes path: frombuffer + H→D (uncompressed or CPU decomp)
                 k_flat = torch.frombuffer(
@@ -762,16 +751,25 @@ class AmfKvManager:
                     bytearray(kv_payload[v_off : v_off + v_sz]), dtype=cache_dtype
                 )
 
-            k_src = k_flat.reshape(k_all[block_ids].shape)
-            v_src = v_flat.reshape(v_all[block_ids].shape)
-
-            if kv_gpu_tensor is None:
-                k_src = k_src.to(k_all.device)
-                v_src = v_src.to(v_all.device)
-
-            # Scatter restored KV into the cache at the physical block positions.
-            k_all[block_ids] = k_src
-            v_all[block_ids] = v_src
+            if block_table:
+                # Scatter into specific physical blocks owned by this sequence.
+                block_ids = torch.tensor(block_table, device=k_all.device, dtype=torch.long)
+                k_src = k_flat.reshape(k_all[block_ids].shape)
+                v_src = v_flat.reshape(v_all[block_ids].shape)
+                if kv_gpu_tensor is None:
+                    k_src = k_src.to(k_all.device)
+                    v_src = v_src.to(v_all.device)
+                k_all[block_ids] = k_src
+                v_all[block_ids] = v_src
+            else:
+                # Empty block_table → single-request benchmark: restore ALL blocks.
+                k_src = k_flat.reshape_as(k_all)
+                v_src = v_flat.reshape_as(v_all)
+                if kv_gpu_tensor is None:
+                    k_src = k_src.to(k_all.device)
+                    v_src = v_src.to(v_all.device)
+                k_all.copy_(k_src)
+                v_all.copy_(v_src)
 
         # ── Promote to VRAM cache for future zero-copy restores ───────────────
         if (
@@ -833,17 +831,18 @@ class AmfKvManager:
                 k_all = layer_cache
                 v_all = layer_cache
 
-            if not block_table:
-                continue
+            _esz   = cache_dtype.itemsize
+            k_flat = kv_gpu_tensor[k_off // _esz : (k_off + k_sz) // _esz].to(cache_dtype)
+            v_flat = kv_gpu_tensor[v_off // _esz : (v_off + v_sz) // _esz].to(cache_dtype)
 
-            block_ids = torch.tensor(block_table, device=k_all.device, dtype=torch.long)
-
-            _esz    = cache_dtype.itemsize
-            k_flat  = kv_gpu_tensor[k_off // _esz : (k_off + k_sz) // _esz].to(cache_dtype)
-            v_flat  = kv_gpu_tensor[v_off // _esz : (v_off + v_sz) // _esz].to(cache_dtype)
-
-            k_all[block_ids] = k_flat.reshape(k_all[block_ids].shape)
-            v_all[block_ids] = v_flat.reshape(v_all[block_ids].shape)
+            if block_table:
+                block_ids = torch.tensor(block_table, device=k_all.device, dtype=torch.long)
+                k_all[block_ids] = k_flat.reshape(k_all[block_ids].shape)
+                v_all[block_ids] = v_flat.reshape(v_all[block_ids].shape)
+            else:
+                # Empty block_table → restore ALL blocks (single-request benchmark).
+                k_all.copy_(k_flat.reshape_as(k_all))
+                v_all.copy_(v_flat.reshape_as(v_all))
 
         return entry.n_tokens
 
