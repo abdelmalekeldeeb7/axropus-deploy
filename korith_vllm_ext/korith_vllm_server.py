@@ -136,9 +136,6 @@ def run_benchmark(args: argparse.Namespace) -> None:
     if not enable_amf or not amf_path:
         return
 
-    # ── Warm run — measure restore_ms separately from generation ─────────────
-    print("[KORITH_VLLM] warm run — restoring KV from snapshot...", flush=True)
-
     tokenizer = llm.get_tokenizer()
     token_ids = tokenizer.encode(prompt)
 
@@ -153,61 +150,94 @@ def run_benchmark(args: argparse.Namespace) -> None:
     )
     has_snap = _dummy_mgr.has_snapshot(token_ids)
 
+    if not has_snap:
+        print("[AMF_MISS] reason=no_snapshot", flush=True)
+        return
+
+    # ── Reset vLLM's prefix cache to simulate cold start ─────────────────────
+    # This proves AMF is providing the value, not vLLM's built-in cache.
+    print("[KORITH_VLLM] resetting vLLM prefix cache (simulating restart)...",
+          flush=True)
+    try:
+        llm.llm_engine.reset_prefix_cache()
+    except Exception as exc:
+        print(f"[AMF_WARN] reset_prefix_cache failed: {exc}", flush=True)
+
+    # ── Warm run: AMF restore → register prefix cache → generate ─────────────
+    print("[KORITH_VLLM] warm run — AMF restore + prefix cache register...",
+          flush=True)
+
     restore_ms = 0.0
     restored_tokens = 0
-    if has_snap:
+    try:
+        # Step 1: Restore KV data into physical blocks (worker side).
+        t_restore0 = time.monotonic()
+        results = llm.collective_rpc(
+            "amf_restore_kv",
+            timeout=120,
+            args=(amf_path, list(token_ids), 0, tenant_id),
+        )
+        restore_ms = (time.monotonic() - t_restore0) * 1000.0
+        restored_tokens = results[0] if results else 0
+    except Exception as exc:
+        print(f"[AMF_WARN] restore failed: {exc}", file=sys.stderr, flush=True)
+
+    register_ms = 0.0
+    if restored_tokens > 0:
         try:
-            t_restore0 = time.monotonic()
-            results = llm.collective_rpc(
-                "amf_restore_kv",
-                timeout=120,
-                args=(amf_path, list(token_ids), 0, tenant_id),
+            # Step 2: Register restored blocks in vLLM's prefix cache
+            # (EngineCore side) so generate() skips prefill.
+            import math
+            block_size = 16  # default; register method auto-detects
+            n_blocks = math.ceil(len(token_ids) / block_size)
+            block_ids = list(range(n_blocks))
+
+            t_reg0 = time.monotonic()
+            llm.llm_engine.engine_core.call_utility(
+                "amf_register_prefix",
+                list(token_ids),
+                block_ids,
             )
-            restore_ms = (time.monotonic() - t_restore0) * 1000.0
-            restored_tokens = results[0] if results else 0
-
-            if restored_tokens > 0:
-                saved_ms  = max(0.0, prompt_ms - restore_ms)
-                speedup   = prompt_ms / max(1.0, restore_ms)
-                print(
-                    f"[AMF_HIT] prefix_tokens={restored_tokens} "
-                    f"restore_ms={restore_ms:.2f} "
-                    f"saved_ms={saved_ms:.2f} "
-                    f"speedup={speedup:.2f}x",
-                    flush=True,
-                )
-            else:
-                print("[AMF_MISS] reason=restore_failed", flush=True)
+            register_ms = (time.monotonic() - t_reg0) * 1000.0
+            print(
+                f"[AMF_HIT] prefix_tokens={restored_tokens} "
+                f"restore_ms={restore_ms:.2f} "
+                f"register_ms={register_ms:.2f} "
+                f"total_amf_ms={restore_ms + register_ms:.2f} "
+                f"speedup={prompt_ms / max(1.0, restore_ms + register_ms):.2f}x",
+                flush=True,
+            )
         except Exception as exc:
-            print(f"[AMF_WARN] restore failed: {exc}", file=sys.stderr, flush=True)
+            print(f"[AMF_WARN] register failed: {exc}", file=sys.stderr,
+                  flush=True)
     else:
-        print("[AMF_MISS] reason=no_snapshot", flush=True)
+        print("[AMF_MISS] reason=restore_failed", flush=True)
 
-    # Run warm generate() to verify output matches (prefill still runs inside
-    # vLLM — output should be identical since temperature=0).
+    # Warm generate — should skip prefill via prefix cache hit.
     t_warm0       = time.monotonic()
     warm_outputs  = llm.generate([prompt], sampling)
     warm_total_ms = (time.monotonic() - t_warm0) * 1000.0
     warm_text     = warm_outputs[0].outputs[0].text if warm_outputs else ""
 
-    skip_ratio = prompt_ms / max(1.0, restore_ms) if restore_ms > 0 else 0.0
-
     print(
         f"[KORITH_RUN_SUMMARY] "
         f"cold_ms={prompt_ms:.1f} "
         f"restore_ms={restore_ms:.1f} "
+        f"register_ms={register_ms:.1f} "
         f"warm_generate_ms={warm_total_ms:.1f} "
         f"tokens={max_tokens} "
-        f"speedup={skip_ratio:.2f}x "
+        f"e2e_speedup={prompt_ms / max(1.0, warm_total_ms):.2f}x "
         f"cold={cold_text!r} "
         f"warm={warm_text!r}",
         flush=True,
     )
 
-    # ── Second warm run — measures VRAM cache hit (zero H→D) ─────────────────
+    # ── Second warm run — VRAM cache path ────────────────────────────────────
     if restored_tokens > 0:
         print("[KORITH_VLLM] warm2 run — VRAM cache path...", flush=True)
         try:
+            llm.llm_engine.reset_prefix_cache()
+
             t_restore2 = time.monotonic()
             results2 = llm.collective_rpc(
                 "amf_restore_kv",
@@ -217,21 +247,31 @@ def run_benchmark(args: argparse.Namespace) -> None:
             restore2_ms = (time.monotonic() - t_restore2) * 1000.0
             restored2 = results2[0] if results2 else 0
 
+            t_reg2 = time.monotonic()
+            llm.llm_engine.engine_core.call_utility(
+                "amf_register_prefix",
+                list(token_ids),
+                block_ids,
+            )
+            register2_ms = (time.monotonic() - t_reg2) * 1000.0
+
             t_warm2       = time.monotonic()
             warm2_outputs = llm.generate([prompt], sampling)
             warm2_ms      = (time.monotonic() - t_warm2) * 1000.0
             warm2_text    = warm2_outputs[0].outputs[0].text if warm2_outputs else ""
 
-            speedup2 = prompt_ms / max(1.0, restore2_ms)
+            total2 = restore2_ms + register2_ms
             print(
                 f"[AMF_HIT] source=vram prefix_tokens={restored2} "
-                f"restore_ms={restore2_ms:.2f} speedup={speedup2:.2f}x",
+                f"restore_ms={restore2_ms:.2f} register_ms={register2_ms:.2f} "
+                f"speedup={prompt_ms / max(1.0, total2):.2f}x",
                 flush=True,
             )
             print(
                 f"[KORITH_RUN_SUMMARY2] "
                 f"restore2_ms={restore2_ms:.1f} "
                 f"warm2_generate_ms={warm2_ms:.1f} "
+                f"e2e_speedup2={prompt_ms / max(1.0, warm2_ms):.2f}x "
                 f"warm2={warm2_text!r}",
                 flush=True,
             )
