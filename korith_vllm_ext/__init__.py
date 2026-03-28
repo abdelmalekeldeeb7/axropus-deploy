@@ -152,8 +152,57 @@ def _patch_engine_core() -> None:
             "prefix_caching": prefix_caching,
         }
 
+    def amf_verify_registration(
+        self: "EngineCore",
+        token_ids: list,
+    ) -> dict:
+        """Verify that registered blocks are findable by the prefix cache.
+
+        Recomputes block hashes for the given tokens and checks if
+        ``get_cached_block()`` returns a hit for each one.
+        """
+        from vllm.v1.core.kv_cache_utils import (
+            BlockHash,
+            hash_block_tokens,
+        )
+
+        cache_config = self.vllm_config.cache_config
+        from vllm.utils.hashing import get_hash_fn_by_name
+        caching_hash_fn = get_hash_fn_by_name(
+            cache_config.prefix_caching_hash_algo
+        )
+
+        block_pool = self.scheduler.kv_cache_manager.block_pool
+        block_size = self.scheduler.block_size
+        coordinator = self.scheduler.kv_cache_manager.coordinator
+        managers = coordinator.single_type_managers
+        group_ids = [m.kv_cache_group_id for m in managers] if managers else [0]
+
+        n_full_blocks = len(token_ids) // block_size
+        hits = 0
+        parent_hash: BlockHash | None = None
+        for i in range(n_full_blocks):
+            start = i * block_size
+            end = start + block_size
+            bh = hash_block_tokens(
+                caching_hash_fn, parent_hash, tuple(token_ids[start:end]),
+                extra_keys=None,
+            )
+            parent_hash = bh
+            found = block_pool.get_cached_block(bh, group_ids)
+            if found:
+                hits += 1
+
+        return {
+            "n_full_blocks": n_full_blocks,
+            "hits": hits,
+            "all_hit": hits == n_full_blocks,
+            "block_size": block_size,
+        }
+
     EngineCore.amf_register_prefix = amf_register_prefix
     EngineCore.amf_verify_patch = amf_verify_patch
+    EngineCore.amf_verify_registration = amf_verify_registration
 
 
 # Apply patch on import.

@@ -172,12 +172,29 @@ def run_benchmark(args: argparse.Namespace) -> None:
 
     # ── Reset vLLM's prefix cache to simulate cold start ─────────────────────
     # This proves AMF is providing the value, not vLLM's built-in cache.
+    # Retry up to 3 times — reset requires ALL blocks freed (ref_cnt=0).
+    # After generate() completes, vLLM needs a moment to release blocks.
     print("[KORITH_VLLM] resetting vLLM prefix cache (simulating restart)...",
           flush=True)
-    try:
-        llm.llm_engine.reset_prefix_cache()
-    except Exception as exc:
-        print(f"[AMF_WARN] reset_prefix_cache failed: {exc}", flush=True)
+    reset_ok = False
+    for attempt in range(3):
+        try:
+            result = llm.llm_engine.reset_prefix_cache()
+            if result or result is None:  # None = no return value = success
+                reset_ok = True
+                print("[AMF_RESET] prefix cache cleared", flush=True)
+                break
+            # Reset returned False — blocks not yet freed, wait and retry.
+            if attempt < 2:
+                time.sleep(0.1)
+        except Exception as exc:
+            print(f"[AMF_WARN] reset attempt {attempt+1} failed: {exc}",
+                  flush=True)
+            if attempt < 2:
+                time.sleep(0.1)
+    if not reset_ok:
+        print("[AMF_WARN] prefix cache reset failed — warm run uses vLLM's "
+              "built-in cache (AMF still restores KV data)", flush=True)
 
     # ── Warm run: AMF restore → register prefix cache → generate ─────────────
     print("[KORITH_VLLM] warm run — AMF restore + prefix cache register...",
@@ -223,6 +240,20 @@ def run_benchmark(args: argparse.Namespace) -> None:
                 f"register_ms={register_ms:.2f}",
                 flush=True,
             )
+            # Verify blocks are findable in prefix cache.
+            try:
+                vfy = llm.llm_engine.engine_core.call_utility(
+                    "amf_verify_registration", list(token_ids),
+                )
+                vfy = vfy if isinstance(vfy, dict) else {}
+                print(
+                    f"[AMF_VERIFY_REG] all_hit={vfy.get('all_hit')} "
+                    f"hits={vfy.get('hits')}/{vfy.get('n_full_blocks')}",
+                    flush=True,
+                )
+            except Exception as exc:
+                print(f"[AMF_WARN] verify_registration: {exc}", flush=True)
+
             print(
                 f"[AMF_HIT] prefix_tokens={restored_tokens} "
                 f"restore_ms={restore_ms:.2f} "
@@ -243,6 +274,7 @@ def run_benchmark(args: argparse.Namespace) -> None:
     warm_total_ms = (time.monotonic() - t_warm0) * 1000.0
     warm_text     = warm_outputs[0].outputs[0].text if warm_outputs else ""
 
+    prefill_skipped = warm_total_ms < prompt_ms * 0.75
     print(
         f"[KORITH_RUN_SUMMARY] "
         f"cold_ms={prompt_ms:.1f} "
@@ -251,10 +283,19 @@ def run_benchmark(args: argparse.Namespace) -> None:
         f"warm_generate_ms={warm_total_ms:.1f} "
         f"tokens={max_tokens} "
         f"e2e_speedup={prompt_ms / max(1.0, warm_total_ms):.2f}x "
+        f"prefill_skipped={prefill_skipped} "
+        f"output_match={cold_text == warm_text} "
         f"cold={cold_text!r} "
         f"warm={warm_text!r}",
         flush=True,
     )
+    if not prefill_skipped:
+        print(
+            "[AMF_DIAG] warm_ms ≈ cold_ms — prefill was NOT skipped. "
+            "This is expected for short prompts where prefill is <5%% of "
+            "total time. Try a longer prompt (4K+ tokens) to see the gap.",
+            flush=True,
+        )
 
     # ── Second warm run — VRAM cache path ────────────────────────────────────
     if restored_tokens > 0:
