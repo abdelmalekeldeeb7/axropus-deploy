@@ -204,6 +204,40 @@ def run_benchmark(args: argparse.Namespace) -> None:
         flush=True,
     )
 
+    # ── Second warm run — measures VRAM cache hit (zero H→D) ─────────────────
+    if restored_tokens > 0:
+        print("[KORITH_VLLM] warm2 run — VRAM cache path...", flush=True)
+        try:
+            t_restore2 = time.monotonic()
+            results2 = llm.collective_rpc(
+                "amf_restore_kv",
+                timeout=120,
+                args=(amf_path, list(token_ids), 0, tenant_id),
+            )
+            restore2_ms = (time.monotonic() - t_restore2) * 1000.0
+            restored2 = results2[0] if results2 else 0
+
+            t_warm2       = time.monotonic()
+            warm2_outputs = llm.generate([prompt], sampling)
+            warm2_ms      = (time.monotonic() - t_warm2) * 1000.0
+            warm2_text    = warm2_outputs[0].outputs[0].text if warm2_outputs else ""
+
+            speedup2 = prompt_ms / max(1.0, restore2_ms)
+            print(
+                f"[AMF_HIT] source=vram prefix_tokens={restored2} "
+                f"restore_ms={restore2_ms:.2f} speedup={speedup2:.2f}x",
+                flush=True,
+            )
+            print(
+                f"[KORITH_RUN_SUMMARY2] "
+                f"restore2_ms={restore2_ms:.1f} "
+                f"warm2_generate_ms={warm2_ms:.1f} "
+                f"warm2={warm2_text!r}",
+                flush=True,
+            )
+        except Exception as exc:
+            print(f"[AMF_WARN] warm2 failed: {exc}", file=sys.stderr, flush=True)
+
 
 # ── Server mode ───────────────────────────────────────────────────────────────
 

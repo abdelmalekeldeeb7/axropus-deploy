@@ -143,11 +143,12 @@ def amf_key_filename(
 
 @dataclass
 class _VRAMEntry:
-    """One compressed KV snapshot resident in GPU VRAM."""
-    payload_gpu: "torch.Tensor"          # uint8 CUDA tensor — TurboQuant compressed blob
+    """One KV snapshot resident in GPU VRAM (compressed or raw)."""
+    payload_gpu: "torch.Tensor"          # uint8 CUDA tensor
     snap_dtype:  "torch.dtype"
     n_tokens:    int
     layer_infos: list                    # [(k_off, k_sz, v_off, v_sz), ...]
+    codec_id:    int = CODEC_NONE        # CODEC_NONE or CODEC_TURBOQUANT
 
 
 class VRAMSnapshotCache:
@@ -179,8 +180,9 @@ class VRAMSnapshotCache:
         snap_dtype:  "torch.dtype",
         n_tokens:    int,
         layer_infos: list,
+        codec_id:    int = CODEC_NONE,
     ) -> bool:
-        """Store compressed KV blob as a GPU tensor.  Returns True if cached."""
+        """Store KV blob as a GPU tensor.  Returns True if cached."""
         if len(compressed) > self._max:
             return False
 
@@ -205,6 +207,7 @@ class VRAMSnapshotCache:
                 snap_dtype=snap_dtype,
                 n_tokens=n_tokens,
                 layer_infos=layer_infos,
+                codec_id=codec_id,
             )
             self._cache[key] = entry
             self._used += gpu_t.nbytes
@@ -473,15 +476,21 @@ class AmfKvManager:
         for k_off, k_sz, v_off, v_sz in layer_infos:
             layer_tbl += struct.pack(_LAYER_FMT, k_off, k_sz, v_off, v_sz)
 
-        # Copy KV tensors D→H using pinned memory for maximum PCIe throughput.
+        # Copy KV tensors D→H using pinned host memory for maximum PCIe throughput.
+        # pin_memory=True allocates page-locked memory so cudaMemcpy is fully async.
+        _pin = torch.cuda.is_available()
         kv_payload = bytearray(total_kv_bytes)
         mv = memoryview(kv_payload)
 
         for (k_off, k_sz, v_off, v_sz), k_t, v_t in zip(
             layer_infos, layer_k_tensors, layer_v_tensors
         ):
-            k_cpu = k_t.cpu().contiguous()   # triggers cudaMemcpy D→H
-            v_cpu = v_t.cpu().contiguous()
+            k_cpu = torch.empty_like(k_t, device="cpu", pin_memory=_pin)
+            v_cpu = torch.empty_like(v_t, device="cpu", pin_memory=_pin)
+            k_cpu.copy_(k_t, non_blocking=True)
+            v_cpu.copy_(v_t, non_blocking=True)
+            if _pin:
+                torch.cuda.current_stream().synchronize()
             # Use raw storage bytes instead of .numpy() to support bfloat16
             # and other dtypes that NumPy cannot represent.
             mv[k_off : k_off + k_sz] = bytes(k_cpu.untyped_storage())
@@ -531,8 +540,8 @@ class AmfKvManager:
 
         blob = header + layer_tbl + payload_bytes
 
-        # ── Populate VRAM cache (TurboQuant only — raw payloads are too large) ──
-        if self._vram_cache is not None and codec_id == CODEC_TURBOQUANT:
+        # ── Populate VRAM cache (compressed or raw — LRU eviction handles budget) ──
+        if self._vram_cache is not None:
             vram_key = kv_path.stem
             stored = self._vram_cache.put(
                 key=vram_key,
@@ -540,11 +549,12 @@ class AmfKvManager:
                 snap_dtype=kv_dtype,
                 n_tokens=n_tokens,
                 layer_infos=layer_infos,
+                codec_id=codec_id,
             )
             if stored:
                 logger.debug(
-                    "[AMF_VLLM] VRAM cache: stored %s (%.1f MB)",
-                    vram_key, len(payload_bytes) / (1024 * 1024),
+                    "[AMF_VLLM] VRAM cache: stored %s (%.1f MB, codec=%d)",
+                    vram_key, len(payload_bytes) / (1024 * 1024), codec_id,
                 )
 
         # Write atomically via temp file.
@@ -774,17 +784,16 @@ class AmfKvManager:
                 v_all.copy_(v_src)
 
         # ── Promote to VRAM cache for future zero-copy restores ───────────────
-        if (
-            self._vram_cache is not None
-            and compression_codec == CODEC_TURBOQUANT
-            and not self._vram_cache.contains(vram_key)
-        ):
+        if self._vram_cache is not None and not self._vram_cache.contains(vram_key):
+            # Store the on-disk payload (compressed or raw) for VRAM cache.
+            _promote_bytes = bytes(kv_payload_raw) if compression_codec == CODEC_TURBOQUANT else bytes(kv_payload)
             self._vram_cache.put(
                 key=vram_key,
-                compressed=bytes(kv_payload_raw),
+                compressed=_promote_bytes,
                 snap_dtype=snap_dtype,
                 n_tokens=int(n_tokens),
                 layer_infos=layer_infos,
+                codec_id=compression_codec,
             )
 
         elapsed_ms = (time.monotonic() - t0) * 1000.0
@@ -802,21 +811,22 @@ class AmfKvManager:
     def _restore_from_vram(self, entry: "_VRAMEntry", block_table: List[int]) -> int:
         """Scatter KV from a VRAM cache entry into the engine's KV blocks.
 
+        Handles both raw and TurboQuant-compressed VRAM entries.
         Returns the number of tokens restored, or 0 on failure.
-        The compressed payload is already on GPU — this method calls
-        TurboQuantCodec.decompress_from_gpu_tensor() which does zero H→D I/O.
         """
-        from .turboquant_codec import TurboQuantCodec
-        _tq  = TurboQuantCodec()
-        _dev = entry.payload_gpu.device
-
-        try:
-            kv_gpu_tensor = _tq.decompress_from_gpu_tensor(
-                entry.payload_gpu, entry.snap_dtype
-            )
-        except Exception as exc:
-            logger.warning("[AMF_VLLM] VRAM decompress failed: %s", exc)
-            return 0
+        if entry.codec_id == CODEC_TURBOQUANT:
+            from .turboquant_codec import TurboQuantCodec
+            _tq = TurboQuantCodec()
+            try:
+                kv_gpu_tensor = _tq.decompress_from_gpu_tensor(
+                    entry.payload_gpu, entry.snap_dtype
+                )
+            except Exception as exc:
+                logger.warning("[AMF_VLLM] VRAM decompress failed: %s", exc)
+                return 0
+        else:
+            # Raw payload — reinterpret uint8 GPU tensor as the snapshot dtype.
+            kv_gpu_tensor = entry.payload_gpu.view(entry.snap_dtype)
 
         gpu_cache = self._cache_engine.gpu_cache
 
@@ -842,7 +852,6 @@ class AmfKvManager:
                 k_all[block_ids] = k_flat.reshape(k_all[block_ids].shape)
                 v_all[block_ids] = v_flat.reshape(v_all[block_ids].shape)
             else:
-                # Empty block_table → restore ALL blocks (single-request benchmark).
                 k_all.copy_(k_flat.reshape_as(k_all))
                 v_all.copy_(v_flat.reshape_as(v_all))
 

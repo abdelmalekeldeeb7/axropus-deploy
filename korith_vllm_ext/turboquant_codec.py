@@ -80,12 +80,18 @@ class TurboQuantCodec:
     # ── Random projection ──────────────────────────────────────────────────────
 
     def _rademacher(self, dim: int) -> torch.Tensor:
-        """Cached square Rademacher matrix R ∈ {±1/√dim}^(dim×dim)."""
+        """Cached random orthogonal matrix Q ∈ R^(dim×dim).
+
+        Uses QR decomposition of a random Gaussian matrix seeded
+        deterministically so that compress and decompress produce the same Q.
+        Q^T @ Q = I exactly, so the inverse projection is lossless and the
+        only reconstruction error comes from quantisation.
+        """
         if dim not in self._proj_cache:
             g = torch.Generator().manual_seed(self.seed)
-            R = (torch.randint(0, 2, (dim, dim), generator=g).float() * 2.0 - 1.0)
-            R /= float(dim) ** 0.5
-            self._proj_cache[dim] = R
+            raw = torch.randn(dim, dim, generator=g)
+            Q, _ = torch.linalg.qr(raw)
+            self._proj_cache[dim] = Q
         return self._proj_cache[dim]
 
     # ── Bit-packing helpers ────────────────────────────────────────────────────
@@ -300,7 +306,8 @@ class TurboQuantCodec:
         if pad:
             flat = flat[:-pad]
 
-        result = flat.to(dtype).numpy().tobytes()
+        result_tensor = flat.to(dtype).contiguous()
+        result = bytes(result_tensor.untyped_storage())
         if len(result) != original_size:
             raise ValueError(
                 f"TurboQuant: decompressed {len(result)} bytes, expected {original_size}"
