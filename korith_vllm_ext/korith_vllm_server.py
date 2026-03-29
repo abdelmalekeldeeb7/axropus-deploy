@@ -235,12 +235,14 @@ def run_benchmark(args: argparse.Namespace) -> None:
     except Exception as exc:
         print(f"[AMF_WARN] restore failed: {exc}", file=sys.stderr, flush=True)
 
-    # Get block_ids from save_info (worker knows the real block_size).
-    block_ids = save_info.get("block_ids", [])
-    if not block_ids:
-        import math
-        bs = save_info.get("block_size", 16)
-        block_ids = list(range(math.ceil(len(token_ids) / bs)))
+    # Compute RESTORE block IDs — these are where amf_restore_kv writes data.
+    # The restore always writes into sequential blocks [0, 1, ..., n-1]
+    # starting from the beginning of the pool (via _get_block_size_and_table).
+    # This is DIFFERENT from the save block IDs (which came from vLLM's allocator).
+    import math
+    restore_block_size = save_info.get("block_size", 16)
+    n_restore_blocks = math.ceil(len(token_ids) / restore_block_size)
+    restore_block_ids = list(range(n_restore_blocks))
 
     register_ms = 0.0
     if restored_tokens > 0:
@@ -250,7 +252,7 @@ def run_benchmark(args: argparse.Namespace) -> None:
             reg_result = llm.llm_engine.engine_core.call_utility(
                 "amf_register_prefix",
                 list(token_ids),
-                block_ids,
+                restore_block_ids,
             )
             register_ms = (time.monotonic() - t_reg0) * 1000.0
             reg_info = reg_result if isinstance(reg_result, dict) else {}
@@ -336,7 +338,7 @@ def run_benchmark(args: argparse.Namespace) -> None:
             llm.llm_engine.engine_core.call_utility(
                 "amf_register_prefix",
                 list(token_ids),
-                block_ids,
+                restore_block_ids,
             )
             register2_ms = (time.monotonic() - t_reg2) * 1000.0
 

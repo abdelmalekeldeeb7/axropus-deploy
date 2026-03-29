@@ -47,7 +47,6 @@ def _patch_engine_core() -> None:
             Dict with ``registered`` (int) = number of blocks registered.
         """
         from vllm.v1.core.kv_cache_utils import (
-            NONE_HASH,
             BlockHash,
             hash_block_tokens,
             make_block_hash_with_group_id,
