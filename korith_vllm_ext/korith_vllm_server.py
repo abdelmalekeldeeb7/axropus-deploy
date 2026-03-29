@@ -122,10 +122,30 @@ def run_benchmark(args: argparse.Namespace) -> None:
             tokenizer  = llm.get_tokenizer()
             token_ids  = tokenizer.encode(prompt)
 
+            # Query the prefix cache for the REAL physical block IDs that
+            # vLLM allocated during the cold generate.  Without this we'd
+            # save stale data from blocks [0,1,2] which may not be the ones
+            # vLLM actually used.
+            real_block_ids: list = []
+            try:
+                cached_info = llm.llm_engine.engine_core.call_utility(
+                    "amf_get_cached_block_ids", list(token_ids),
+                )
+                if isinstance(cached_info, dict):
+                    real_block_ids = cached_info.get("block_ids", [])
+                    print(
+                        f"[AMF_BLOCKS] physical_ids={real_block_ids} "
+                        f"n_found={cached_info.get('n_found')}/{cached_info.get('n_full_blocks')}",
+                        flush=True,
+                    )
+            except Exception as exc:
+                print(f"[AMF_WARN] get_cached_block_ids: {exc}", flush=True)
+
             results = llm.collective_rpc(
                 "amf_save_kv",
                 timeout=120,
                 args=(amf_path, list(token_ids), 0, tenant_id),
+                kwargs={"physical_block_ids": real_block_ids} if real_block_ids else None,
             )
             # collective_rpc returns list (one per worker); take first.
             save_info = results[0] if results else {}

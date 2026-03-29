@@ -101,11 +101,17 @@ class AmfWorkerExtension:
         prompt_tokens: list,
         model_hash: int = 0,
         tenant_id: str = "__shared__",
+        physical_block_ids: list | None = None,
     ) -> dict:
         """Save KV cache snapshot to disk + VRAM cache.
 
+        Args:
+            physical_block_ids: If provided, save these specific physical
+                blocks (from amf_get_cached_block_ids).  If None, assumes
+                blocks [0, 1, ..., ceil(n_tokens/block_size)-1].
+
         Returns dict with ``saved`` (bool), ``n_layers`` (int),
-        ``n_tokens`` (int).
+        ``n_tokens`` (int), ``block_size`` (int), ``block_ids`` (list).
         """
         kv_caches = self.model_runner.kv_caches
         if not kv_caches:
@@ -115,7 +121,10 @@ class AmfWorkerExtension:
         if not proxy.gpu_cache:
             return {"saved": False, "n_layers": 0, "n_tokens": 0}
 
-        block_table = _get_block_size_and_table(proxy.gpu_cache, len(prompt_tokens))
+        if physical_block_ids is not None and len(physical_block_ids) > 0:
+            block_table = list(physical_block_ids)
+        else:
+            block_table = _get_block_size_and_table(proxy.gpu_cache, len(prompt_tokens))
 
         # Extract block_size for the caller (needed for prefix cache registration).
         t = proxy.gpu_cache[0]
