@@ -200,9 +200,63 @@ def _patch_engine_core() -> None:
             "block_size": block_size,
         }
 
+    def amf_get_cached_block_ids(
+        self: "EngineCore",
+        token_ids: list,
+    ) -> dict:
+        """Look up which physical blocks the prefix cache assigned to these
+        tokens.  Called AFTER cold generate() to discover the real block IDs
+        before saving KV data.
+
+        Returns dict with ``block_ids`` (list[int]), ``block_size`` (int),
+        ``n_full_blocks`` (int).
+        """
+        from vllm.v1.core.kv_cache_utils import (
+            BlockHash,
+            hash_block_tokens,
+        )
+
+        cache_config = self.vllm_config.cache_config
+        from vllm.utils.hashing import get_hash_fn_by_name
+        caching_hash_fn = get_hash_fn_by_name(
+            cache_config.prefix_caching_hash_algo
+        )
+
+        block_pool = self.scheduler.kv_cache_manager.block_pool
+        block_size = self.scheduler.block_size
+        coordinator = self.scheduler.kv_cache_manager.coordinator
+        managers = coordinator.single_type_managers
+        group_ids = [m.kv_cache_group_id for m in managers] if managers else [0]
+
+        n_full_blocks = len(token_ids) // block_size
+
+        block_ids: list[int] = []
+        parent_hash: BlockHash | None = None
+        for i in range(n_full_blocks):
+            start = i * block_size
+            end = start + block_size
+            bh = hash_block_tokens(
+                caching_hash_fn, parent_hash, tuple(token_ids[start:end]),
+                extra_keys=None,
+            )
+            parent_hash = bh
+            found = block_pool.get_cached_block(bh, group_ids)
+            if found:
+                block_ids.append(found[0].block_id)
+            else:
+                break  # chain broken
+
+        return {
+            "block_ids": block_ids,
+            "block_size": block_size,
+            "n_full_blocks": n_full_blocks,
+            "n_found": len(block_ids),
+        }
+
     EngineCore.amf_register_prefix = amf_register_prefix
     EngineCore.amf_verify_patch = amf_verify_patch
     EngineCore.amf_verify_registration = amf_verify_registration
+    EngineCore.amf_get_cached_block_ids = amf_get_cached_block_ids
 
 
 # Apply patch on import.
