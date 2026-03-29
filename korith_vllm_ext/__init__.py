@@ -109,12 +109,15 @@ def _patch_engine_core() -> None:
                 )
                 blk.reset_hash()
 
-            # Register for each KV cache group (typically just group 0).
-            for gid in group_ids:
-                key = make_block_hash_with_group_id(block_hashes[i], gid)
-                blk.block_hash = key
-                block_pool.cached_block_hash_to_block.insert(key, blk)
-                break
+            # Register for the first KV cache group.  block_hash is a
+            # single-valued property so one block can only belong to one
+            # group.  For standard transformers there is only one group.
+            # Multi-group models (MoE cross-attention) would need one
+            # physical block per group — not yet supported.
+            gid = group_ids[0]
+            key = make_block_hash_with_group_id(block_hashes[i], gid)
+            blk.block_hash = key
+            block_pool.cached_block_hash_to_block.insert(key, blk)
 
             registered += 1
 

@@ -47,6 +47,26 @@ def _env_truthy(name: str, default: bool = False) -> bool:
     return (v in _TRUTHY) if v else default
 
 
+def _call_engine_core(llm: Any, method: str, *args: Any) -> Any:
+    """Call a patched method on EngineCore, handling both client types.
+
+    SyncMPClient (multiprocess): has call_utility() → sends via ZMQ.
+    InprocClient (in-process):   has engine_core attribute → call directly.
+    """
+    ec = llm.llm_engine.engine_core
+    # SyncMPClient path (multiprocess EngineCore)
+    if hasattr(ec, "call_utility"):
+        return ec.call_utility(method, *args)
+    # InprocClient path (in-process EngineCore)
+    inner = getattr(ec, "engine_core", None)
+    if inner is not None and hasattr(inner, method):
+        return getattr(inner, method)(*args)
+    raise AttributeError(
+        f"Cannot call {method} on {type(ec).__name__} — "
+        f"neither call_utility nor engine_core.{method} found"
+    )
+
+
 # ── Benchmark mode ────────────────────────────────────────────────────────────
 
 def run_benchmark(args: argparse.Namespace) -> None:
@@ -91,7 +111,7 @@ def run_benchmark(args: argparse.Namespace) -> None:
 
     # ── Verify EngineCore patch ──────────────────────────────────────────────
     try:
-        verify = llm.llm_engine.engine_core.call_utility("amf_verify_patch")
+        verify = _call_engine_core(llm,"amf_verify_patch")
         print(
             f"[AMF_VERIFY] patch_ok={verify.get('patch_ok')} "
             f"block_size={verify.get('block_size')} "
@@ -128,7 +148,7 @@ def run_benchmark(args: argparse.Namespace) -> None:
             # vLLM actually used.
             real_block_ids: list = []
             try:
-                cached_info = llm.llm_engine.engine_core.call_utility(
+                cached_info = _call_engine_core(llm,
                     "amf_get_cached_block_ids", list(token_ids),
                 )
                 if isinstance(cached_info, dict):
@@ -249,7 +269,7 @@ def run_benchmark(args: argparse.Namespace) -> None:
         try:
 
             t_reg0 = time.monotonic()
-            reg_result = llm.llm_engine.engine_core.call_utility(
+            reg_result = _call_engine_core(llm,
                 "amf_register_prefix",
                 list(token_ids),
                 restore_block_ids,
@@ -264,7 +284,7 @@ def run_benchmark(args: argparse.Namespace) -> None:
             )
             # Verify blocks are findable in prefix cache.
             try:
-                vfy = llm.llm_engine.engine_core.call_utility(
+                vfy = _call_engine_core(llm,
                     "amf_verify_registration", list(token_ids),
                 )
                 vfy = vfy if isinstance(vfy, dict) else {}
@@ -335,7 +355,7 @@ def run_benchmark(args: argparse.Namespace) -> None:
             restored2 = results2[0] if results2 else 0
 
             t_reg2 = time.monotonic()
-            llm.llm_engine.engine_core.call_utility(
+            _call_engine_core(llm,
                 "amf_register_prefix",
                 list(token_ids),
                 restore_block_ids,
