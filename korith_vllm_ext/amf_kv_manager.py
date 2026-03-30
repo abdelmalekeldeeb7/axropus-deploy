@@ -712,29 +712,41 @@ class AmfKvManager:
             from .turboquant_codec import TurboQuantCodec
             _tq = TurboQuantCodec()
             _cuda_ok = torch.cuda.is_available()
-            try:
-                if _cuda_ok:
+            _gpu_ok = False
+            if _cuda_ok:
+                try:
                     # ── Fast path: decompress directly onto GPU ────────────────
                     _dev = gpu_cache[0].device if gpu_cache else torch.device("cuda")
                     kv_gpu_tensor = _tq.decompress_to_gpu(
                         bytes(kv_payload_raw), snap_dtype, str(_dev)
                     )
+                    _gpu_ok = True
                     logger.debug(
                         "[AMF_VLLM] TurboQuant GPU: decompressed %d elems on %s",
                         kv_gpu_tensor.numel(), _dev,
                     )
-                else:
-                    # ── Slow path: CPU decompress (small models / no GPU) ──────
+                except torch.cuda.OutOfMemoryError:
+                    logger.info(
+                        "[AMF_VLLM] TurboQuant GPU OOM — falling back to CPU decompress"
+                    )
+                except Exception as exc:
+                    logger.info(
+                        "[AMF_VLLM] TurboQuant GPU failed: %s — trying CPU", exc
+                    )
+
+            if not _gpu_ok:
+                try:
+                    # ── Slow path: CPU decompress, per-layer H→D ──────────────
                     kv_payload = _tq.decompress(bytes(kv_payload_raw), snap_dtype)
                     logger.debug(
                         "[AMF_VLLM] TurboQuant CPU fallback: %d bytes", len(kv_payload)
                     )
-            except Exception as exc:
-                logger.warning(
-                    "[AMF_VLLM] TurboQuant decompress failed: %s — treating as miss", exc
-                )
-                self._misses += 1
-                return 0
+                except Exception as exc:
+                    logger.warning(
+                        "[AMF_VLLM] TurboQuant decompress failed: %s — treating as miss", exc
+                    )
+                    self._misses += 1
+                    return 0
 
         # Restore tensors into gpu_cache at the allocated physical blocks.
         for layer_idx, (layer_cache, (k_off, k_sz, v_off, v_sz)) in enumerate(
