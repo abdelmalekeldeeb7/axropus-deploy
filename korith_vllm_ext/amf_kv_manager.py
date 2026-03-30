@@ -186,7 +186,11 @@ class VRAMSnapshotCache:
         if len(compressed) > self._max:
             return False
 
-        gpu_t = torch.frombuffer(bytearray(compressed), dtype=torch.uint8).to(self._device)
+        try:
+            gpu_t = torch.frombuffer(bytearray(compressed), dtype=torch.uint8).to(self._device)
+        except torch.cuda.OutOfMemoryError:
+            logger.debug("[AMF_VLLM] VRAM cache: OOM, skipping cache for this entry")
+            return False
 
         with self._lock:
             # Replace existing entry for this key
