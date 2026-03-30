@@ -256,12 +256,11 @@ def run_benchmark(args: argparse.Namespace) -> None:
         print(f"[AMF_WARN] restore failed: {exc}", file=sys.stderr, flush=True)
 
     # Compute RESTORE block IDs — these are where amf_restore_kv writes data.
-    # The restore always writes into sequential blocks [0, 1, ..., n-1]
-    # starting from the beginning of the pool (via _get_block_size_and_table).
-    # This is DIFFERENT from the save block IDs (which came from vLLM's allocator).
-    import math
+    # Only FULL blocks (floor division) — matches prefix cache and save behavior.
     restore_block_size = save_info.get("block_size", 16)
-    n_restore_blocks = math.ceil(len(token_ids) / restore_block_size)
+    n_restore_blocks = len(token_ids) // restore_block_size
+    if n_restore_blocks == 0:
+        n_restore_blocks = 1
     restore_block_ids = list(range(n_restore_blocks))
 
     register_ms = 0.0

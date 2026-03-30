@@ -19,9 +19,9 @@ from typing import Any
 def _get_block_size_and_table(proxy_gpu_cache: list, n_tokens: int) -> list:
     """Compute the block_table for the first ``n_tokens`` tokens.
 
-    In benchmark mode we run a single prompt so vLLM allocates blocks
-    starting at physical block 0.  We compute how many blocks the prompt
-    occupies and return ``[0, 1, ..., n_used - 1]``.
+    Only FULL blocks are included — the prefix cache and AMFK snapshots
+    only store complete blocks.  The partial trailing block (if any) is
+    handled by vLLM's normal prefill for the remaining tokens.
 
     FlashAttn KV shape: ``(2, num_blocks, block_size, num_kv_heads, head_dim)``
     FlashInfer (after proxy permute): same logical shape.
@@ -38,7 +38,10 @@ def _get_block_size_and_table(proxy_gpu_cache: list, n_tokens: int) -> list:
     else:
         block_size = 1
 
-    n_used = math.ceil(n_tokens / block_size) if block_size > 0 else 1
+    # Floor division: only full blocks (matches prefix cache behavior).
+    n_used = n_tokens // block_size if block_size > 0 else 0
+    if n_used == 0:
+        n_used = 1  # at least save/restore one block
     return list(range(n_used))
 
 
