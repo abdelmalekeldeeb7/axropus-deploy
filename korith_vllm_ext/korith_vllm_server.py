@@ -443,6 +443,7 @@ def main() -> None:
     )
     parser.add_argument("--model",      type=str, default="",    help="Model path or HuggingFace ID")
     parser.add_argument("--prompt",     type=str, default="",    help="Prompt (benchmark mode)")
+    parser.add_argument("--prompt-file", type=str, default="",   help="Read prompt from file (benchmark mode)")
     parser.add_argument("--max-tokens", type=int, default=32,    help="Max output tokens")
     parser.add_argument("--serve",      action="store_true",     help="Run in server mode")
     parser.add_argument("--host",       type=str, default="0.0.0.0", help="Server host")
@@ -457,8 +458,11 @@ def main() -> None:
     if args.serve:
         run_server(args)
     else:
+        if args.prompt_file:
+            with open(args.prompt_file, "r") as f:
+                args.prompt = f.read()
         if not args.prompt:
-            parser.error("--prompt required in benchmark mode")
+            parser.error("--prompt or --prompt-file required in benchmark mode")
         run_benchmark(args)
 
 
