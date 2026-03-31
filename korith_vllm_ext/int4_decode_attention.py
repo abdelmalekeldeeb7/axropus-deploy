@@ -489,19 +489,9 @@ def benchmark_int4_vs_bf16(
 
         speedup = bf16_ms / int4_ms
 
-        print(f"[INT4_BENCH] int4: {int4_ms:.2f}ms, {int4_bandwidth:.1f} GB/s effective")
-        print(f"[INT4_BENCH] speedup: {speedup:.2f}x")
-        print(f"[INT4_BENCH] cosine_similarity: {cos_sim:.6f}")
+        print(f"[INT4_BENCH] int4 triton: {int4_ms:.2f}ms, {int4_bandwidth:.1f} GB/s")
+        print(f"[INT4_BENCH] triton speedup: {speedup:.2f}x, cosine: {cos_sim:.6f}")
 
-        return {
-            "bf16_ms": bf16_ms,
-            "int4_ms": int4_ms,
-            "speedup": speedup,
-            "cosine_sim": cos_sim,
-            "seq_len": seq_len,
-            "bf16_bandwidth_gbs": bf16_bandwidth,
-            "int4_bandwidth_gbs": int4_bandwidth,
-        }
     # ── INT4 dequant + sdpa (practical fast path) ──
     print("[INT4_BENCH] Running INT4 dequant+sdpa...")
     for _ in range(num_warmup):
@@ -532,7 +522,7 @@ def benchmark_int4_vs_bf16(
     print(f"[INT4_BENCH] dequant+sdpa cosine: {cos_sim_dq:.6f}")
 
     if not HAS_TRITON:
-        return {"bf16_ms": bf16_ms, "dq_ms": dq_ms, "seq_len": seq_len}
+    return {"bf16_ms": bf16_ms, "dq_ms": dq_ms, "dq_cosine": cos_sim_dq, "seq_len": seq_len}
 
 
 if __name__ == "__main__":
