@@ -190,8 +190,13 @@ class AmfWorkerExtension:
 
         block_table = _get_block_size_and_table(proxy.gpu_cache, len(prompt_tokens))
 
+        # Check if KV cache is FP8 — pool must handle dtype correctly
+        kv_is_fp8 = (hasattr(self, 'vllm_config') and
+                      self.vllm_config.cache_config.cache_dtype.startswith("fp8"))
+
         # Fast path: compressed VRAM pool (INT4 dequant, ~50-200ms)
-        pool = self._get_compressed_pool()
+        # Skip pool for FP8 KV — pool doesn't preserve FP8 scale factors yet
+        pool = self._get_compressed_pool() if not kv_is_fp8 else None
         if pool is not None:
             pool_key = mgr._kv_filename(mgr.compute_amf_key(prompt_tokens)).stem
             n_restored = pool.restore(pool_key, proxy.gpu_cache, block_table)

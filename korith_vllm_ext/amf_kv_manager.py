@@ -67,6 +67,11 @@ _DTYPE_TAG = {
     torch.float32:  1,
     torch.bfloat16: 2,
 }
+# Add FP8 if available (PyTorch 2.1+)
+if hasattr(torch, 'float8_e4m3fn'):
+    _DTYPE_TAG[torch.float8_e4m3fn] = 3
+if hasattr(torch, 'float8_e5m2'):
+    _DTYPE_TAG[torch.float8_e5m2] = 4
 
 
 # ── Hash helpers (FNV-1a, byte-level, matching C++ hash_bytes / hash_token_prefix_step)
@@ -756,6 +761,10 @@ class AmfKvManager:
         #   CPU fallback: full decompress on CPU, then per-layer H→D as before.
         #
         _TAG_TO_DTYPE = {0: torch.float16, 1: torch.float32, 2: torch.bfloat16}
+        if hasattr(torch, 'float8_e4m3fn'):
+            _TAG_TO_DTYPE[3] = torch.float8_e4m3fn
+        if hasattr(torch, 'float8_e5m2'):
+            _TAG_TO_DTYPE[4] = torch.float8_e5m2
         snap_dtype    = _TAG_TO_DTYPE.get(dtype_tag, torch.float16)
 
         # kv_gpu_tensor: 1-D GPU tensor when GPU decompress succeeds, else None.
@@ -827,12 +836,20 @@ class AmfKvManager:
                 v_flat = kv_gpu_tensor[v_off // _esz : (v_off + v_sz) // _esz].to(cache_dtype)
             else:
                 # ── CPU bytes path: frombuffer + H→D (uncompressed or CPU decomp)
+                # Use uint8 + view for FP8 compat (frombuffer may not support fp8)
+                _use_view = (hasattr(torch, 'float8_e4m3fn') and
+                             cache_dtype in (torch.float8_e4m3fn,
+                                             getattr(torch, 'float8_e5m2', None)))
+                _buf_dtype = torch.uint8 if _use_view else cache_dtype
                 k_flat = torch.frombuffer(
-                    bytearray(kv_payload[k_off : k_off + k_sz]), dtype=cache_dtype
+                    bytearray(kv_payload[k_off : k_off + k_sz]), dtype=_buf_dtype
                 )
                 v_flat = torch.frombuffer(
-                    bytearray(kv_payload[v_off : v_off + v_sz]), dtype=cache_dtype
+                    bytearray(kv_payload[v_off : v_off + v_sz]), dtype=_buf_dtype
                 )
+                if _use_view:
+                    k_flat = k_flat.view(cache_dtype)
+                    v_flat = v_flat.view(cache_dtype)
 
             if block_table:
                 # Scatter into specific physical blocks owned by this sequence.
