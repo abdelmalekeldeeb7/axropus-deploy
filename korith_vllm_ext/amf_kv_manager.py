@@ -527,6 +527,18 @@ class AmfKvManager:
         if _pin:
             torch.cuda.current_stream().synchronize()
 
+        # ── Verification: log checksum of first layer's K data from GPU ──────
+        _verify_layer = gpu_cache[0]
+        if _verify_layer.dim() == 5 and _verify_layer.shape[0] == 2:
+            _vk = _verify_layer[0]
+        else:
+            _vk = _verify_layer
+        if block_ids_gpu is not None:
+            _vk_block0 = _vk[block_ids_gpu[0]].float().sum().item()
+        else:
+            _vk_block0 = _vk[0].float().sum().item()
+        logger.info("[AMF_VERIFY_SAVE] layer0_block0_ksum=%.6f", _vk_block0)
+
         # ── TurboQuant compression (optional) ─────────────────────────────────
         codec      = get_codec()
         codec_id   = CODEC_NONE
@@ -852,8 +864,11 @@ class AmfKvManager:
                 v_all.copy_(v_src)
 
         # ── Promote to VRAM cache for future zero-copy restores ───────────────
-        if self._vram_cache is not None and not self._vram_cache.contains(vram_key):
-            # Store the on-disk payload (compressed or raw) for VRAM cache.
+        # Skip promotion for large payloads (>2 GB) — creating a Python bytes
+        # copy of 40 GB would exhaust host memory.
+        if (self._vram_cache is not None
+            and not self._vram_cache.contains(vram_key)
+            and total_kv_bytes <= 2 * 1024 * 1024 * 1024):
             _promote_bytes = bytes(kv_payload_raw) if compression_codec == CODEC_TURBOQUANT else bytes(kv_payload)
             self._vram_cache.put(
                 key=vram_key,
@@ -863,6 +878,17 @@ class AmfKvManager:
                 layer_infos=layer_infos,
                 codec_id=compression_codec,
             )
+
+        # ── Verification: check restored data matches save checksum ────────────
+        _rv_layer = gpu_cache[0]
+        if _rv_layer.dim() == 5 and _rv_layer.shape[0] == 2:
+            _rvk = _rv_layer[0]
+        else:
+            _rvk = _rv_layer
+        _restore_block0_id = block_table[0] if block_table else 0
+        _rvk_sum = _rvk[_restore_block0_id].float().sum().item()
+        logger.info("[AMF_VERIFY_RESTORE] layer0_block0_ksum=%.6f block_id=%d",
+                    _rvk_sum, _restore_block0_id)
 
         elapsed_ms = (time.monotonic() - t0) * 1000.0
         self._hits     += 1
@@ -916,9 +942,16 @@ class AmfKvManager:
             v_flat = kv_gpu_tensor[v_off // _esz : (v_off + v_sz) // _esz].to(cache_dtype)
 
             if block_table:
+                n_blk = len(block_table)
+                target_shape = (n_blk, *k_all.shape[1:])
+                k_src = k_flat.reshape(target_shape)
+                v_src = v_flat.reshape(target_shape)
                 block_ids = torch.tensor(block_table, device=k_all.device, dtype=torch.long)
-                k_all[block_ids] = k_flat.reshape(k_all[block_ids].shape)
-                v_all[block_ids] = v_flat.reshape(v_all[block_ids].shape)
+                _RC = 256
+                for _s in range(0, n_blk, _RC):
+                    _e = min(_s + _RC, n_blk)
+                    k_all[block_ids[_s:_e]] = k_src[_s:_e]
+                    v_all[block_ids[_s:_e]] = v_src[_s:_e]
             else:
                 k_all.copy_(k_flat.reshape_as(k_all))
                 v_all.copy_(v_flat.reshape_as(v_all))

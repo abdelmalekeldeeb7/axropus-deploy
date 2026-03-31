@@ -95,13 +95,12 @@ def run_benchmark(args: argparse.Namespace) -> None:
     # on the GPU worker via string-name collective_rpc (no serialization issues).
     ext_cls = "korith_vllm_ext.amf_worker_ext.AmfWorkerExtension"
 
-    print(f"[KORITH_VLLM] loading model={model_path}", flush=True)
+    eager = getattr(args, 'enforce_eager', False)
+    print(f"[KORITH_VLLM] loading model={model_path} enforce_eager={eager}", flush=True)
     llm = LLM(
         model=model_path,
         trust_remote_code=True,
-        # KV cache tensors are pre-allocated and accessible via worker
-        # extension regardless of CUDAGraph/compile state.  Enabling
-        # graphs gives ~10x faster decode (5-15 ms/tok vs 40-120 ms/tok).
+        enforce_eager=eager,
         worker_extension_cls=ext_cls,
     )
     sampling = SamplingParams(
@@ -447,6 +446,7 @@ def main() -> None:
     parser.add_argument("--prompt",     type=str, default="",    help="Prompt (benchmark mode)")
     parser.add_argument("--prompt-file", type=str, default="",   help="Read prompt from file (benchmark mode)")
     parser.add_argument("--max-tokens", type=int, default=32,    help="Max output tokens")
+    parser.add_argument("--enforce-eager", action="store_true",  help="Disable CUDAGraphs/compile")
     parser.add_argument("--serve",      action="store_true",     help="Run in server mode")
     parser.add_argument("--host",       type=str, default="0.0.0.0", help="Server host")
     parser.add_argument("--port",       type=int, default=8000,  help="Server port")
