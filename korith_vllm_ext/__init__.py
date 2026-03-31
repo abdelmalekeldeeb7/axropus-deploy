@@ -119,6 +119,18 @@ def _patch_engine_core() -> None:
             blk.block_hash = key
             block_pool.cached_block_hash_to_block.insert(key, blk)
 
+            # Remove from free queue and set ref_cnt so the block can't
+            # be evicted by get_new_blocks._maybe_evict_cached_block.
+            # Without this, at high cache usage (128K tokens = 72% of
+            # blocks), get_new_blocks pops our cached blocks from the
+            # free queue and evicts them before the scheduler can use them.
+            if blk.prev_free_block is not None or blk.next_free_block is not None:
+                try:
+                    block_pool.free_block_queue.remove(blk)
+                except (RuntimeError, ValueError):
+                    pass  # block already removed
+            blk.ref_cnt = 1
+
             registered += 1
 
         return {
