@@ -99,7 +99,9 @@ def run_benchmark(args: argparse.Namespace) -> None:
     llm = LLM(
         model=model_path,
         trust_remote_code=True,
-        enforce_eager=True,  # disable CUDA graph so KV tensors stay accessible
+        # KV cache tensors are pre-allocated and accessible via worker
+        # extension regardless of CUDAGraph/compile state.  Enabling
+        # graphs gives ~10x faster decode (5-15 ms/tok vs 40-120 ms/tok).
         worker_extension_cls=ext_cls,
     )
     sampling = SamplingParams(
@@ -163,7 +165,7 @@ def run_benchmark(args: argparse.Namespace) -> None:
 
             results = llm.collective_rpc(
                 "amf_save_kv",
-                timeout=120,
+                timeout=600,
                 args=(amf_path, list(token_ids), 0, tenant_id),
                 kwargs={"physical_block_ids": real_block_ids} if real_block_ids else None,
             )
@@ -247,7 +249,7 @@ def run_benchmark(args: argparse.Namespace) -> None:
         t_restore0 = time.monotonic()
         results = llm.collective_rpc(
             "amf_restore_kv",
-            timeout=120,
+            timeout=600,
             args=(amf_path, list(token_ids), 0, tenant_id),
         )
         restore_ms = (time.monotonic() - t_restore0) * 1000.0
@@ -347,7 +349,7 @@ def run_benchmark(args: argparse.Namespace) -> None:
             t_restore2 = time.monotonic()
             results2 = llm.collective_rpc(
                 "amf_restore_kv",
-                timeout=120,
+                timeout=600,
                 args=(amf_path, list(token_ids), 0, tenant_id),
             )
             restore2_ms = (time.monotonic() - t_restore2) * 1000.0
