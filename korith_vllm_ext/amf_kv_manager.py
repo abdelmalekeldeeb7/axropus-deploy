@@ -510,18 +510,15 @@ class AmfKvManager:
 
         if _pin:
             torch.cuda.current_stream().synchronize()
-        kv_payload = bytes(pinned_buf.untyped_storage())
 
         # ── TurboQuant compression (optional) ─────────────────────────────────
-        # layer_infos store UNCOMPRESSED offsets — restore uses them after
-        # decompressing. total_kv_bytes in the header stays as the uncompressed
-        # size so VRAM allocation on restore is correct. The codec ID written
-        # into the reserved/compression field tells restore whether to decompress.
         codec      = get_codec()
         kv_dtype   = layer_k_tensors[0].dtype
         codec_id   = CODEC_NONE
 
         if codec is not None and total_kv_bytes > 0:
+            # Need bytes for compression — only materialize if TQ is enabled
+            kv_payload = bytes(pinned_buf.untyped_storage())
             try:
                 compressed = codec.compress(kv_payload, head_dim, kv_dtype)
                 if len(compressed) < len(kv_payload):
@@ -536,6 +533,8 @@ class AmfKvManager:
                     codec_id   = CODEC_TURBOQUANT
             except Exception as exc:  # compression is best-effort
                 logger.warning("[AMF_VLLM] TurboQuant compress failed: %s", exc)
+        else:
+            kv_payload = None  # will write directly from pinned_buf
 
         # Rebuild header with codec_id in the reserved field.
         header = struct.pack(
@@ -553,29 +552,47 @@ class AmfKvManager:
             key["prefix_hash"],
         )
 
-        blob = header + layer_tbl + kv_payload
-
-        # ── Populate VRAM cache (compressed or raw — LRU eviction handles budget) ──
+        # ── Populate VRAM cache (skip for large payloads without compression) ──
         if self._vram_cache is not None:
             vram_key = kv_path.stem
-            stored = self._vram_cache.put(
-                key=vram_key,
-                compressed=kv_payload,
-                snap_dtype=kv_dtype,
-                n_tokens=n_tokens,
-                layer_infos=layer_infos,
-                codec_id=codec_id,
-            )
-            if stored:
-                logger.debug(
-                    "[AMF_VLLM] VRAM cache: stored %s (%.1f MB, codec=%d)",
-                    vram_key, len(kv_payload) / (1024 * 1024), codec_id,
+            # For VRAM cache we need bytes — only for small payloads or TQ
+            if kv_payload is not None:
+                _vram_data = kv_payload
+            elif total_kv_bytes <= 2 * 1024 * 1024 * 1024:  # < 2 GB
+                _vram_data = bytes(pinned_buf.untyped_storage())
+            else:
+                _vram_data = None  # too large for VRAM cache
+            if _vram_data is not None:
+                stored = self._vram_cache.put(
+                    key=vram_key,
+                    compressed=_vram_data,
+                    snap_dtype=kv_dtype,
+                    n_tokens=n_tokens,
+                    layer_infos=layer_infos,
+                    codec_id=codec_id,
                 )
+                if stored:
+                    logger.debug(
+                        "[AMF_VLLM] VRAM cache: stored %s (%.1f MB, codec=%d)",
+                        vram_key, len(_vram_data) / (1024 * 1024), codec_id,
+                    )
 
-        # Write atomically via temp file.
+        # Write atomically via temp file — stream to avoid 10 GB bytes copy.
         tmp_path = kv_path.with_suffix(".kv.tmp")
         try:
-            tmp_path.write_bytes(blob)
+            with open(tmp_path, "wb") as f:
+                f.write(header)
+                f.write(layer_tbl)
+                if kv_payload is not None:
+                    f.write(kv_payload)
+                else:
+                    # Write directly from pinned tensor — no Python bytes copy
+                    # numpy view of pinned buffer for zero-copy write
+                    import numpy as np
+                    arr = np.frombuffer(
+                        pinned_buf.untyped_storage(), dtype=np.uint8
+                    )
+                    f.write(arr.data)
             tmp_path.rename(kv_path)
         except OSError as exc:
             logger.warning("[AMF_VLLM] save: write failed: %s", exc)
