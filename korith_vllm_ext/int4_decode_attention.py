@@ -87,89 +87,83 @@ if HAS_TRITON:
         # GQA: map query head to KV head
         kv_head_idx = head_idx * num_kv_heads // num_q_heads
 
-        # Load query vector [head_dim]
+        # Load query as even/odd halves for INT4 dot product
         q_offset = batch_idx * stride_qb + head_idx * stride_qh
         d_range = tl.arange(0, head_dim)
-        q = tl.load(Q + q_offset + d_range * stride_qd).to(tl.float32)
+        packed_range = tl.arange(0, head_dim_packed)
+        even_range = packed_range * 2        # [0, 2, 4, ...]
+        odd_range = even_range + 1           # [1, 3, 5, ...]
 
-        # Get sequence length for this batch
+        # Load q_even = q[0,2,4,...] and q_odd = q[1,3,5,...]
+        q_even = tl.load(Q + q_offset + even_range * stride_qd).to(tl.float32)
+        q_odd = tl.load(Q + q_offset + odd_range * stride_qd).to(tl.float32)
+
         seq_len = tl.load(SEQ_LENS + batch_idx)
         num_blocks_used = (seq_len + block_size - 1) // block_size
 
-        # Online softmax variables
-        m_prev = float("-inf")  # running max
-        l_prev = 0.0           # running sum of exp
-        acc = tl.zeros([head_dim], dtype=tl.float32)  # running output accumulator
+        # Online softmax state
+        m_prev = float("-inf")
+        l_prev = 0.0
+        # Accumulate even/odd halves separately
+        acc_even = tl.zeros([head_dim_packed], dtype=tl.float32)
+        acc_odd = tl.zeros([head_dim_packed], dtype=tl.float32)
 
-        packed_range = tl.arange(0, head_dim_packed)
-        k_even = tl.arange(0, head_dim_packed) * 2
-        k_odd = k_even + 1
-
-        # Iterate over KV blocks (no break — use masking)
         for block_idx in range(max_num_blocks):
-            # Mask: skip if past used blocks
             block_valid = block_idx < num_blocks_used
             if block_valid:
-                # Get physical block ID from block table
                 phys_block = tl.load(BLOCK_TABLE + batch_idx * stride_btb + block_idx * stride_btl)
 
-                # Load per-block scale and zero for this KV head
                 scale_offset = phys_block * stride_scb + kv_head_idx * stride_sch
                 k_scale = tl.load(K_SCALES + scale_offset)
                 k_zero = tl.load(K_ZEROS + scale_offset)
                 v_scale = tl.load(V_SCALES + scale_offset)
                 v_zero = tl.load(V_ZEROS + scale_offset)
 
-                # Process each token in the block (no break — use masking)
                 for tok in range(block_size):
                     global_tok = block_idx * block_size + tok
                     tok_valid = global_tok < seq_len
                     if tok_valid:
-                        # ── Load and dequantize K ──
+                        # ── Load + dequant K ──
                         k_base = (phys_block * stride_kb +
                                   tok * stride_ks +
                                   kv_head_idx * stride_kh)
                         k_packed = tl.load(K_INT4 + k_base + packed_range * stride_kd).to(tl.int32)
 
-                        k_hi = ((k_packed >> 4) & 0x0F).to(tl.float32)
-                        k_lo = (k_packed & 0x0F).to(tl.float32)
-                        k_hi_dq = k_hi * k_scale + k_zero
-                        k_lo_dq = k_lo * k_scale + k_zero
+                        k_hi = ((k_packed >> 4) & 0x0F).to(tl.float32) * k_scale + k_zero
+                        k_lo = (k_packed & 0x0F).to(tl.float32) * k_scale + k_zero
 
-                        # Q·K dot product
-                        score = tl.sum(q[k_even] * k_hi_dq) + tl.sum(q[k_odd] * k_lo_dq)
-                        score = score * sm_scale
+                        # Q·K = sum(q_even * k_hi) + sum(q_odd * k_lo)
+                        score = (tl.sum(q_even * k_hi) + tl.sum(q_odd * k_lo)) * sm_scale
 
                         # ── Online softmax ──
                         m_new = tl.maximum(m_prev, score)
                         alpha = tl.exp(m_prev - m_new)
                         p = tl.exp(score - m_new)
                         l_prev = l_prev * alpha + p
-                        acc = acc * alpha
+                        acc_even = acc_even * alpha
+                        acc_odd = acc_odd * alpha
 
-                        # ── Load and dequantize V ──
+                        # ── Load + dequant V ──
                         v_base = (phys_block * stride_vb +
                                   tok * stride_vs +
                                   kv_head_idx * stride_vh)
                         v_packed = tl.load(V_INT4 + v_base + packed_range * stride_vd).to(tl.int32)
 
-                        v_hi = ((v_packed >> 4) & 0x0F).to(tl.float32)
-                        v_lo = (v_packed & 0x0F).to(tl.float32)
-                        v_hi_dq = v_hi * v_scale + v_zero
-                        v_lo_dq = v_lo * v_scale + v_zero
+                        v_hi = ((v_packed >> 4) & 0x0F).to(tl.float32) * v_scale + v_zero
+                        v_lo = (v_packed & 0x0F).to(tl.float32) * v_scale + v_zero
 
-                        # Accumulate: acc += p * V
-                        acc = tl.where(d_range % 2 == 0,
-                                       acc + p * v_hi_dq[d_range // 2],
-                                       acc + p * v_lo_dq[d_range // 2])
+                        acc_even = acc_even + p * v_hi
+                        acc_odd = acc_odd + p * v_lo
                         m_prev = m_new
 
-        # Normalize by softmax denominator
-        acc = acc / l_prev
+        # Normalize
+        acc_even = acc_even / l_prev
+        acc_odd = acc_odd / l_prev
 
-        # Store output
+        # Interleave even/odd back to [head_dim]: [e0,o0,e1,o1,...]
         o_offset = batch_idx * stride_ob + head_idx * stride_oh
-        tl.store(OUTPUT + o_offset + d_range * stride_od, acc.to(tl.bfloat16))
+        tl.store(OUTPUT + o_offset + even_range * stride_od, acc_even.to(tl.bfloat16))
+        tl.store(OUTPUT + o_offset + odd_range * stride_od, acc_odd.to(tl.bfloat16))
 
 
 def int4_decode_attention(
