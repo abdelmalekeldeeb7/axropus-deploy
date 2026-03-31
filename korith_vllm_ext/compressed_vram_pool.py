@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 
 QUANT_FP8 = "fp8"       # 2x compression, ~0.999 cosine sim
 QUANT_INT4 = "int4"     # 4x compression, ~0.995 cosine sim
-QUANT_INT2 = "int2"     # 8x compression, ~0.98 cosine sim (future)
+QUANT_INT2 = "int2"     # 8x compression, ~0.98 cosine sim
 
 
 @dataclass
@@ -170,6 +170,53 @@ class CompressedVRAMPool:
         # Dequantize
         return (unpacked * scale + zero).to(target_dtype)
 
+    def _quantize_int2(
+        self, tensor: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Quantize bf16/fp16 tensor to INT2 (packed as uint8). 8x compression.
+
+        Each value mapped to 0-3 (2 bits). Four INT2 values packed per byte.
+        Uses per-tensor min/max scaling for speed.
+        """
+        flat = tensor.reshape(-1).float()
+        n = flat.numel()
+
+        vmin = flat.min()
+        vmax = flat.max()
+        scale = (vmax - vmin) / 3.0
+        scale = torch.where(scale > 0, scale, torch.ones_like(scale))
+        zero = vmin
+
+        # Quantize to 0-3
+        q = ((flat - zero) / scale).clamp(0, 3).round().to(torch.uint8)
+
+        # Pack 4 INT2 values into one uint8
+        pad = (4 - n % 4) % 4
+        if pad > 0:
+            q = torch.cat([q, torch.zeros(pad, dtype=torch.uint8, device=q.device)])
+        q4 = q.reshape(-1, 4)
+        packed = (q4[:, 0] << 6) | (q4[:, 1] << 4) | (q4[:, 2] << 2) | q4[:, 3]
+
+        return packed, scale.unsqueeze(0), zero.unsqueeze(0)
+
+    def _dequantize_int2(
+        self,
+        packed: torch.Tensor,
+        scale: torch.Tensor,
+        zero: torch.Tensor,
+        n_elements: int,
+        target_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Dequantize packed INT2 back to target dtype."""
+        # Unpack uint8 → four INT2 values
+        b3 = ((packed >> 6) & 0x03).to(torch.float32)
+        b2 = ((packed >> 4) & 0x03).to(torch.float32)
+        b1 = ((packed >> 2) & 0x03).to(torch.float32)
+        b0 = (packed & 0x03).to(torch.float32)
+        unpacked = torch.stack([b3, b2, b1, b0], dim=1).reshape(-1)[:n_elements]
+
+        return (unpacked * scale + zero).to(target_dtype)
+
     # ── Store ─────────────────────────────────────────────────────────────────
 
     def put(
@@ -247,10 +294,20 @@ class CompressedVRAMPool:
                 total_bytes += k_q.nbytes + v_q.nbytes + k_scale.nbytes + v_scale.nbytes
 
             elif self._quant_mode == QUANT_INT4:
-                n_k = k_seq.numel()
-                n_v = v_seq.numel()
                 k_packed, k_scale, k_zero = self._quantize_int4(k_seq)
                 v_packed, v_scale, v_zero = self._quantize_int4(v_seq)
+                cl = _CompressedLayer(
+                    k_data=k_packed, v_data=v_packed,
+                    k_scale=k_scale, v_scale=v_scale,
+                    k_zero=k_zero, v_zero=v_zero,
+                )
+                total_bytes += (k_packed.nbytes + v_packed.nbytes +
+                                k_scale.nbytes + v_scale.nbytes +
+                                k_zero.nbytes + v_zero.nbytes)
+
+            elif self._quant_mode == QUANT_INT2:
+                k_packed, k_scale, k_zero = self._quantize_int2(k_seq)
+                v_packed, v_scale, v_zero = self._quantize_int2(v_seq)
                 cl = _CompressedLayer(
                     k_data=k_packed, v_data=v_packed,
                     k_scale=k_scale, v_scale=v_scale,
@@ -368,6 +425,15 @@ class CompressedVRAMPool:
                     cl.k_data, cl.k_scale, cl.k_zero, n_elements, target_dtype
                 )
                 v_full = self._dequantize_int4(
+                    cl.v_data, cl.v_scale, cl.v_zero, n_elements, target_dtype
+                )
+                k_src = k_full.reshape(seq_shape)
+                v_src = v_full.reshape(seq_shape)
+            elif entry.quant_mode == QUANT_INT2:
+                k_full = self._dequantize_int2(
+                    cl.k_data, cl.k_scale, cl.k_zero, n_elements, target_dtype
+                )
+                v_full = self._dequantize_int2(
                     cl.v_data, cl.v_scale, cl.v_zero, n_elements, target_dtype
                 )
                 k_src = k_full.reshape(seq_shape)
