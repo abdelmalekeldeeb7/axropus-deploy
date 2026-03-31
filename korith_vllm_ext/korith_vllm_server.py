@@ -96,11 +96,13 @@ def run_benchmark(args: argparse.Namespace) -> None:
     ext_cls = "korith_vllm_ext.amf_worker_ext.AmfWorkerExtension"
 
     eager = getattr(args, 'enforce_eager', False)
-    print(f"[KORITH_VLLM] loading model={model_path} enforce_eager={eager}", flush=True)
+    kv_dtype = getattr(args, 'kv_cache_dtype', 'auto')
+    print(f"[KORITH_VLLM] loading model={model_path} enforce_eager={eager} kv_cache_dtype={kv_dtype}", flush=True)
     llm = LLM(
         model=model_path,
         trust_remote_code=True,
         enforce_eager=eager,
+        kv_cache_dtype=kv_dtype,
         worker_extension_cls=ext_cls,
     )
     sampling = SamplingParams(
@@ -447,6 +449,7 @@ def main() -> None:
     parser.add_argument("--prompt-file", type=str, default="",   help="Read prompt from file (benchmark mode)")
     parser.add_argument("--max-tokens", type=int, default=32,    help="Max output tokens")
     parser.add_argument("--enforce-eager", action="store_true",  help="Disable CUDAGraphs/compile")
+    parser.add_argument("--kv-cache-dtype", type=str, default="auto", help="KV cache dtype (auto/fp8)")
     parser.add_argument("--serve",      action="store_true",     help="Run in server mode")
     parser.add_argument("--host",       type=str, default="0.0.0.0", help="Server host")
     parser.add_argument("--port",       type=int, default=8000,  help="Server port")
