@@ -409,56 +409,34 @@ class AmfKvManager:
 
         n_tokens    = len(prompt_tokens)
 
-        # ── Collect KV data from physical blocks ──────────────────────────────
-        # gpu_cache[layer] shape (vLLM V1, after _KvCacheProxy normalisation):
-        #   FlashAttn/Tree: [2, num_blocks, block_size, num_kv_heads, head_dim]
-        #   FlashInfer:     permuted to same layout by _KvCacheProxy
-        layer_k_tensors: List[torch.Tensor] = []
-        layer_v_tensors: List[torch.Tensor] = []
+        # ── Determine shapes and compute layout ────────────────────────────────
+        sample_layer = gpu_cache[0]
+        if sample_layer.dim() == 5 and sample_layer.shape[0] == 2:
+            k_sample = sample_layer[0]
+        else:
+            k_sample = sample_layer
+        block_shape = k_sample.shape[1:]  # (block_size, num_kv_heads, head_dim)
+        n_kv_heads = block_shape[-2] if len(block_shape) >= 2 else 1
+        head_dim   = block_shape[-1]
+        kv_dtype   = k_sample.dtype
+        elem_size  = k_sample.element_size()
 
-        for layer_cache in gpu_cache:
-            if layer_cache.dim() == 5 and layer_cache.shape[0] == 2:
-                # Stacked KV layout.
-                k_all = layer_cache[0]  # [num_blocks, num_kv_heads, block_size, head_dim]
-                v_all = layer_cache[1]
-            elif layer_cache.dim() == 4:
-                # Split K only; V is the second half along blocks dim — fallback.
-                k_all = layer_cache
-                v_all = layer_cache  # same tensor — caller must know layout
-            else:
-                k_all = layer_cache
-                v_all = layer_cache
+        n_seq_blocks = len(block_table) if block_table else k_sample.shape[0]
+        seq_block_shape = (n_seq_blocks, *block_shape)
+        per_kv_bytes = 1
+        for d in seq_block_shape:
+            per_kv_bytes *= d
+        per_kv_bytes *= elem_size
 
-            # Gather only the blocks used by this sequence.
-            if block_table:
-                block_ids = torch.tensor(block_table, device=k_all.device, dtype=torch.long)
-                k_seq = k_all[block_ids].contiguous()   # [n_blocks, n_kv_heads, block_size, head_dim]
-                v_seq = v_all[block_ids].contiguous()
-            else:
-                k_seq = k_all.contiguous()
-                v_seq = v_all.contiguous()
-
-            layer_k_tensors.append(k_seq)
-            layer_v_tensors.append(v_seq)
-
-        # ── Build the AMFK blob ───────────────────────────────────────────────
-        dtype_tag = _DTYPE_TAG.get(layer_k_tensors[0].dtype, 0)
-
-        # Compute per-layer offsets.
         layer_infos: List[tuple] = []
         total_kv_bytes = 0
-        for k_t, v_t in zip(layer_k_tensors, layer_v_tensors):
-            k_bytes = k_t.numel() * k_t.element_size()
-            v_bytes = v_t.numel() * v_t.element_size()
-            layer_infos.append((total_kv_bytes, k_bytes, total_kv_bytes + k_bytes, v_bytes))
-            total_kv_bytes += k_bytes + v_bytes
+        for _ in range(n_layers):
+            k_off = total_kv_bytes
+            v_off = k_off + per_kv_bytes
+            layer_infos.append((k_off, per_kv_bytes, v_off, per_kv_bytes))
+            total_kv_bytes += 2 * per_kv_bytes
 
-        # Sample n_kv_heads / head_dim from first layer.
-        # After indexing by block_ids, k tensor shape is:
-        #   [n_blocks, block_size, num_kv_heads, head_dim]
-        sample = layer_k_tensors[0]
-        n_kv_heads = sample.shape[-2] if sample.dim() >= 3 else 1
-        head_dim   = sample.shape[-1]
+        dtype_tag = _DTYPE_TAG.get(kv_dtype, 0)
 
         # Write header.
         header = struct.pack(
@@ -481,39 +459,70 @@ class AmfKvManager:
         for k_off, k_sz, v_off, v_sz in layer_infos:
             layer_tbl += struct.pack(_LAYER_FMT, k_off, k_sz, v_off, v_sz)
 
-        # Copy KV tensors D→H using a single large pinned buffer for maximum
-        # throughput.  Previous per-layer pin_memory alloc was extremely slow
-        # (80 allocs × page-lock overhead).  Now we allocate ONE flat pinned
-        # tensor, issue all async copies, then sync once.
+        # ── Copy KV blocks D→H into a single pinned buffer ─────────────────────
+        # To avoid GPU OOM from k_all[block_ids].contiguous() (which allocates
+        # a full copy on GPU), we copy in small chunks directly to pinned CPU
+        # memory.  This uses near-zero extra GPU memory.
         _pin = torch.cuda.is_available()
-        elem_size = layer_k_tensors[0].element_size()
         pinned_buf = torch.empty(
             total_kv_bytes // elem_size,
-            dtype=layer_k_tensors[0].dtype,
+            dtype=kv_dtype,
             device="cpu",
             pin_memory=_pin,
         )
-        buf_ptr = pinned_buf.data_ptr()
+        block_ids_gpu = (
+            torch.tensor(block_table, device=k_sample.device, dtype=torch.long)
+            if block_table else None
+        )
+        CHUNK = 256  # blocks per GPU gather — ~8 MB, fits in any free memory
 
-        for (k_off, k_sz, v_off, v_sz), k_t, v_t in zip(
-            layer_infos, layer_k_tensors, layer_v_tensors
-        ):
-            # set_ with untyped_storage expects element offset, not byte offset
-            k_dst = torch.empty(
-                k_t.shape, dtype=k_t.dtype, device="cpu",
-            ).set_(pinned_buf.untyped_storage(), k_off // elem_size, k_t.shape)
-            v_dst = torch.empty(
-                v_t.shape, dtype=v_t.dtype, device="cpu",
-            ).set_(pinned_buf.untyped_storage(), v_off // elem_size, v_t.shape)
-            k_dst.copy_(k_t, non_blocking=True)
-            v_dst.copy_(v_t, non_blocking=True)
+        for layer_idx, layer_cache in enumerate(gpu_cache):
+            if layer_cache.dim() == 5 and layer_cache.shape[0] == 2:
+                k_all = layer_cache[0]
+                v_all = layer_cache[1]
+            else:
+                k_all = layer_cache
+                v_all = layer_cache
+
+            k_off, _, v_off, _ = layer_infos[layer_idx]
+            k_elem_off = k_off // elem_size
+            v_elem_off = v_off // elem_size
+            block_elems = 1
+            for d in block_shape:
+                block_elems *= d
+
+            if block_ids_gpu is not None:
+                for start in range(0, n_seq_blocks, CHUNK):
+                    end = min(start + CHUNK, n_seq_blocks)
+                    chunk_ids = block_ids_gpu[start:end]
+                    k_chunk = k_all[chunk_ids]  # small GPU alloc
+                    v_chunk = v_all[chunk_ids]
+                    dst_off = k_elem_off + start * block_elems
+                    k_dst = torch.empty(
+                        k_chunk.shape, dtype=kv_dtype, device="cpu",
+                    ).set_(pinned_buf.untyped_storage(), dst_off, k_chunk.shape)
+                    k_dst.copy_(k_chunk, non_blocking=True)
+                    dst_off = v_elem_off + start * block_elems
+                    v_dst = torch.empty(
+                        v_chunk.shape, dtype=kv_dtype, device="cpu",
+                    ).set_(pinned_buf.untyped_storage(), dst_off, v_chunk.shape)
+                    v_dst.copy_(v_chunk, non_blocking=True)
+                    del k_chunk, v_chunk
+            else:
+                k_dst = torch.empty(
+                    k_all.shape, dtype=kv_dtype, device="cpu",
+                ).set_(pinned_buf.untyped_storage(), k_elem_off, k_all.shape)
+                v_dst = torch.empty(
+                    v_all.shape, dtype=kv_dtype, device="cpu",
+                ).set_(pinned_buf.untyped_storage(), v_elem_off, v_all.shape)
+                k_dst.copy_(k_all, non_blocking=True)
+                v_dst.copy_(v_all, non_blocking=True)
 
         if _pin:
             torch.cuda.current_stream().synchronize()
 
         # ── TurboQuant compression (optional) ─────────────────────────────────
         codec      = get_codec()
-        kv_dtype   = layer_k_tensors[0].dtype
         codec_id   = CODEC_NONE
 
         if codec is not None and total_kv_bytes > 0:
