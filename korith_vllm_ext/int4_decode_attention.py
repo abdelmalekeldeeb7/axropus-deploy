@@ -372,23 +372,28 @@ def benchmark_int4_vs_bf16(
     k_expanded = k_bf16.repeat_interleave(gqa_ratio, dim=2)
     v_expanded = v_bf16.repeat_interleave(gqa_ratio, dim=2)
 
-    # Transpose for attention
-    q_t = query.float()  # [B, H, D]
-    k_t = k_expanded.squeeze(0).permute(1, 2, 0).float()  # [H, D, S]
-    v_t = v_expanded.squeeze(0).permute(1, 0, 2).float()  # [H, S, D]
+    # Transpose for attention: use scaled_dot_product_attention
+    q_t = query.float().unsqueeze(0)  # [1, B*H, 1, D] -> use sdpa
+    k_full = k_expanded.squeeze(0).float()  # [S, H, D]
+    v_full = v_expanded.squeeze(0).float()  # [S, H, D]
+
+    # Reshape for sdpa: [B, H, S, D]
+    q_sdpa = query.float().unsqueeze(2)  # [B, H, 1, D]
+    k_sdpa = k_full.permute(1, 0, 2).unsqueeze(0)  # [1, H, S, D]
+    v_sdpa = v_full.permute(1, 0, 2).unsqueeze(0)  # [1, H, S, D]
 
     # Warmup bf16
     for _ in range(num_warmup):
-        scores = torch.bmm(q_t.unsqueeze(2), k_t).squeeze(2) * sm_scale  # [H, S]
-        probs = torch.softmax(scores, dim=-1)
-        out_bf16 = torch.bmm(probs.unsqueeze(1), v_t).squeeze(1)  # [H, D]
+        out_bf16 = torch.nn.functional.scaled_dot_product_attention(
+            q_sdpa, k_sdpa, v_sdpa, scale=sm_scale
+        ).squeeze(2)  # [B, H, D]
 
     torch.cuda.synchronize()
     t0 = time.monotonic()
     for _ in range(num_iters):
-        scores = torch.bmm(q_t.unsqueeze(2), k_t).squeeze(2) * sm_scale
-        probs = torch.softmax(scores, dim=-1)
-        out_bf16 = torch.bmm(probs.unsqueeze(1), v_t).squeeze(1)
+        out_bf16 = torch.nn.functional.scaled_dot_product_attention(
+            q_sdpa, k_sdpa, v_sdpa, scale=sm_scale
+        ).squeeze(2)
     torch.cuda.synchronize()
     bf16_ms = (time.monotonic() - t0) * 1000.0 / num_iters
 
@@ -431,9 +436,8 @@ def benchmark_int4_vs_bf16(
 
         # Check accuracy
         cos_sim = torch.nn.functional.cosine_similarity(
-            out_bf16.reshape(-1).float(),
-            out_int4.reshape(batch_size, num_q_heads, head_dim)[0].reshape(-1).float(),
-            dim=0,
+            out_bf16.reshape(-1).float().unsqueeze(0),
+            out_int4.reshape(-1).float().unsqueeze(0),
         ).item()
 
         speedup = bf16_ms / int4_ms
