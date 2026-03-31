@@ -101,84 +101,68 @@ if HAS_TRITON:
         l_prev = 0.0           # running sum of exp
         acc = tl.zeros([head_dim], dtype=tl.float32)  # running output accumulator
 
-        # Iterate over KV blocks
+        packed_range = tl.arange(0, head_dim_packed)
+        k_even = tl.arange(0, head_dim_packed) * 2
+        k_odd = k_even + 1
+
+        # Iterate over KV blocks (no break — use masking)
         for block_idx in range(max_num_blocks):
-            if block_idx >= num_blocks_used:
-                break
+            # Mask: skip if past used blocks
+            block_valid = block_idx < num_blocks_used
+            if block_valid:
+                # Get physical block ID from block table
+                phys_block = tl.load(BLOCK_TABLE + batch_idx * stride_btb + block_idx * stride_btl)
 
-            # Get physical block ID from block table
-            phys_block = tl.load(BLOCK_TABLE + batch_idx * stride_btb + block_idx * stride_btl)
+                # Load per-block scale and zero for this KV head
+                scale_offset = phys_block * stride_scb + kv_head_idx * stride_sch
+                k_scale = tl.load(K_SCALES + scale_offset)
+                k_zero = tl.load(K_ZEROS + scale_offset)
+                v_scale = tl.load(V_SCALES + scale_offset)
+                v_zero = tl.load(V_ZEROS + scale_offset)
 
-            # Load per-block scale and zero for this KV head
-            scale_offset = phys_block * stride_scb + kv_head_idx * stride_sch
-            k_scale = tl.load(K_SCALES + scale_offset)
-            k_zero = tl.load(K_ZEROS + scale_offset)
-            v_scale = tl.load(V_SCALES + scale_offset)
-            v_zero = tl.load(V_ZEROS + scale_offset)
+                # Process each token in the block (no break — use masking)
+                for tok in range(block_size):
+                    global_tok = block_idx * block_size + tok
+                    tok_valid = global_tok < seq_len
+                    if tok_valid:
+                        # ── Load and dequantize K ──
+                        k_base = (phys_block * stride_kb +
+                                  tok * stride_ks +
+                                  kv_head_idx * stride_kh)
+                        k_packed = tl.load(K_INT4 + k_base + packed_range * stride_kd).to(tl.int32)
 
-            # Compute number of valid tokens in this block
-            tokens_in_block = tl.minimum(block_size, seq_len - block_idx * block_size)
+                        k_hi = ((k_packed >> 4) & 0x0F).to(tl.float32)
+                        k_lo = (k_packed & 0x0F).to(tl.float32)
+                        k_hi_dq = k_hi * k_scale + k_zero
+                        k_lo_dq = k_lo * k_scale + k_zero
 
-            # Process each token in the block
-            for tok in range(block_size):
-                if tok >= tokens_in_block:
-                    break
+                        # Q·K dot product
+                        score = tl.sum(q[k_even] * k_hi_dq) + tl.sum(q[k_odd] * k_lo_dq)
+                        score = score * sm_scale
 
-                # ── Load and dequantize K for this token ──
-                k_base = (phys_block * stride_kb +
-                          tok * stride_ks +
-                          kv_head_idx * stride_kh)
-                packed_range = tl.arange(0, head_dim_packed)
-                k_packed = tl.load(K_INT4 + k_base + packed_range * stride_kd).to(tl.int32)
+                        # ── Online softmax ──
+                        m_new = tl.maximum(m_prev, score)
+                        alpha = tl.exp(m_prev - m_new)
+                        p = tl.exp(score - m_new)
+                        l_prev = l_prev * alpha + p
+                        acc = acc * alpha
 
-                # Unpack: high 4 bits and low 4 bits
-                k_hi = ((k_packed >> 4) & 0x0F).to(tl.float32)
-                k_lo = (k_packed & 0x0F).to(tl.float32)
+                        # ── Load and dequantize V ──
+                        v_base = (phys_block * stride_vb +
+                                  tok * stride_vs +
+                                  kv_head_idx * stride_vh)
+                        v_packed = tl.load(V_INT4 + v_base + packed_range * stride_vd).to(tl.int32)
 
-                # Interleave [hi0, lo0, hi1, lo1, ...]
-                # Dequantize: val = packed_val * scale + zero
-                k_hi_dq = k_hi * k_scale + k_zero
-                k_lo_dq = k_lo * k_scale + k_zero
+                        v_hi = ((v_packed >> 4) & 0x0F).to(tl.float32)
+                        v_lo = (v_packed & 0x0F).to(tl.float32)
+                        v_hi_dq = v_hi * v_scale + v_zero
+                        v_lo_dq = v_lo * v_scale + v_zero
 
-                # Build full K vector [head_dim]
-                # k_full[2i] = k_hi_dq[i], k_full[2i+1] = k_lo_dq[i]
-                k_even = tl.arange(0, head_dim_packed) * 2
-                k_odd = k_even + 1
-
-                # Compute Q·K score for this token
-                score = tl.sum(q[k_even] * k_hi_dq) + tl.sum(q[k_odd] * k_lo_dq)
-                score = score * sm_scale
-
-                # ── Online softmax update ──
-                m_new = tl.maximum(m_prev, score)
-                # Rescale previous accumulator
-                alpha = tl.exp(m_prev - m_new)
-                # New exp(score - max)
-                p = tl.exp(score - m_new)
-
-                l_prev = l_prev * alpha + p
-                acc = acc * alpha
-
-                # ── Load and dequantize V for this token ──
-                v_base = (phys_block * stride_vb +
-                          tok * stride_vs +
-                          kv_head_idx * stride_vh)
-                v_packed = tl.load(V_INT4 + v_base + packed_range * stride_vd).to(tl.int32)
-
-                v_hi = ((v_packed >> 4) & 0x0F).to(tl.float32)
-                v_lo = (v_packed & 0x0F).to(tl.float32)
-
-                v_hi_dq = v_hi * v_scale + v_zero
-                v_lo_dq = v_lo * v_scale + v_zero
-
-                # Accumulate: acc += p * V
-                acc_even = tl.arange(0, head_dim_packed) * 2
-                acc_odd = acc_even + 1
-                acc = tl.where(d_range % 2 == 0,
-                               acc + p * v_hi_dq[d_range // 2],
-                               acc + p * v_lo_dq[d_range // 2])
-
-                m_prev = m_new
+                        # Accumulate: acc += p * V
+                        acc = tl.where(d_range % 2 == 0,
+                                       acc + p * v_hi_dq[d_range // 2],
+                                       acc + p * v_lo_dq[d_range // 2])
+                        m_prev = m_new
 
         # Normalize by softmax denominator
         acc = acc / l_prev
