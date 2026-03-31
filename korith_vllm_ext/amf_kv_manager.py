@@ -481,25 +481,35 @@ class AmfKvManager:
         for k_off, k_sz, v_off, v_sz in layer_infos:
             layer_tbl += struct.pack(_LAYER_FMT, k_off, k_sz, v_off, v_sz)
 
-        # Copy KV tensors D→H using pinned host memory for maximum PCIe throughput.
-        # pin_memory=True allocates page-locked memory so cudaMemcpy is fully async.
+        # Copy KV tensors D→H using a single large pinned buffer for maximum
+        # throughput.  Previous per-layer pin_memory alloc was extremely slow
+        # (80 allocs × page-lock overhead).  Now we allocate ONE flat pinned
+        # tensor, issue all async copies, then sync once.
         _pin = torch.cuda.is_available()
-        kv_payload = bytearray(total_kv_bytes)
-        mv = memoryview(kv_payload)
+        elem_size = layer_k_tensors[0].element_size()
+        pinned_buf = torch.empty(
+            total_kv_bytes // elem_size,
+            dtype=layer_k_tensors[0].dtype,
+            device="cpu",
+            pin_memory=_pin,
+        )
+        buf_ptr = pinned_buf.data_ptr()
 
         for (k_off, k_sz, v_off, v_sz), k_t, v_t in zip(
             layer_infos, layer_k_tensors, layer_v_tensors
         ):
-            k_cpu = torch.empty_like(k_t, device="cpu", pin_memory=_pin)
-            v_cpu = torch.empty_like(v_t, device="cpu", pin_memory=_pin)
-            k_cpu.copy_(k_t, non_blocking=True)
-            v_cpu.copy_(v_t, non_blocking=True)
-            if _pin:
-                torch.cuda.current_stream().synchronize()
-            # Use raw storage bytes instead of .numpy() to support bfloat16
-            # and other dtypes that NumPy cannot represent.
-            mv[k_off : k_off + k_sz] = bytes(k_cpu.untyped_storage())
-            mv[v_off : v_off + v_sz] = bytes(v_cpu.untyped_storage())
+            k_dst = torch.empty(
+                k_t.shape, dtype=k_t.dtype, device="cpu",
+            ).set_(pinned_buf.untyped_storage(), k_off, k_t.shape)
+            v_dst = torch.empty(
+                v_t.shape, dtype=v_t.dtype, device="cpu",
+            ).set_(pinned_buf.untyped_storage(), v_off, v_t.shape)
+            k_dst.copy_(k_t, non_blocking=True)
+            v_dst.copy_(v_t, non_blocking=True)
+
+        if _pin:
+            torch.cuda.current_stream().synchronize()
+        kv_payload = bytes(pinned_buf.untyped_storage())
 
         # ── TurboQuant compression (optional) ─────────────────────────────────
         # layer_infos store UNCOMPRESSED offsets — restore uses them after
@@ -509,21 +519,20 @@ class AmfKvManager:
         codec      = get_codec()
         kv_dtype   = layer_k_tensors[0].dtype
         codec_id   = CODEC_NONE
-        payload_bytes: bytes = bytes(kv_payload)
 
         if codec is not None and total_kv_bytes > 0:
             try:
-                compressed = codec.compress(payload_bytes, head_dim, kv_dtype)
-                if len(compressed) < len(payload_bytes):
-                    ratio = len(payload_bytes) / len(compressed)
+                compressed = codec.compress(kv_payload, head_dim, kv_dtype)
+                if len(compressed) < len(kv_payload):
+                    ratio = len(kv_payload) / len(compressed)
                     logger.info(
                         "[AMF_VLLM] TurboQuant: %.1f MB → %.1f MB (%.1fx)",
-                        len(payload_bytes) / (1024 * 1024),
+                        len(kv_payload) / (1024 * 1024),
                         len(compressed) / (1024 * 1024),
                         ratio,
                     )
-                    payload_bytes = compressed
-                    codec_id      = CODEC_TURBOQUANT
+                    kv_payload = compressed
+                    codec_id   = CODEC_TURBOQUANT
             except Exception as exc:  # compression is best-effort
                 logger.warning("[AMF_VLLM] TurboQuant compress failed: %s", exc)
 
@@ -543,14 +552,14 @@ class AmfKvManager:
             key["prefix_hash"],
         )
 
-        blob = header + layer_tbl + payload_bytes
+        blob = header + layer_tbl + kv_payload
 
         # ── Populate VRAM cache (compressed or raw — LRU eviction handles budget) ──
         if self._vram_cache is not None:
             vram_key = kv_path.stem
             stored = self._vram_cache.put(
                 key=vram_key,
-                compressed=payload_bytes,
+                compressed=kv_payload,
                 snap_dtype=kv_dtype,
                 n_tokens=n_tokens,
                 layer_infos=layer_infos,
@@ -559,7 +568,7 @@ class AmfKvManager:
             if stored:
                 logger.debug(
                     "[AMF_VLLM] VRAM cache: stored %s (%.1f MB, codec=%d)",
-                    vram_key, len(payload_bytes) / (1024 * 1024), codec_id,
+                    vram_key, len(kv_payload) / (1024 * 1024), codec_id,
                 )
 
         # Write atomically via temp file.
