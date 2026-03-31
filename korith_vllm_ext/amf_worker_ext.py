@@ -98,6 +98,20 @@ class AmfWorkerExtension:
 
         return mgr, proxy
 
+    def _get_compressed_pool(self: Any):
+        """Get or create the compressed VRAM pool (lazy singleton)."""
+        pool = getattr(self, "_compressed_vram_pool", None)
+        if pool is None:
+            from .compressed_vram_pool import CompressedVRAMPool, QUANT_INT4
+            pool_gb = float(os.environ.get("KORITH_VRAM_POOL_GB", "0"))
+            quant = os.environ.get("KORITH_VRAM_POOL_QUANT", "int4")
+            if pool_gb > 0:
+                pool = CompressedVRAMPool(
+                    max_gb=pool_gb, device="cuda:0", quant_mode=quant,
+                )
+            self._compressed_vram_pool = pool
+        return pool
+
     def amf_save_kv(
         self: Any,
         amf_store_path: str,
@@ -134,6 +148,18 @@ class AmfWorkerExtension:
         block_size = t.shape[2] if t.dim() == 5 else 16
 
         saved = mgr.save_kv_state(prompt_tokens, block_table=block_table)
+
+        # Also store in compressed VRAM pool (INT4: 4x compression)
+        pool = self._get_compressed_pool()
+        if pool is not None and saved:
+            pool_key = mgr._kv_filename(mgr.compute_amf_key(prompt_tokens)).stem
+            try:
+                pool.put(pool_key, proxy.gpu_cache, block_table, len(prompt_tokens))
+            except Exception as exc:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "[AMF_POOL] compressed pool put failed: %s", exc)
+
         return {
             "saved": saved,
             "n_layers": len(proxy.gpu_cache),
@@ -164,4 +190,13 @@ class AmfWorkerExtension:
 
         block_table = _get_block_size_and_table(proxy.gpu_cache, len(prompt_tokens))
 
+        # Fast path: compressed VRAM pool (INT4 dequant, ~50-200ms)
+        pool = self._get_compressed_pool()
+        if pool is not None:
+            pool_key = mgr._kv_filename(mgr.compute_amf_key(prompt_tokens)).stem
+            n_restored = pool.restore(pool_key, proxy.gpu_cache, block_table)
+            if n_restored > 0:
+                return n_restored
+
+        # Slow path: NVMe disk restore
         return mgr.restore_kv_state(prompt_tokens, block_table=block_table)
