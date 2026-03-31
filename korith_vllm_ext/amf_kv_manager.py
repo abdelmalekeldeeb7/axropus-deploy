@@ -587,12 +587,12 @@ class AmfKvManager:
                     f.write(kv_payload)
                 else:
                     # Write directly from pinned tensor — no Python bytes copy
-                    # numpy view of pinned buffer for zero-copy write
-                    import numpy as np
-                    arr = np.frombuffer(
-                        pinned_buf.untyped_storage(), dtype=np.uint8
+                    import ctypes
+                    storage = pinned_buf.untyped_storage()
+                    buf = (ctypes.c_char * storage.nbytes()).from_address(
+                        storage.data_ptr()
                     )
-                    f.write(arr.data)
+                    f.write(buf)
             tmp_path.rename(kv_path)
         except OSError as exc:
             logger.warning("[AMF_VLLM] save: write failed: %s", exc)
