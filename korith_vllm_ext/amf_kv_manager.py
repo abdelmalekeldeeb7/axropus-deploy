@@ -498,12 +498,13 @@ class AmfKvManager:
         for (k_off, k_sz, v_off, v_sz), k_t, v_t in zip(
             layer_infos, layer_k_tensors, layer_v_tensors
         ):
+            # set_ with untyped_storage expects element offset, not byte offset
             k_dst = torch.empty(
                 k_t.shape, dtype=k_t.dtype, device="cpu",
-            ).set_(pinned_buf.untyped_storage(), k_off, k_t.shape)
+            ).set_(pinned_buf.untyped_storage(), k_off // elem_size, k_t.shape)
             v_dst = torch.empty(
                 v_t.shape, dtype=v_t.dtype, device="cpu",
-            ).set_(pinned_buf.untyped_storage(), v_off, v_t.shape)
+            ).set_(pinned_buf.untyped_storage(), v_off // elem_size, v_t.shape)
             k_dst.copy_(k_t, non_blocking=True)
             v_dst.copy_(v_t, non_blocking=True)
 
