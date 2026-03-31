@@ -30,6 +30,7 @@ Usage:
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 from collections import OrderedDict
@@ -176,28 +177,57 @@ class CompressedVRAMPool:
         """Quantize bf16/fp16 tensor to INT2 (packed as uint8). 8x compression.
 
         Each value mapped to 0-3 (2 bits). Four INT2 values packed per byte.
-        Uses per-tensor min/max scaling for speed.
+        Uses per-block quantization: one scale + zero_point per KV block
+        (block_size * num_kv_heads * head_dim elements) for much better quality
+        than per-tensor quantization with only 4 levels.
         """
         flat = tensor.reshape(-1).float()
         n = flat.numel()
 
-        vmin = flat.min()
-        vmax = flat.max()
-        scale = (vmax - vmin) / 3.0
-        scale = torch.where(scale > 0, scale, torch.ones_like(scale))
-        zero = vmin
+        # Determine block size: each KV block is [block_size, num_kv_heads, head_dim]
+        # tensor shape is (n_blocks, block_size, num_kv_heads, head_dim)
+        if tensor.dim() >= 2:
+            block_elems = tensor.shape[1:].numel()  # elements per KV block
+        else:
+            block_elems = n  # fallback: treat entire tensor as one block
+        n_blocks = max(n // block_elems, 1)
 
-        # Quantize to 0-3
-        q = ((flat - zero) / scale).clamp(0, 3).round().to(torch.uint8)
+        # Pad flat tensor so it divides evenly into blocks
+        padded_n = n_blocks * block_elems
+        if padded_n > n:
+            flat = torch.cat([flat, torch.zeros(padded_n - n, dtype=flat.dtype,
+                                                device=flat.device)])
+        elif padded_n < n:
+            # More elements than expected blocks — treat remainder as extra block
+            n_blocks = math.ceil(n / block_elems)
+            padded_n = n_blocks * block_elems
+            flat = torch.cat([flat, torch.zeros(padded_n - n, dtype=flat.dtype,
+                                                device=flat.device)])
+
+        blocks = flat.reshape(n_blocks, -1)  # (n_blocks, block_elems)
+
+        # Per-block min/max
+        vmin = blocks.min(dim=1).values  # (n_blocks,)
+        vmax = blocks.max(dim=1).values  # (n_blocks,)
+        scale = (vmax - vmin) / 3.0      # (n_blocks,)
+        scale = torch.where(scale > 0, scale, torch.ones_like(scale))
+        zero = vmin                       # (n_blocks,)
+
+        # Quantize to 0-3 per block
+        q = ((blocks - zero.unsqueeze(1)) / scale.unsqueeze(1)).clamp(0, 3).round().to(torch.uint8)
+        q = q.reshape(-1)  # flatten back
+
+        # Trim back to original + pack-padding length
+        total = padded_n
+        pad4 = (4 - total % 4) % 4
+        if pad4 > 0:
+            q = torch.cat([q, torch.zeros(pad4, dtype=torch.uint8, device=q.device)])
 
         # Pack 4 INT2 values into one uint8
-        pad = (4 - n % 4) % 4
-        if pad > 0:
-            q = torch.cat([q, torch.zeros(pad, dtype=torch.uint8, device=q.device)])
         q4 = q.reshape(-1, 4)
         packed = (q4[:, 0] << 6) | (q4[:, 1] << 4) | (q4[:, 2] << 2) | q4[:, 3]
 
-        return packed, scale.unsqueeze(0), zero.unsqueeze(0)
+        return packed, scale, zero
 
     def _dequantize_int2(
         self,
@@ -207,15 +237,27 @@ class CompressedVRAMPool:
         n_elements: int,
         target_dtype: torch.dtype,
     ) -> torch.Tensor:
-        """Dequantize packed INT2 back to target dtype."""
+        """Dequantize packed INT2 back to target dtype using per-block scales."""
         # Unpack uint8 → four INT2 values
         b3 = ((packed >> 6) & 0x03).to(torch.float32)
         b2 = ((packed >> 4) & 0x03).to(torch.float32)
         b1 = ((packed >> 2) & 0x03).to(torch.float32)
         b0 = (packed & 0x03).to(torch.float32)
-        unpacked = torch.stack([b3, b2, b1, b0], dim=1).reshape(-1)[:n_elements]
+        unpacked = torch.stack([b3, b2, b1, b0], dim=1).reshape(-1)
 
-        return (unpacked * scale + zero).to(target_dtype)
+        n_blocks = scale.numel()
+        if n_blocks > 1:
+            # Per-block dequantization
+            block_elems = unpacked.numel() // n_blocks
+            unpacked_blocks = unpacked.reshape(n_blocks, block_elems)
+            result = unpacked_blocks * scale.unsqueeze(1) + zero.unsqueeze(1)
+            result = result.reshape(-1)[:n_elements]
+        else:
+            # Single block / legacy fallback
+            unpacked = unpacked[:n_elements]
+            result = unpacked * scale + zero
+
+        return result.to(target_dtype)
 
     # ── Store ─────────────────────────────────────────────────────────────────
 
@@ -459,7 +501,7 @@ class CompressedVRAMPool:
                 v_all[block_ids[start:end]] = v_src[start:end]
 
             del k_src, v_src
-            if entry.quant_mode in (QUANT_FP8, QUANT_INT4):
+            if entry.quant_mode in (QUANT_FP8, QUANT_INT4, QUANT_INT2):
                 del k_full, v_full
 
         elapsed_ms = (time.monotonic() - t0) * 1000.0

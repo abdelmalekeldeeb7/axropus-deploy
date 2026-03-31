@@ -15,6 +15,8 @@ import math
 import os
 from typing import Any
 
+import torch
+
 
 def _get_block_size_and_table(proxy_gpu_cache: list, n_tokens: int) -> list:
     """Compute the block_table for the first ``n_tokens`` tokens.
@@ -201,7 +203,24 @@ class AmfWorkerExtension:
             pool_key = mgr._kv_filename(mgr.compute_amf_key(prompt_tokens)).stem
             n_restored = pool.restore(pool_key, proxy.gpu_cache, block_table)
             if n_restored > 0:
+                self._fix_fp8_attention_scales(kv_is_fp8)
                 return n_restored
 
         # Slow path: NVMe disk restore
-        return mgr.restore_kv_state(prompt_tokens, block_table=block_table)
+        n_restored = mgr.restore_kv_state(prompt_tokens, block_table=block_table)
+        self._fix_fp8_attention_scales(kv_is_fp8)
+        return n_restored
+
+    def _fix_fp8_attention_scales(self: Any, kv_is_fp8: bool) -> None:
+        """Ensure FP8 attention scales are valid (not 0.0) after KV restore.
+
+        After restore with FP8 KV cache, the attention layer's _k_scale and
+        _v_scale might be 0.0 (uninitialized), which zeros out all attention.
+        """
+        if kv_is_fp8 and hasattr(self, 'model_runner'):
+            for name, module in self.model_runner.model.named_modules():
+                for attr in ('_k_scale', '_v_scale', 'k_scale', 'v_scale'):
+                    if hasattr(module, attr):
+                        param = getattr(module, attr)
+                        if isinstance(param, torch.Tensor) and param.item() == 0.0:
+                            param.fill_(1.0)
