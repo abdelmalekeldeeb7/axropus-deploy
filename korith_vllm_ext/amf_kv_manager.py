@@ -495,18 +495,24 @@ class AmfKvManager:
                 for start in range(0, n_seq_blocks, CHUNK):
                     end = min(start + CHUNK, n_seq_blocks)
                     chunk_ids = block_ids_gpu[start:end]
-                    k_chunk = k_all[chunk_ids]  # small GPU alloc
-                    v_chunk = v_all[chunk_ids]
+                    chunk_len = end - start
+                    chunk_shape = (chunk_len, *block_shape)
+                    k_chunk = k_all[chunk_ids].contiguous()
+                    v_chunk = v_all[chunk_ids].contiguous()
                     dst_off = k_elem_off + start * block_elems
                     k_dst = torch.empty(
-                        k_chunk.shape, dtype=kv_dtype, device="cpu",
-                    ).set_(pinned_buf.untyped_storage(), dst_off, k_chunk.shape)
+                        chunk_shape, dtype=kv_dtype, device="cpu",
+                    ).set_(pinned_buf.untyped_storage(), dst_off, chunk_shape)
                     k_dst.copy_(k_chunk, non_blocking=True)
                     dst_off = v_elem_off + start * block_elems
                     v_dst = torch.empty(
-                        v_chunk.shape, dtype=kv_dtype, device="cpu",
-                    ).set_(pinned_buf.untyped_storage(), dst_off, v_chunk.shape)
+                        chunk_shape, dtype=kv_dtype, device="cpu",
+                    ).set_(pinned_buf.untyped_storage(), dst_off, chunk_shape)
                     v_dst.copy_(v_chunk, non_blocking=True)
+                    # Sync per chunk to ensure copy completes before GPU
+                    # memory is freed by del — prevents data corruption
+                    # when many chunks reuse the same GPU memory slots.
+                    torch.cuda.current_stream().synchronize()
                     del k_chunk, v_chunk
             else:
                 k_dst = torch.empty(
@@ -818,14 +824,23 @@ class AmfKvManager:
 
             if block_table:
                 # Scatter into specific physical blocks owned by this sequence.
+                n_blocks_restore = len(block_table)
+                target_shape = (n_blocks_restore, *k_all.shape[1:])
+                k_src = k_flat.reshape(target_shape)
+                v_src = v_flat.reshape(target_shape)
                 block_ids = torch.tensor(block_table, device=k_all.device, dtype=torch.long)
-                k_src = k_flat.reshape(k_all[block_ids].shape)
-                v_src = v_flat.reshape(v_all[block_ids].shape)
-                if kv_gpu_tensor is None:
-                    k_src = k_src.to(k_all.device)
-                    v_src = v_src.to(v_all.device)
-                k_all[block_ids] = k_src
-                v_all[block_ids] = v_src
+                # Chunked scatter to avoid GPU OOM on large block counts.
+                _RESTORE_CHUNK = 256
+                for _rs in range(0, n_blocks_restore, _RESTORE_CHUNK):
+                    _re = min(_rs + _RESTORE_CHUNK, n_blocks_restore)
+                    _chunk_ids = block_ids[_rs:_re]
+                    _k_c = k_src[_rs:_re]
+                    _v_c = v_src[_rs:_re]
+                    if kv_gpu_tensor is None:
+                        _k_c = _k_c.to(k_all.device)
+                        _v_c = _v_c.to(v_all.device)
+                    k_all[_chunk_ids] = _k_c
+                    v_all[_chunk_ids] = _v_c
             else:
                 # Empty block_table → single-request benchmark: restore ALL blocks.
                 k_src = k_flat.reshape_as(k_all)
