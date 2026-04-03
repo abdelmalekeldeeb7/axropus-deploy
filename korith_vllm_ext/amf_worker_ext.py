@@ -197,17 +197,20 @@ class AmfWorkerExtension:
                       self.vllm_config.cache_config.cache_dtype.startswith("fp8"))
 
         # Fast path: compressed VRAM pool (INT4 dequant, ~50-200ms)
-        # For FP8, use pool with raw storage (no quantization)
         pool = self._get_compressed_pool()
         if pool is not None:
             pool_key = mgr._kv_filename(mgr.compute_amf_key(prompt_tokens)).stem
             n_restored = pool.restore(pool_key, proxy.gpu_cache, block_table)
             if n_restored > 0:
+                import torch
+                torch.cuda.synchronize()  # Ensure all writes complete
                 self._fix_fp8_attention_scales(kv_is_fp8)
                 return n_restored
 
         # Slow path: NVMe disk restore
         n_restored = mgr.restore_kv_state(prompt_tokens, block_table=block_table)
+        import torch
+        torch.cuda.synchronize()
         self._fix_fp8_attention_scales(kv_is_fp8)
         return n_restored
 

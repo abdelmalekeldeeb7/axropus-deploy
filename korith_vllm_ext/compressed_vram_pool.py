@@ -303,12 +303,20 @@ class CompressedVRAMPool:
         total_bytes = 0
         CHUNK = 512  # gather chunk size to avoid OOM
 
-        # Auto-detect: if KV cache is already FP8, store raw (already 2x compressed).
-        # Don't double-quantize FP8 → INT4 — that destroys quality.
-        is_fp8 = hasattr(torch, 'float8_e4m3fn') and orig_dtype == torch.float8_e4m3fn
-        effective_quant = "raw" if is_fp8 else self._quant_mode
-        if is_fp8:
-            logger.info("[VRAM_POOL] FP8 KV detected — storing raw (already 2x compressed)")
+        # Auto-detect: if KV cache is already FP8/INT8 (compressed), store raw.
+        # Don't double-quantize compressed data → INT4 — that destroys quality.
+        _fp8_types = set()
+        if hasattr(torch, 'float8_e4m3fn'):
+            _fp8_types.add(torch.float8_e4m3fn)
+        if hasattr(torch, 'float8_e5m2'):
+            _fp8_types.add(torch.float8_e5m2)
+        is_compressed = (orig_dtype in _fp8_types or
+                         orig_dtype == torch.int8 or
+                         orig_dtype == torch.uint8 or
+                         orig_dtype.itemsize == 1)  # any 1-byte dtype = already compressed
+        effective_quant = "raw" if is_compressed else self._quant_mode
+        if is_compressed:
+            logger.info("[VRAM_POOL] Compressed KV detected (dtype=%s) — storing raw", orig_dtype)
 
         for layer_cache in gpu_cache:
             if layer_cache.dim() == 5 and layer_cache.shape[0] == 2:
