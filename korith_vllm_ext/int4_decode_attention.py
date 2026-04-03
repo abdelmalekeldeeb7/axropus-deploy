@@ -521,7 +521,6 @@ def benchmark_int4_vs_bf16(
     print(f"[INT4_BENCH] dequant+sdpa: {dq_ms:.2f}ms (speedup: {bf16_ms/dq_ms:.2f}x)")
     print(f"[INT4_BENCH] dequant+sdpa cosine: {cos_sim_dq:.6f}")
 
-    if not HAS_TRITON:
     return {"bf16_ms": bf16_ms, "dq_ms": dq_ms, "dq_cosine": cos_sim_dq, "seq_len": seq_len}
 
 
