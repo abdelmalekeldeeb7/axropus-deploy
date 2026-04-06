@@ -1,5 +1,10 @@
 {
+  "buildCommand": "npm run build",
+  "outputDirectory": "dist",
   "rewrites": [
+    { "source": "/api/:path*", "destination": "https://api.axropus.com/api/:path*" },
+    { "source": "/v1/:path*", "destination": "https://api.axropus.com/v1/:path*" },
+    { "source": "/health/:path*", "destination": "https://api.axropus.com/health/:path*" },
     { "source": "/(.*)", "destination": "/index.html" }
   ]
 }

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi import Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 
 try:
@@ -141,6 +144,19 @@ def create_app() -> FastAPI:
     app.include_router(billing_router)
     app.include_router(claws_router)
     app.include_router(economics_router)
+
+    # ── Static frontend (production) ─────────────────────────────────────
+    static_dir = os.environ.get("AXROPUS_STATIC_DIR", "")
+    if static_dir and Path(static_dir).is_dir():
+        index_html = Path(static_dir) / "index.html"
+
+        @app.get("/{full_path:path}", include_in_schema=False)
+        async def serve_spa(full_path: str):
+            file_path = Path(static_dir) / full_path
+            if file_path.is_file():
+                return FileResponse(file_path)
+            return FileResponse(index_html)
+
     return app
 
 
