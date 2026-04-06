@@ -10,20 +10,25 @@ from sqlalchemy import text
 
 from .auth import router as auth_router
 from .benchmarks import router as benchmarks_router
+from .claws import router as claws_router
 from .config import get_settings
 from .db import SessionLocal, init_db
 from .billing import router as billing_router
 from .dashboard import router as dashboard_router
 from .deploy import router as deploy_router
+from .economics import router as economics_router
 from .inference import router as inference_router
 from .keys import router as keys_router
 from .metrics import router as metrics_router
+from .model_manager import model_manager
+from .model_registry import get_model, list_models, list_families
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     init_db()
     yield
+    await model_manager.shutdown()
 
 
 def create_app() -> FastAPI:
@@ -66,6 +71,48 @@ def create_app() -> FastAPI:
         finally:
             db.close()
 
+    # ── Model registry endpoints ────────────────────────────────────────
+    @app.get("/v1/models/registry", tags=["models"])
+    def list_model_registry(
+        family: str | None = None,
+        tag: str | None = None,
+        supports_openclaw: bool | None = None,
+        supports_nemoclaw: bool | None = None,
+    ) -> list[dict]:
+        """List all models in the Axropus model registry, with optional filters."""
+        specs = list_models(
+            family=family,
+            tag=tag,
+            supports_openclaw=supports_openclaw,
+            supports_nemoclaw=supports_nemoclaw,
+        )
+        return [s.to_dict() for s in specs]
+
+    @app.get("/v1/models/registry/{model_id}", tags=["models"])
+    def get_model_detail(model_id: str) -> dict:
+        """Get detailed metadata for a specific model."""
+        spec = get_model(model_id)
+        if spec is None:
+            return JSONResponse({"detail": f"Model {model_id!r} not found"}, status_code=404)
+        return spec.to_dict()
+
+    @app.get("/v1/models/families", tags=["models"])
+    def get_model_families() -> list[str]:
+        """List all available model families."""
+        return list_families()
+
+    # ── Model management endpoints ────────────────────────────────────────
+    @app.get("/v1/models/deployments", tags=["models"])
+    def list_model_deployments() -> list[dict]:
+        """List all managed model deployments and their status."""
+        return model_manager.list_deployed_models()
+
+    @app.get("/v1/models/deployments/{deployment_id}", tags=["models"])
+    def get_model_deployment_status(deployment_id: int) -> dict:
+        """Get status of a specific model deployment."""
+        return model_manager.get_model_status(deployment_id)
+
+    # ── Existing routers ──────────────────────────────────────────────────
     app.include_router(auth_router)
     app.include_router(benchmarks_router)
     app.include_router(keys_router)
@@ -74,6 +121,8 @@ def create_app() -> FastAPI:
     app.include_router(metrics_router)
     app.include_router(dashboard_router)
     app.include_router(billing_router)
+    app.include_router(claws_router)
+    app.include_router(economics_router)
     return app
 
 

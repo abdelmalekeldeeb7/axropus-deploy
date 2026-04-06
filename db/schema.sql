@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS deployments (
   model_family TEXT NOT NULL,
   model_size TEXT NOT NULL,
   draft_model TEXT,
+  inference_url TEXT,
   status TEXT DEFAULT 'pending',
   deployed_at TIMESTAMP,
   FOREIGN KEY (customer_id) REFERENCES customers(id),
@@ -68,113 +69,116 @@ CREATE TABLE IF NOT EXISTS invoices (
   FOREIGN KEY (customer_id) REFERENCES customers(id)
 );
 
--- ═══════════════════════════════════════════════════════════
--- AXROPUS PLATFORM HUB TABLES
--- ═══════════════════════════════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════════════════
+-- Axropus Platform Hub — Model Deployments
+-- ═══════════════════════════════════════════════════════════════════════════
 
--- Model deployments (managed by model_manager)
 CREATE TABLE IF NOT EXISTS model_deployments (
-    id TEXT PRIMARY KEY,
-    model_id TEXT NOT NULL,
-    model_name TEXT NOT NULL,
-    model_family TEXT NOT NULL,
-    status TEXT DEFAULT 'stopped',
-    gpu_id TEXT,
-    quant_mode TEXT DEFAULT 'int4',
-    vram_allocated_gb REAL,
-    amf_enabled INTEGER DEFAULT 1,
-    config JSON,
-    pid INTEGER,
-    port INTEGER,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  id INTEGER PRIMARY KEY,
+  customer_id INTEGER NOT NULL,
+  model_id TEXT NOT NULL,
+  status TEXT DEFAULT 'pending',
+  port INTEGER,
+  quant_mode TEXT,
+  tensor_parallel INTEGER DEFAULT 1,
+  gpu_count INTEGER DEFAULT 0,
+  error_message TEXT,
+  deployed_at TIMESTAMP,
+  stopped_at TIMESTAMP,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (customer_id) REFERENCES customers(id)
 );
 
--- OpenClaw agents (Claws)
+CREATE INDEX IF NOT EXISTS idx_model_deployments_customer ON model_deployments(customer_id);
+CREATE INDEX IF NOT EXISTS idx_model_deployments_status ON model_deployments(status);
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- Axropus Platform Hub — OpenClaw Agents (Claws)
+-- ═══════════════════════════════════════════════════════════════════════════
+
 CREATE TABLE IF NOT EXISTS claws (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    model_id TEXT NOT NULL,
-    system_prompt TEXT,
-    tools JSON,
-    channels JSON,
-    openclaw_config JSON,
-    amf_config JSON,
-    status TEXT DEFAULT 'draft',
-    total_tasks INTEGER DEFAULT 0,
-    total_tokens_saved INTEGER DEFAULT 0,
-    avg_prefix_reuse REAL DEFAULT 0,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  id INTEGER PRIMARY KEY,
+  customer_id INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  model_id TEXT NOT NULL,
+  system_prompt TEXT DEFAULT 'You are a helpful AI assistant.',
+  tools TEXT DEFAULT '[]',
+  channels TEXT DEFAULT '[]',
+  openclaw_config TEXT DEFAULT '{}',
+  amf_config TEXT DEFAULT '{}',
+  status TEXT DEFAULT 'active',
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (customer_id) REFERENCES customers(id)
 );
 
--- Claw task executions
+CREATE INDEX IF NOT EXISTS idx_claws_customer ON claws(customer_id);
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- Axropus Platform Hub — Claw Task Executions
+-- ═══════════════════════════════════════════════════════════════════════════
+
 CREATE TABLE IF NOT EXISTS claw_tasks (
-    id TEXT PRIMARY KEY,
-    claw_id TEXT NOT NULL REFERENCES claws(id),
-    input TEXT,
-    output TEXT,
-    total_steps INTEGER DEFAULT 0,
-    total_tokens INTEGER DEFAULT 0,
-    tokens_saved INTEGER DEFAULT 0,
-    prefix_reuse_rate REAL DEFAULT 0,
-    total_cost_usd REAL DEFAULT 0,
-    duration_ms INTEGER DEFAULT 0,
-    status TEXT DEFAULT 'running',
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  id INTEGER PRIMARY KEY,
+  claw_id INTEGER NOT NULL,
+  task_uid TEXT UNIQUE NOT NULL,
+  prompt TEXT NOT NULL,
+  status TEXT DEFAULT 'pending',
+  result TEXT,
+  total_steps INTEGER DEFAULT 0,
+  tokens_used INTEGER DEFAULT 0,
+  tokens_saved INTEGER DEFAULT 0,
+  duration_ms INTEGER DEFAULT 0,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  completed_at TIMESTAMP,
+  FOREIGN KEY (claw_id) REFERENCES claws(id)
 );
 
--- Individual steps within a claw task
-CREATE TABLE IF NOT EXISTS claw_steps (
-    id TEXT PRIMARY KEY,
-    task_id TEXT NOT NULL REFERENCES claw_tasks(id),
-    step_number INTEGER NOT NULL,
-    input_tokens INTEGER DEFAULT 0,
-    output_tokens INTEGER DEFAULT 0,
-    amf_hit INTEGER DEFAULT 0,
-    tokens_saved INTEGER DEFAULT 0,
-    restore_ms REAL DEFAULT 0,
-    prefill_ms REAL DEFAULT 0,
-    decode_ms REAL DEFAULT 0,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- Economics / savings tracking (daily aggregates)
-CREATE TABLE IF NOT EXISTS economics_daily (
-    date TEXT NOT NULL,
-    model_id TEXT DEFAULT '__all__',
-    claw_id TEXT DEFAULT '__all__',
-    total_tokens INTEGER DEFAULT 0,
-    tokens_saved INTEGER DEFAULT 0,
-    compute_cost_usd REAL DEFAULT 0,
-    equivalent_openai_usd REAL DEFAULT 0,
-    equivalent_anthropic_usd REAL DEFAULT 0,
-    equivalent_together_usd REAL DEFAULT 0,
-    amf_hit_rate REAL DEFAULT 0,
-    avg_prefix_reuse REAL DEFAULT 0,
-    total_requests INTEGER DEFAULT 0,
-    PRIMARY KEY (date, model_id, claw_id)
-);
-
--- Request log for billing and analytics
-CREATE TABLE IF NOT EXISTS request_log (
-    id TEXT PRIMARY KEY,
-    api_key_id TEXT,
-    model_id TEXT,
-    claw_id TEXT,
-    input_tokens INTEGER DEFAULT 0,
-    output_tokens INTEGER DEFAULT 0,
-    amf_hit INTEGER DEFAULT 0,
-    tokens_saved INTEGER DEFAULT 0,
-    restore_ms REAL DEFAULT 0,
-    total_ms REAL DEFAULT 0,
-    cost_usd REAL DEFAULT 0,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- Indexes
 CREATE INDEX IF NOT EXISTS idx_claw_tasks_claw ON claw_tasks(claw_id);
+CREATE INDEX IF NOT EXISTS idx_claw_tasks_uid ON claw_tasks(task_uid);
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- Axropus Platform Hub — Individual Steps Within a Claw Task
+-- ═══════════════════════════════════════════════════════════════════════════
+
+CREATE TABLE IF NOT EXISTS claw_steps (
+  id INTEGER PRIMARY KEY,
+  task_id INTEGER NOT NULL,
+  step_number INTEGER NOT NULL,
+  action TEXT,
+  input_text TEXT,
+  output_text TEXT,
+  input_tokens INTEGER DEFAULT 0,
+  output_tokens INTEGER DEFAULT 0,
+  tokens_saved INTEGER DEFAULT 0,
+  amf_hit INTEGER DEFAULT 0,
+  duration_ms INTEGER DEFAULT 0,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (task_id) REFERENCES claw_tasks(id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_claw_steps_task ON claw_steps(task_id);
-CREATE INDEX IF NOT EXISTS idx_economics_date ON economics_daily(date);
-CREATE INDEX IF NOT EXISTS idx_request_log_created ON request_log(created_at);
-CREATE INDEX IF NOT EXISTS idx_model_deploy_status ON model_deployments(status);
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- Axropus Platform Hub — Daily Economics / Savings Aggregates
+-- ═══════════════════════════════════════════════════════════════════════════
+
+CREATE TABLE IF NOT EXISTS economics_daily (
+  id INTEGER PRIMARY KEY,
+  customer_id INTEGER NOT NULL,
+  date TEXT NOT NULL,
+  total_tokens INTEGER DEFAULT 0,
+  tokens_saved INTEGER DEFAULT 0,
+  axropus_cost_usd REAL DEFAULT 0,
+  openai_equivalent_usd REAL DEFAULT 0,
+  anthropic_equivalent_usd REAL DEFAULT 0,
+  together_equivalent_usd REAL DEFAULT 0,
+  amf_hit_rate REAL DEFAULT 0,
+  prefix_reuse_rate REAL DEFAULT 0,
+  total_requests INTEGER DEFAULT 0,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (customer_id) REFERENCES customers(id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_economics_daily_customer_date ON economics_daily(customer_id, date);
