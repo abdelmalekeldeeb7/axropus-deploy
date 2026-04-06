@@ -17,9 +17,14 @@ from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisco
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from .auth import get_current_customer
-from .db import SessionLocal, get_db
-from .models import APIKey, Customer, Deployment
+try:
+    from .auth import get_current_customer
+    from .db import SessionLocal, get_db
+    from .models import APIKey, Customer, Deployment
+except ImportError:
+    from auth import get_current_customer
+    from db import SessionLocal, get_db
+    from models import APIKey, Customer, Deployment
 
 router = APIRouter(prefix="/api/deploy", tags=["deploy"])
 

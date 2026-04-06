@@ -7,8 +7,12 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
-from .db import get_db
-from .models import APIKey, Deployment
+try:
+    from .db import get_db
+    from .models import APIKey, Deployment
+except ImportError:
+    from db import get_db
+    from models import APIKey, Deployment
 
 router = APIRouter(tags=["inference"])
 

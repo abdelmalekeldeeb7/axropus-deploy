@@ -17,9 +17,14 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from .auth import get_current_customer
-from .db import get_db
-from .models import Claw, ClawTask, ClawStep, Customer
+try:
+    from .auth import get_current_customer
+    from .db import get_db
+    from .models import Claw, ClawTask, ClawStep, Customer
+except ImportError:
+    from auth import get_current_customer
+    from db import get_db
+    from models import Claw, ClawTask, ClawStep, Customer
 
 logger = logging.getLogger(__name__)
 

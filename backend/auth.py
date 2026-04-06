@@ -10,10 +10,16 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from .config import get_settings
-from .db import get_db
-from .models import APIKey, Customer
-from .rate_limit import enforce_rate_limit
+try:
+    from .config import get_settings
+    from .db import get_db
+    from .models import APIKey, Customer
+    from .rate_limit import enforce_rate_limit
+except ImportError:
+    from config import get_settings
+    from db import get_db
+    from models import APIKey, Customer
+    from rate_limit import enforce_rate_limit
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 bearer = HTTPBearer(auto_error=False)

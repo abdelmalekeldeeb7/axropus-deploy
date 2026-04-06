@@ -19,8 +19,12 @@ from typing import Any, Optional
 
 from sqlalchemy.orm import Session
 
-from .db import SessionLocal
-from .model_registry import ModelSpec, get_model_or_raise
+try:
+    from .db import SessionLocal
+    from .model_registry import ModelSpec, get_model_or_raise
+except ImportError:
+    from db import SessionLocal
+    from model_registry import ModelSpec, get_model_or_raise
 
 logger = logging.getLogger(__name__)
 

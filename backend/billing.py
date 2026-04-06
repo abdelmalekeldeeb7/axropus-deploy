@@ -5,9 +5,14 @@ from datetime import date, datetime, timedelta, timezone
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
-from .auth import get_current_customer
-from .db import get_db
-from .models import APIKey, Customer, Invoice, Metric
+try:
+    from .auth import get_current_customer
+    from .db import get_db
+    from .models import APIKey, Customer, Invoice, Metric
+except ImportError:
+    from auth import get_current_customer
+    from db import get_db
+    from models import APIKey, Customer, Invoice, Metric
 
 router = APIRouter(prefix="/api/billing", tags=["billing"])
 

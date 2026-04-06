@@ -7,8 +7,12 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
-from .db import get_db
-from .models import APIKey, Metric
+try:
+    from .db import get_db
+    from .models import APIKey, Metric
+except ImportError:
+    from db import get_db
+    from models import APIKey, Metric
 
 router = APIRouter(prefix="/api/metrics", tags=["metrics"])
 

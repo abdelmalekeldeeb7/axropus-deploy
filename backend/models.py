@@ -3,7 +3,10 @@ from __future__ import annotations
 from sqlalchemy import Date, DateTime, ForeignKey, Integer, REAL, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from .db import Base
+try:
+    from .db import Base
+except ImportError:
+    from db import Base
 
 
 class Customer(Base):

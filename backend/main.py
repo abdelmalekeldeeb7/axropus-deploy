@@ -8,20 +8,38 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
-from .auth import router as auth_router
-from .benchmarks import router as benchmarks_router
-from .claws import router as claws_router
-from .config import get_settings
-from .db import SessionLocal, init_db
-from .billing import router as billing_router
-from .dashboard import router as dashboard_router
-from .deploy import router as deploy_router
-from .economics import router as economics_router
-from .inference import router as inference_router
-from .keys import router as keys_router
-from .metrics import router as metrics_router
-from .model_manager import model_manager
-from .model_registry import get_model, list_models, list_families
+try:
+    from .auth import router as auth_router
+    from .benchmarks import router as benchmarks_router
+    from .claws import router as claws_router
+    from .config import get_settings
+    from .db import SessionLocal, init_db
+    from .billing import router as billing_router
+    from .dashboard import router as dashboard_router
+    from .deploy import router as deploy_router
+    from .economics import router as economics_router
+    from .inference import router as inference_router
+except ImportError:
+    from auth import router as auth_router
+    from benchmarks import router as benchmarks_router
+    from claws import router as claws_router
+    from config import get_settings
+    from db import SessionLocal, init_db
+    from billing import router as billing_router
+    from dashboard import router as dashboard_router
+    from deploy import router as deploy_router
+    from economics import router as economics_router
+    from inference import router as inference_router
+try:
+    from .keys import router as keys_router
+    from .metrics import router as metrics_router
+    from .model_manager import model_manager
+    from .model_registry import get_model, list_models, list_families
+except ImportError:
+    from keys import router as keys_router
+    from metrics import router as metrics_router
+    from model_manager import model_manager
+    from model_registry import get_model, list_models, list_families
 
 
 @asynccontextmanager

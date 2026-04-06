@@ -8,10 +8,16 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from .auth import get_current_customer
-from .config import get_settings
-from .db import get_db
-from .models import APIKey, Customer
+try:
+    from .auth import get_current_customer
+    from .config import get_settings
+    from .db import get_db
+    from .models import APIKey, Customer
+except ImportError:
+    from auth import get_current_customer
+    from config import get_settings
+    from db import get_db
+    from models import APIKey, Customer
 
 router = APIRouter(prefix="/api/keys", tags=["keys"])
 
