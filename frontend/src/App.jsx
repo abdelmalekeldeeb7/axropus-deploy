@@ -2,11 +2,14 @@ import { Navigate, Route, Routes } from "react-router-dom";
 import ProtectedRoute from "./components/ProtectedRoute";
 import { useAuth } from "./context/AuthContext";
 import Billing from "./pages/Billing";
+import Claws from "./pages/Claws";
 import Configure from "./pages/Configure";
 import Dashboard from "./pages/Dashboard";
 import Demo from "./pages/Demo";
 import Deploy from "./pages/Deploy";
 import Login from "./pages/Login";
+import ModelHub from "./pages/ModelHub";
+import Playground from "./pages/Playground";
 import Settings from "./pages/Settings";
 import Signup from "./pages/Signup";
 
@@ -74,6 +77,30 @@ export default function App() {
         }
       />
       <Route
+        path="/hub"
+        element={
+          <ProtectedRoute>
+            <ModelHub />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/playground"
+        element={
+          <ProtectedRoute>
+            <Playground />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/claws"
+        element={
+          <ProtectedRoute>
+            <Claws />
+          </ProtectedRoute>
+        }
+      />
+      <Route
         path="/settings"
         element={
           <ProtectedRoute>
@@ -81,8 +108,8 @@ export default function App() {
           </ProtectedRoute>
         }
       />
-      <Route path="/" element={<Navigate to={isAuthenticated ? "/dashboard" : "/signup"} replace />} />
-      <Route path="*" element={<Navigate to={isAuthenticated ? "/dashboard" : "/signup"} replace />} />
+      <Route path="/" element={<Navigate to={isAuthenticated ? "/hub" : "/signup"} replace />} />
+      <Route path="*" element={<Navigate to={isAuthenticated ? "/hub" : "/signup"} replace />} />
     </Routes>
   );
 }
