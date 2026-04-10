@@ -35,6 +35,19 @@ from typing import Any, List, Optional, Sequence
 import torch
 
 from .turboquant_codec import CODEC_NONE, CODEC_TURBOQUANT, get_codec
+from . import amf_codec
+from .amf_codec import (
+    CODEC_FP8,
+    CodecContext,
+    apply_fp8_scales,
+    get_codec_by_id,
+    is_v2_file,
+    pack_v2_header,
+    parse_fp8_sidecar,
+    tag_to_dtype as _tag_to_dtype_v2,
+    unpack_v2_header,
+    AMF2_HEADER_SIZE,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -704,6 +717,11 @@ class AmfKvManager:
             self._misses += 1
             return 0
 
+        # ── v2 dispatch: AMF2 magic routes to the codec-aware restore ────────
+        if is_v2_file(blob):
+            result = self._restore_v2(blob, block_table, t0)
+            return result
+
         # Parse header.
         (
             magic, version, n_layers_snap, n_tokens,
@@ -974,6 +992,391 @@ class AmfKvManager:
                 v_all.copy_(v_flat.reshape_as(v_all))
 
         return entry.n_tokens
+
+    # ── v2 save (codec-aware) ─────────────────────────────────────────────────
+
+    def save_kv_state_v2(
+        self,
+        prompt_tokens: Sequence[int],
+        block_table: List[int],
+        *,
+        codec_id: int,
+        sidecar_scales: Optional[dict] = None,
+        model_runner: Any = None,
+    ) -> bool:
+        """Save KV cache using the v2 format with codec + sidecar support.
+
+        This method is additive — it does NOT replace save_kv_state. The
+        v1 path remains byte-for-byte identical for raw / TurboQuant codecs.
+        Only codecs that need metadata (FP8 scales, INT4 scales/zeros) use
+        this path.
+
+        Args:
+            prompt_tokens:   Full prompt token IDs.
+            block_table:     Physical block IDs for this sequence.
+            codec_id:        Codec to use for encoding (see amf_codec).
+            sidecar_scales:  Optional pre-captured scales dict (FP8).
+            model_runner:    Optional model runner ref for codecs that need
+                             to walk attention layers.
+
+        Returns True on success.
+        """
+        t0 = time.monotonic()
+        key = self.compute_amf_key(prompt_tokens)
+        kv_path = self._kv_filename(key)
+
+        gpu_cache = self._cache_engine.gpu_cache
+        n_layers = len(gpu_cache)
+        if n_layers == 0:
+            logger.warning("[AMF_VLLM] save_v2: no GPU cache layers")
+            return False
+
+        n_tokens = len(prompt_tokens)
+
+        # Determine shapes (same as v1 path).
+        sample_layer = gpu_cache[0]
+        if sample_layer.dim() == 5 and sample_layer.shape[0] == 2:
+            k_sample = sample_layer[0]
+        else:
+            k_sample = sample_layer
+        block_shape = k_sample.shape[1:]
+        n_kv_heads = block_shape[-2] if len(block_shape) >= 2 else 1
+        head_dim = block_shape[-1]
+        kv_dtype = k_sample.dtype
+        elem_size = k_sample.element_size()
+
+        n_seq_blocks = len(block_table) if block_table else k_sample.shape[0]
+        seq_block_shape = (n_seq_blocks, *block_shape)
+        per_kv_bytes = 1
+        for d in seq_block_shape:
+            per_kv_bytes *= d
+        per_kv_bytes *= elem_size
+
+        layer_infos: List[tuple] = []
+        total_kv_bytes = 0
+        for _ in range(n_layers):
+            k_off = total_kv_bytes
+            v_off = k_off + per_kv_bytes
+            layer_infos.append((k_off, per_kv_bytes, v_off, per_kv_bytes))
+            total_kv_bytes += 2 * per_kv_bytes
+
+        # Gather KV into a single pinned buffer (same as v1).
+        _pin = torch.cuda.is_available()
+        pinned_buf = torch.empty(
+            total_kv_bytes // elem_size,
+            dtype=kv_dtype,
+            device="cpu",
+            pin_memory=_pin,
+        )
+        block_ids_gpu = (
+            torch.tensor(block_table, device=k_sample.device, dtype=torch.long)
+            if block_table else None
+        )
+        CHUNK = 256
+
+        for layer_idx, layer_cache in enumerate(gpu_cache):
+            if layer_cache.dim() == 5 and layer_cache.shape[0] == 2:
+                k_all = layer_cache[0]
+                v_all = layer_cache[1]
+            else:
+                k_all = layer_cache
+                v_all = layer_cache
+
+            k_off, _, v_off, _ = layer_infos[layer_idx]
+            k_elem_off = k_off // elem_size
+            v_elem_off = v_off // elem_size
+            block_elems = 1
+            for d in block_shape:
+                block_elems *= d
+
+            if block_ids_gpu is not None:
+                for start in range(0, n_seq_blocks, CHUNK):
+                    end = min(start + CHUNK, n_seq_blocks)
+                    chunk_ids = block_ids_gpu[start:end]
+                    chunk_len = end - start
+                    chunk_shape = (chunk_len, *block_shape)
+                    k_chunk = k_all[chunk_ids].contiguous()
+                    v_chunk = v_all[chunk_ids].contiguous()
+                    dst_off = k_elem_off + start * block_elems
+                    k_dst = torch.empty(
+                        chunk_shape, dtype=kv_dtype, device="cpu",
+                    ).set_(pinned_buf.untyped_storage(), dst_off, chunk_shape)
+                    k_dst.copy_(k_chunk, non_blocking=True)
+                    dst_off = v_elem_off + start * block_elems
+                    v_dst = torch.empty(
+                        chunk_shape, dtype=kv_dtype, device="cpu",
+                    ).set_(pinned_buf.untyped_storage(), dst_off, chunk_shape)
+                    v_dst.copy_(v_chunk, non_blocking=True)
+                    torch.cuda.current_stream().synchronize()
+                    del k_chunk, v_chunk
+
+        if _pin:
+            torch.cuda.current_stream().synchronize()
+
+        # ── Materialize raw bytes and run them through the codec ─────────────
+        import ctypes
+        storage = pinned_buf.untyped_storage()
+        raw_buf = (ctypes.c_char * storage.nbytes()).from_address(storage.data_ptr())
+        # We need to pass bytes to codec.encode — but for raw/fp8 this is a
+        # no-op so we can avoid the copy by using the ctypes buffer directly
+        # on disk write path. For codecs that actually transform, we do copy.
+
+        codec = get_codec_by_id(codec_id)
+        ctx = CodecContext(
+            n_layers=n_layers,
+            n_kv_heads=n_kv_heads,
+            head_dim=head_dim,
+            block_size=block_shape[0] if len(block_shape) >= 1 else 16,
+            kv_dtype=kv_dtype,
+            scales=sidecar_scales,
+            model_runner=model_runner,
+        )
+
+        # Raw-like codecs (FP8 included — payload is the original bytes,
+        # only the sidecar is different) don't need to copy the pinned buffer
+        # through Python bytes. We handle the sidecar and write the payload
+        # directly from the ctypes buffer.
+        if codec_id in (CODEC_NONE, CODEC_FP8):
+            # Encode just to get the sidecar — payload is empty placeholder.
+            blob = codec.encode(b"", ctx)
+            sidecar_bytes = blob.sidecar
+            payload_bytes_len = total_kv_bytes
+            use_direct_write = True
+        else:
+            # Generic codec path: copy payload into Python bytes first.
+            raw_payload = bytes(raw_buf[:total_kv_bytes])
+            blob = codec.encode(raw_payload, ctx)
+            sidecar_bytes = blob.sidecar
+            payload_bytes_len = len(blob.payload)
+            use_direct_write = False
+
+        # ── Pack v2 header ───────────────────────────────────────────────────
+        dtype_tag_val = amf_codec.dtype_tag(kv_dtype)
+        header = pack_v2_header(
+            codec_id=codec_id,
+            n_layers=n_layers,
+            n_tokens=n_tokens,
+            n_kv_heads=n_kv_heads,
+            head_dim=head_dim,
+            dtype_tag_val=dtype_tag_val,
+            total_kv_bytes=total_kv_bytes,
+            payload_bytes=payload_bytes_len,
+            sidecar_bytes=len(sidecar_bytes),
+            model_hash=key["model_hash"],
+            prefix_hash=key["prefix_hash"],
+        )
+
+        # Layer info table (same format as v1)
+        layer_tbl = b""
+        for k_off, k_sz, v_off, v_sz in layer_infos:
+            layer_tbl += struct.pack(_LAYER_FMT, k_off, k_sz, v_off, v_sz)
+
+        # Write atomically via temp file.
+        tmp_path = kv_path.with_suffix(".kv.tmp")
+        try:
+            with open(tmp_path, "wb") as f:
+                f.write(header)
+                f.write(layer_tbl)
+                f.write(sidecar_bytes)
+                if use_direct_write:
+                    f.write(raw_buf[:payload_bytes_len])
+                else:
+                    f.write(blob.payload)
+            tmp_path.rename(kv_path)
+        except OSError as exc:
+            logger.warning("[AMF_VLLM] save_v2: write failed: %s", exc)
+            tmp_path.unlink(missing_ok=True)
+            return False
+
+        # Token file (same format as v1).
+        tok_bytes = struct.pack(f"<{n_tokens}i", *prompt_tokens)
+        tok_path = self._tok_filename(key)
+        try:
+            tok_path.write_bytes(tok_bytes)
+        except OSError as exc:
+            logger.warning("[AMF_VLLM] save_v2: tok write failed: %s", exc)
+
+        elapsed_ms = (time.monotonic() - t0) * 1000.0
+        self._saves += 1
+        logger.info(
+            "[AMF_VLLM] save_v2(codec=%s): %d layers, %d tokens, "
+            "%.1f MB payload + %d B sidecar in %.0f ms",
+            amf_codec.CODEC_NAMES.get(codec_id, "?"),
+            n_layers, n_tokens,
+            payload_bytes_len / (1024 * 1024),
+            len(sidecar_bytes),
+            elapsed_ms,
+        )
+        return True
+
+    # ── v2 restore (codec-aware) ──────────────────────────────────────────────
+
+    def _restore_v2(
+        self,
+        blob: bytes,
+        block_table: List[int],
+        t0: float,
+    ) -> int:
+        """Parse an AMF2 v2 file and restore KV + apply codec sidecar.
+
+        Args:
+            blob:         Full file contents already read into memory.
+            block_table:  Physical block IDs to scatter into.
+            t0:           Start time from the caller (for timing logs).
+
+        Returns number of tokens restored, or 0 on failure.
+        """
+        try:
+            hdr = unpack_v2_header(blob)
+        except ValueError as exc:
+            logger.warning("[AMF_VLLM] restore_v2: header parse failed: %s", exc)
+            self._misses += 1
+            return 0
+
+        codec_id       = hdr["codec_id"]
+        n_layers_snap  = hdr["n_layers"]
+        n_tokens       = hdr["n_tokens"]
+        n_kv_heads     = hdr["n_kv_heads"]
+        head_dim       = hdr["head_dim"]
+        dtype_tag      = hdr["dtype_tag"]
+        total_kv_bytes = hdr["total_kv_bytes"]
+        payload_bytes  = hdr["payload_bytes"]
+        sidecar_bytes  = hdr["sidecar_bytes"]
+
+        gpu_cache = self._cache_engine.gpu_cache
+        n_layers_ctx = len(gpu_cache)
+
+        if n_layers_snap != n_layers_ctx:
+            logger.warning(
+                "[AMF_VLLM] restore_v2: layer count mismatch (snap=%d, ctx=%d)",
+                n_layers_snap, n_layers_ctx,
+            )
+            self._misses += 1
+            return 0
+
+        # Parse layer info table.
+        layer_tbl_off   = AMF2_HEADER_SIZE
+        layer_tbl_bytes = n_layers_snap * _LAYER_SIZE
+        sidecar_off     = layer_tbl_off + layer_tbl_bytes
+        payload_off     = sidecar_off + sidecar_bytes
+
+        if len(blob) < payload_off + payload_bytes:
+            logger.warning(
+                "[AMF_VLLM] restore_v2: blob truncated (%d < %d)",
+                len(blob), payload_off + payload_bytes,
+            )
+            self._misses += 1
+            return 0
+
+        layer_infos: List[tuple] = []
+        for i in range(n_layers_snap):
+            off = layer_tbl_off + i * _LAYER_SIZE
+            layer_infos.append(struct.unpack_from(_LAYER_FMT, blob, off))
+
+        sidecar = blob[sidecar_off : sidecar_off + sidecar_bytes]
+        payload = blob[payload_off : payload_off + payload_bytes]
+
+        snap_dtype = _tag_to_dtype_v2(dtype_tag)
+
+        # ── Codec decode (for raw/fp8 this is a no-op on bytes) ──────────────
+        ctx = CodecContext(
+            n_layers=n_layers_snap,
+            n_kv_heads=n_kv_heads,
+            head_dim=head_dim,
+            block_size=0,
+            kv_dtype=snap_dtype,
+        )
+        codec = get_codec_by_id(codec_id)
+        kv_payload = codec.decode(payload, sidecar, ctx)
+
+        # Stash the sidecar on the manager so the worker extension can apply
+        # FP8 scales back to the model (see apply_sidecar).
+        self._last_restore_sidecar = sidecar
+        self._last_restore_codec_id = codec_id
+
+        # ── Scatter raw KV bytes into gpu_cache (same logic as v1) ───────────
+        for layer_idx, (layer_cache, (k_off, k_sz, v_off, v_sz)) in enumerate(
+            zip(gpu_cache, layer_infos)
+        ):
+            if k_sz == 0 and v_sz == 0:
+                continue
+
+            cache_dtype = layer_cache.dtype
+
+            if layer_cache.dim() == 5 and layer_cache.shape[0] == 2:
+                k_all = layer_cache[0]
+                v_all = layer_cache[1]
+            else:
+                k_all = layer_cache
+                v_all = layer_cache
+
+            # Use uint8 view for FP8 (frombuffer may not support fp8 directly)
+            _use_view = (hasattr(torch, "float8_e4m3fn") and
+                         cache_dtype in (torch.float8_e4m3fn,
+                                          getattr(torch, "float8_e5m2", None)))
+            _buf_dtype = torch.uint8 if _use_view else cache_dtype
+
+            k_flat = torch.frombuffer(
+                bytearray(kv_payload[k_off : k_off + k_sz]), dtype=_buf_dtype
+            )
+            v_flat = torch.frombuffer(
+                bytearray(kv_payload[v_off : v_off + v_sz]), dtype=_buf_dtype
+            )
+            if _use_view:
+                k_flat = k_flat.view(cache_dtype)
+                v_flat = v_flat.view(cache_dtype)
+
+            if block_table:
+                n_blocks_restore = len(block_table)
+                target_shape = (n_blocks_restore, *k_all.shape[1:])
+                k_src = k_flat.reshape(target_shape)
+                v_src = v_flat.reshape(target_shape)
+                block_ids = torch.tensor(block_table, device=k_all.device, dtype=torch.long)
+                _RC = 256
+                for _rs in range(0, n_blocks_restore, _RC):
+                    _re = min(_rs + _RC, n_blocks_restore)
+                    k_all[block_ids[_rs:_re]] = k_src[_rs:_re].to(k_all.device)
+                    v_all[block_ids[_rs:_re]] = v_src[_rs:_re].to(v_all.device)
+            else:
+                k_src = k_flat.reshape_as(k_all).to(k_all.device)
+                v_src = v_flat.reshape_as(v_all).to(v_all.device)
+                k_all.copy_(k_src)
+                v_all.copy_(v_src)
+
+        elapsed_ms = (time.monotonic() - t0) * 1000.0
+        self._hits += 1
+        self._restore_ms = elapsed_ms
+        logger.info(
+            "[AMF_VLLM] restore_v2(codec=%s): %d layers, %d tokens, %.1f ms",
+            amf_codec.CODEC_NAMES.get(codec_id, "?"),
+            n_layers_ctx, n_tokens, elapsed_ms,
+        )
+        return int(n_tokens)
+
+    def apply_restore_sidecar(self, model_runner: Any) -> bool:
+        """Apply any pending FP8 scale sidecar from the last restore_v2 call.
+
+        Called by the worker extension after a successful restore_v2. Walks
+        the model's attention layers and fills in ``_k_scale``/``_v_scale``/
+        ``calculate_kv_scales = False``. No-op for codecs without a sidecar.
+
+        Returns True if a sidecar was applied.
+        """
+        sidecar = getattr(self, "_last_restore_sidecar", None)
+        codec_id = getattr(self, "_last_restore_codec_id", CODEC_NONE)
+        if not sidecar or codec_id != CODEC_FP8:
+            return False
+
+        scales = parse_fp8_sidecar(sidecar)
+        if not scales:
+            return False
+
+        n_applied = apply_fp8_scales(model_runner, scales)
+        logger.info("[AMF_VLLM] apply_restore_sidecar: %d layers", n_applied)
+        # Clear after applying so subsequent restores don't re-apply stale data
+        self._last_restore_sidecar = None
+        self._last_restore_codec_id = CODEC_NONE
+        return n_applied > 0
 
     # ── Stats ─────────────────────────────────────────────────────────────────
 

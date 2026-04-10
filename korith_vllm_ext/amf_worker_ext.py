@@ -227,3 +227,152 @@ class AmfWorkerExtension:
                         param = getattr(module, attr)
                         if isinstance(param, torch.Tensor) and param.item() == 0.0:
                             param.fill_(1.0)
+
+    # ── v2 codec-aware save/restore ──────────────────────────────────────────
+
+    def amf_save_kv_v2(
+        self: Any,
+        amf_store_path: str,
+        prompt_tokens: list,
+        model_hash: int = 0,
+        tenant_id: str = "__shared__",
+        codec: str = "raw",
+        physical_block_ids: list | None = None,
+    ) -> dict:
+        """Codec-aware save. For codec='fp8' captures attention layer scales
+        into the sidecar so they can be restored byte-perfectly.
+
+        The v1 ``amf_save_kv`` method is unchanged — this is an additive API.
+
+        Args:
+            codec: one of 'raw', 'fp8', 'int4', 'polarquant', 'qjl'.
+                   'turboquant' still routes through the v1 path via the
+                   KORITH_KV_COMPRESSION env var.
+            physical_block_ids: actual physical blocks to save.
+        """
+        from .amf_codec import (
+            CODEC_NONE, CODEC_FP8, get_codec_by_name, capture_fp8_scales,
+        )
+
+        kv_caches = self.model_runner.kv_caches
+        if not kv_caches:
+            return {"saved": False, "n_layers": 0, "n_tokens": 0}
+
+        mgr, proxy = self._get_amf_manager(amf_store_path, model_hash, tenant_id)
+        if not proxy.gpu_cache:
+            return {"saved": False, "n_layers": 0, "n_tokens": 0}
+
+        if physical_block_ids is not None and len(physical_block_ids) > 0:
+            block_table = list(physical_block_ids)
+        else:
+            block_table = _get_block_size_and_table(
+                proxy.gpu_cache, len(prompt_tokens)
+            )
+
+        t = proxy.gpu_cache[0]
+        block_size = t.shape[2] if t.dim() == 5 else 16
+
+        # Capture FP8 scales BEFORE save if needed.
+        codec_obj = get_codec_by_name(codec)
+        scales = None
+        if codec_obj.id == CODEC_FP8:
+            scales = capture_fp8_scales(self.model_runner)
+
+        saved = mgr.save_kv_state_v2(
+            prompt_tokens,
+            block_table=block_table,
+            codec_id=codec_obj.id,
+            sidecar_scales=scales,
+            model_runner=self.model_runner,
+        )
+
+        return {
+            "saved": saved,
+            "n_layers": len(proxy.gpu_cache),
+            "n_tokens": len(prompt_tokens),
+            "block_size": block_size,
+            "n_blocks": len(block_table),
+            "block_ids": block_table,
+            "codec": codec,
+            "n_scales": len(scales) if scales else 0,
+        }
+
+    def amf_restore_kv_v2(
+        self: Any,
+        amf_store_path: str,
+        prompt_tokens: list,
+        model_hash: int = 0,
+        tenant_id: str = "__shared__",
+    ) -> int:
+        """Codec-aware restore. Applies FP8 scale sidecar back to attention
+        layers after scattering the KV bytes, and locks calculate_kv_scales
+        so vLLM does not recompute scales on the warm batch's first forward.
+        """
+        kv_caches = self.model_runner.kv_caches
+        if not kv_caches:
+            return 0
+
+        mgr, proxy = self._get_amf_manager(amf_store_path, model_hash, tenant_id)
+        if not proxy.gpu_cache:
+            return 0
+
+        block_table = _get_block_size_and_table(proxy.gpu_cache, len(prompt_tokens))
+
+        # Route through the existing restore path which dispatches on magic.
+        n_restored = mgr.restore_kv_state(prompt_tokens, block_table=block_table)
+        if n_restored <= 0:
+            return n_restored
+
+        # Apply any FP8 sidecar captured during restore_v2.
+        torch.cuda.synchronize()
+        try:
+            mgr.apply_restore_sidecar(self.model_runner)
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning(
+                "[AMF_WORKER] apply_restore_sidecar failed: %s", exc
+            )
+
+        return n_restored
+
+    # ── Diagnostic: snapshot attention scales for fp8_diagnostic.py ──────────
+
+    def amf_diag_snapshot(self: Any, label: str = "") -> dict:
+        """Return a dict of attention layer scale values for diagnostics.
+
+        Walks ``self.model_runner.model.named_modules()`` and captures
+        ``_k_scale``, ``_v_scale``, ``_q_scale``, ``_prob_scale``, plus their
+        ``*_float`` counterparts and ``calculate_kv_scales`` flag.
+        """
+        if not hasattr(self, "model_runner") or self.model_runner is None:
+            return {"error": "no model_runner", "label": label}
+
+        result: dict = {"label": label, "layers": {}}
+        layer_idx = 0
+        for name, module in self.model_runner.model.named_modules():
+            if not any(hasattr(module, a) for a in ("_k_scale", "k_scale")):
+                continue
+            entry: dict = {"name": name}
+            for attr in (
+                "_k_scale", "_v_scale", "_q_scale", "_prob_scale",
+                "_k_scale_float", "_v_scale_float", "_q_scale_float",
+                "calculate_kv_scales",
+            ):
+                if hasattr(module, attr):
+                    val = getattr(module, attr)
+                    if isinstance(val, torch.Tensor):
+                        try:
+                            entry[attr] = float(val.item())
+                        except Exception:
+                            entry[attr] = "tensor"
+                    elif isinstance(val, bool):
+                        entry[attr] = val
+                    else:
+                        try:
+                            entry[attr] = float(val)
+                        except Exception:
+                            entry[attr] = str(val)
+            result["layers"][f"L{layer_idx}"] = entry
+            layer_idx += 1
+        result["n_layers"] = layer_idx
+        return result
