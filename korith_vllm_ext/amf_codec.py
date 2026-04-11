@@ -484,3 +484,60 @@ def is_v2_file(blob: bytes) -> bool:
 # Public v2 constants for consumers
 AMF2_HEADER_SIZE = _AMF2_HEADER_SIZE
 AMF2_MAGIC       = _AMF2_MAGIC
+
+
+# ── LMCache promotion helper ─────────────────────────────────────────────────
+
+def promote_from_raw_kv(
+    raw_kv: "torch.Tensor",
+    *,
+    codec_id: int = CODEC_NONE,
+    ctx: Optional[CodecContext] = None,
+) -> "EncodedBlob":
+    """Encode a raw KV tensor (e.g. freshly fetched from LMCache) with a codec.
+
+    This is the glue that lets the TieredCacheRouter turn an LMCache hit
+    (which returns a raw KV tensor) into a format the Axropus compressed
+    pool can store. For ``codec_id=CODEC_NONE`` this is effectively a
+    no-op; for FP8 / INT4 it runs the same encoder path used by the
+    AMF v2 save pipeline so the promoted entry is byte-compatible with
+    a v2 on-disk snapshot.
+
+    Args:
+        raw_kv:   Raw KV tensor returned by the fallback tier.
+        codec_id: Target codec (defaults to raw).
+        ctx:      Optional CodecContext — scales, n_layers, etc. Will be
+                  auto-populated with sensible defaults if omitted.
+
+    Returns an ``EncodedBlob`` ready for storage.
+    """
+    codec = get_codec_by_id(codec_id)
+    if ctx is None:
+        # Best-effort defaults inferred from the tensor shape.
+        shape = tuple(raw_kv.shape)
+        n_layers   = shape[0] if len(shape) >= 5 else 1
+        n_kv_heads = shape[-2] if len(shape) >= 2 else 1
+        head_dim   = shape[-1] if shape else 0
+        ctx = CodecContext(
+            n_layers=n_layers,
+            n_kv_heads=n_kv_heads,
+            head_dim=head_dim,
+            block_size=0,
+            kv_dtype=raw_kv.dtype,
+        )
+
+    # Serialize to bytes via a contiguous CPU copy. Codecs that don't
+    # actually transform bytes (raw, fp8) won't re-copy the payload.
+    if raw_kv.is_cuda:
+        cpu = raw_kv.detach().contiguous().cpu()
+    else:
+        cpu = raw_kv.detach().contiguous()
+
+    # FP8 dtypes can't go through .numpy().tobytes() — use the underlying
+    # storage bytes instead.
+    try:
+        payload = bytes(cpu.untyped_storage())
+    except Exception:
+        payload = cpu.numpy().tobytes()
+
+    return codec.encode(payload, ctx)

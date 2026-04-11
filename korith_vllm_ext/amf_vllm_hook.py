@@ -50,6 +50,10 @@ class AmfEngineHook:
         vram_cache_gb: VRAM budget for compressed KV snapshots (0 = disabled).
         model_hash:    Pre-computed model file hash (0 = skip).
         tenant_id:     Tenant string for multi-tenant isolation.
+        tiered_router: Optional ``TieredCacheRouter`` that wires an
+                       LMCache fallback tier below the AMF compressed pool.
+                       When provided, AMF misses flow through LMCache
+                       before falling back to a cold prefill.
     """
 
     def __init__(
@@ -60,9 +64,11 @@ class AmfEngineHook:
         vram_cache_gb: float = 0.0,
         model_hash: int = 0,
         tenant_id: str = "__shared__",
+        tiered_router: Optional[Any] = None,
     ) -> None:
         self._engine = engine
         self._amf: Optional[Any] = None  # AmfKvManager, lazy-init after engine ready
+        self._tiered_router: Optional[Any] = tiered_router
 
         self._amf_store     = amf_store
         self._vram_cache_gb = vram_cache_gb
@@ -73,6 +79,7 @@ class AmfEngineHook:
         self._cold:   int = 0
         self._hits:   int = 0
         self._vram_hits: int = 0
+        self._lmcache_hits: int = 0
 
         # Env overrides from KORITH_* vars
         os.environ.setdefault("KORITH_KV_COMPRESSION",      "turboquant")
@@ -80,6 +87,29 @@ class AmfEngineHook:
         if vram_cache_gb > 0:
             os.environ["KORITH_VRAM_CACHE_GB"]     = str(vram_cache_gb)
             os.environ["KORITH_VRAM_CACHE_DEVICE"] = "cuda:0"
+
+        # Lazy-construct a TieredCacheRouter if the LMCache flag is set
+        # and the caller didn't pass one in. The router is optional —
+        # without it the hook behaves exactly like before.
+        if (self._tiered_router is None
+                and os.environ.get("AXROPUS_LMCACHE_FALLBACK", "").lower()
+                in ("1", "true", "yes", "on")):
+            try:
+                from .tiered_router import TieredCacheRouter
+                from .lmcache_adapter import LMCacheAdapter
+                # Router will resolve amf_pool lazily via the AmfKvManager
+                # on first lookup — defer construction until _get_amf().
+                self._lazy_router_cls = TieredCacheRouter
+                self._lazy_lmcache_cls = LMCacheAdapter
+            except Exception as exc:
+                logger.warning(
+                    "[AMF_HOOK] tiered router deferred init failed: %s", exc
+                )
+                self._lazy_router_cls = None
+                self._lazy_lmcache_cls = None
+        else:
+            self._lazy_router_cls = None
+            self._lazy_lmcache_cls = None
 
     # ── Lazy AmfKvManager init ─────────────────────────────────────────────────
 
@@ -111,7 +141,44 @@ class AmfEngineHook:
             "[AMF_HOOK] AmfKvManager ready — store=%s vram_cache_gb=%.0f",
             self._amf_store, self._vram_cache_gb,
         )
+
+        # If LMCache fallback was enabled via env at construction time
+        # and the caller didn't inject a router, construct one now that
+        # the AMF manager (and its VRAM pool) is available.
+        if (self._tiered_router is None
+                and self._lazy_router_cls is not None):
+            try:
+                amf_pool = getattr(self._amf, "_vram_cache", None)
+                if amf_pool is not None:
+                    lmcache = self._lazy_lmcache_cls(
+                        config_path=os.environ.get("LMCACHE_CONFIG_PATH")
+                    )
+                    self._tiered_router = self._lazy_router_cls(
+                        amf_pool=amf_pool,
+                        lmcache=lmcache if lmcache.available else None,
+                    )
+                    logger.info(
+                        "[AMF_HOOK] TieredCacheRouter attached: %s",
+                        self._tiered_router.config(),
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "[AMF_HOOK] TieredCacheRouter attach failed: %s", exc
+                )
+
         return self._amf
+
+    # ── Tiered router lookup ──────────────────────────────────────────────────
+
+    def _router_prefix_hash(self, prompt_tokens: Sequence[int]) -> str:
+        """Compute a stable string hash for the TieredCacheRouter key space.
+
+        The router uses string keys (SHA256 or similar) for prefix lookup;
+        we derive a 64-bit FNV-1a hash from the prompt tokens (matching
+        the C++ amf_hash_tokens implementation) and hex-encode it.
+        """
+        from .amf_kv_manager import amf_hash_tokens
+        return f"{amf_hash_tokens(tuple(prompt_tokens)):016x}"
 
     # ── Core generate with AMF ─────────────────────────────────────────────────
 
@@ -137,12 +204,36 @@ class AmfEngineHook:
                 amf, prompt_tokens, sampling_params, request_id, t0
             ):
                 yield output
-        else:
-            # ── Cold path: normal prefill then save ───────────────────────────
-            async for output in self._generate_cold(
-                amf, prompt_tokens, sampling_params, request_id, t0
-            ):
-                yield output
+            return
+
+        # ── G3+ fallback tier: ask the tiered router before going cold ──────
+        # If a TieredCacheRouter is configured and reports a hit from
+        # LMCache (or any future fallback tier), that hit is promoted into
+        # the AMF compressed pool and we re-enter the restore path. This
+        # keeps AMF as the G1 tier — LMCache hits pay once, the next call
+        # is warm from VRAM.
+        if self._tiered_router is not None:
+            try:
+                pfx_hash = self._router_prefix_hash(prompt_tokens)
+                _, source = self._tiered_router.lookup(pfx_hash, list(prompt_tokens))
+                if source == "lmcache":
+                    # Promotion already happened inside the router. Re-check
+                    # the AMF snapshot and re-enter the hot path.
+                    self._lmcache_hits += 1
+                    if amf.has_snapshot(prompt_tokens):
+                        async for output in self._generate_with_restore(
+                            amf, prompt_tokens, sampling_params, request_id, t0
+                        ):
+                            yield output
+                        return
+            except Exception as exc:
+                logger.debug("[AMF_HOOK] tiered router lookup failed: %s", exc)
+
+        # ── Cold path: normal prefill then save ───────────────────────────
+        async for output in self._generate_cold(
+            amf, prompt_tokens, sampling_params, request_id, t0
+        ):
+            yield output
 
     async def _generate_with_restore(
         self,
@@ -232,9 +323,20 @@ class AmfEngineHook:
     # ── Stats ──────────────────────────────────────────────────────────────────
 
     def stats(self) -> dict:
-        base = {"cold": self._cold, "hits": self._hits, "vram_hits": self._vram_hits}
+        base = {
+            "cold":         self._cold,
+            "hits":         self._hits,
+            "vram_hits":    self._vram_hits,
+            "lmcache_hits": self._lmcache_hits,
+        }
         if self._amf:
             base["amf"] = self._amf.stats()
+        if self._tiered_router is not None:
+            try:
+                base["tiered"] = self._tiered_router.hit_rate()
+                base["tiered_config"] = self._tiered_router.config()
+            except Exception:
+                pass
         return base
 
 

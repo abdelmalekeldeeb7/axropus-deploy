@@ -521,6 +521,188 @@ class CompressedVRAMPool:
 
     # ── Management ────────────────────────────────────────────────────────────
 
+    def insert_from_raw(
+        self,
+        key: str,
+        raw_kv: torch.Tensor,
+        n_tokens: int,
+        *,
+        orig_dtype: Optional[torch.dtype] = None,
+    ) -> bool:
+        """Insert a raw (uncompressed) KV tensor from a fallback tier (LMCache).
+
+        Used by the TieredCacheRouter to promote LMCache hits into the
+        compressed pool so the NEXT lookup is a G1 (warm) hit instead of
+        going back through CPU/NVMe. The raw tensor is run through the
+        same quantization path as ``put()``.
+
+        Accepted shapes (inferred automatically):
+          * ``[n_layers, 2, n_blocks, block_size, n_kv_heads, head_dim]``
+            — LMCache's "stacked" layout
+          * ``[n_layers, 2, n_tokens, n_kv_heads, head_dim]``
+            — LMCache's "per-token" layout (reshape to blocks)
+          * ``[n_blocks, block_size, n_kv_heads, head_dim]``
+            — single-layer probe (testing / benchmarks)
+
+        Args:
+            key:         Prefix hash to insert under.
+            raw_kv:      Raw KV tensor on GPU (or CPU — will be moved).
+            n_tokens:    Number of tokens in the prefix.
+            orig_dtype:  Optional override for the "original" dtype to
+                         store on the entry (defaults to raw_kv.dtype).
+
+        Returns ``True`` on successful insertion.
+        """
+        t0 = time.monotonic()
+
+        if raw_kv is None or raw_kv.numel() == 0:
+            return False
+
+        # Move to the pool's device if needed.
+        if str(raw_kv.device) != str(self._device):
+            try:
+                raw_kv = raw_kv.to(self._device)
+            except Exception as exc:
+                logger.warning(
+                    "[VRAM_POOL] insert_from_raw: to(%s) failed: %s",
+                    self._device, exc,
+                )
+                return False
+
+        effective_dtype = orig_dtype if orig_dtype is not None else raw_kv.dtype
+
+        # ── Infer layout ──────────────────────────────────────────────────
+        # We need per-layer (k_seq, v_seq) pairs to feed the quantizer.
+        layers_kv: List[tuple] = []
+        block_shape: tuple = ()
+
+        if raw_kv.dim() >= 5 and raw_kv.shape[1] == 2:
+            # Stacked per-layer: [L, 2, n_blocks, block_size, n_kv_heads, head_dim]
+            # or [L, 2, n_tokens, n_kv_heads, head_dim]
+            n_layers = raw_kv.shape[0]
+            for L in range(n_layers):
+                k = raw_kv[L, 0]
+                v = raw_kv[L, 1]
+                layers_kv.append((k, v))
+            block_shape = tuple(layers_kv[0][0].shape[1:]) if layers_kv else ()
+        elif raw_kv.dim() == 6 and raw_kv.shape[1] == 2:
+            # [L, 2, n_blocks, block_size, n_kv_heads, head_dim] — explicit
+            n_layers = raw_kv.shape[0]
+            for L in range(n_layers):
+                layers_kv.append((raw_kv[L, 0], raw_kv[L, 1]))
+            block_shape = tuple(raw_kv.shape[3:])
+        elif raw_kv.dim() == 4:
+            # Single layer, block-shaped: [n_blocks, block_size, n_kv_heads, head_dim]
+            layers_kv.append((raw_kv, raw_kv))
+            block_shape = tuple(raw_kv.shape[1:])
+        else:
+            logger.warning(
+                "[VRAM_POOL] insert_from_raw: unsupported tensor shape %s",
+                tuple(raw_kv.shape),
+            )
+            return False
+
+        n_layers = len(layers_kv)
+        n_blocks = layers_kv[0][0].shape[0] if layers_kv else 0
+
+        # ── Quantize each layer ──────────────────────────────────────────
+        _fp8_types = set()
+        if hasattr(torch, "float8_e4m3fn"):
+            _fp8_types.add(torch.float8_e4m3fn)
+        if hasattr(torch, "float8_e5m2"):
+            _fp8_types.add(torch.float8_e5m2)
+        is_compressed = (
+            effective_dtype in _fp8_types
+            or effective_dtype == torch.int8
+            or effective_dtype == torch.uint8
+            or effective_dtype.itemsize == 1
+        )
+        effective_quant = "raw" if is_compressed else self._quant_mode
+
+        compressed_layers: List[_CompressedLayer] = []
+        total_bytes = 0
+
+        for k_seq, v_seq in layers_kv:
+            if effective_quant == "raw":
+                cl = _CompressedLayer(k_data=k_seq.contiguous().clone(),
+                                       v_data=v_seq.contiguous().clone())
+                total_bytes += k_seq.nbytes + v_seq.nbytes
+            elif effective_quant == QUANT_FP8:
+                k_q, k_scale = self._quantize_fp8(k_seq)
+                v_q, v_scale = self._quantize_fp8(v_seq)
+                cl = _CompressedLayer(
+                    k_data=k_q, v_data=v_q,
+                    k_scale=k_scale, v_scale=v_scale,
+                )
+                total_bytes += (k_q.nbytes + v_q.nbytes
+                                + k_scale.nbytes + v_scale.nbytes)
+            elif effective_quant == QUANT_INT4:
+                k_packed, k_scale, k_zero = self._quantize_int4(k_seq)
+                v_packed, v_scale, v_zero = self._quantize_int4(v_seq)
+                cl = _CompressedLayer(
+                    k_data=k_packed, v_data=v_packed,
+                    k_scale=k_scale, v_scale=v_scale,
+                    k_zero=k_zero, v_zero=v_zero,
+                )
+                total_bytes += (k_packed.nbytes + v_packed.nbytes
+                                + k_scale.nbytes + v_scale.nbytes
+                                + k_zero.nbytes + v_zero.nbytes)
+            elif effective_quant == QUANT_INT2:
+                k_packed, k_scale, k_zero = self._quantize_int2(k_seq)
+                v_packed, v_scale, v_zero = self._quantize_int2(v_seq)
+                cl = _CompressedLayer(
+                    k_data=k_packed, v_data=v_packed,
+                    k_scale=k_scale, v_scale=v_scale,
+                    k_zero=k_zero, v_zero=v_zero,
+                )
+                total_bytes += (k_packed.nbytes + v_packed.nbytes
+                                + k_scale.nbytes + v_scale.nbytes
+                                + k_zero.nbytes + v_zero.nbytes)
+            else:
+                cl = _CompressedLayer(k_data=k_seq.contiguous().clone(),
+                                       v_data=v_seq.contiguous().clone())
+                total_bytes += k_seq.nbytes + v_seq.nbytes
+            compressed_layers.append(cl)
+
+        entry = _PoolEntry(
+            layers=compressed_layers,
+            n_tokens=n_tokens,
+            n_blocks=n_blocks,
+            block_shape=block_shape,
+            orig_dtype=effective_dtype,
+            quant_mode=effective_quant,
+            size_bytes=total_bytes,
+        )
+
+        with self._lock:
+            if key in self._cache:
+                self._used_bytes -= self._cache[key].size_bytes
+                del self._cache[key]
+
+            while (self._used_bytes + total_bytes > self._max_bytes
+                   and self._cache):
+                _, evicted = self._cache.popitem(last=False)
+                self._used_bytes -= evicted.size_bytes
+
+            if self._used_bytes + total_bytes > self._max_bytes:
+                logger.warning(
+                    "[VRAM_POOL] insert_from_raw: entry too large "
+                    "%.1f GB > %.1f GB",
+                    total_bytes / (1024 ** 3),
+                    (self._max_bytes - self._used_bytes) / (1024 ** 3),
+                )
+                return False
+
+            self._cache[key] = entry
+            self._used_bytes += total_bytes
+
+        elapsed_ms = (time.monotonic() - t0) * 1000.0
+        logger.info(
+            "[VRAM_POOL] insert_from_raw key=%s: %d layers, %.1f MB in %.0f ms",
+            key[:32], n_layers, total_bytes / (1024 * 1024), elapsed_ms,
+        )
+        return True
+
     def contains(self, key: str) -> bool:
         with self._lock:
             return key in self._cache

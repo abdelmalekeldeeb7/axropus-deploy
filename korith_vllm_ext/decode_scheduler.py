@@ -169,12 +169,51 @@ class KorithDecodeScheduler(Scheduler):
             except Exception as _amf_exc:
                 logger.warning("KorithDecodeScheduler: AMF hook init failed: %s", _amf_exc)
 
+        # ── LMCache fallback tier (optional, G3-G5 below AMF's G1) ────────────
+        #
+        # Axropus AMF is the G1 compressed VRAM pool. LMCache can be plugged
+        # in below as a CPU / NVMe / remote tier. This keeps customers on
+        # their existing LMCache deployment and adds AMF as a hot tier above.
+        #
+        # Env vars:
+        #   AXROPUS_LMCACHE_FALLBACK          = false     # master switch
+        #   LMCACHE_CONFIG_PATH               = unset     # LMCache YAML path
+        #   AXROPUS_PROMOTE_LMCACHE_HITS      = true      # G3 hit -> G1 promote
+        #   AXROPUS_LMCACHE_WRITE_THROUGH     = true      # cold prefill -> G3
+        #   AXROPUS_LMCACHE_LOOKUP_TIMEOUT_MS = 200       # G3 timeout budget
+        self._lmcache_enabled = _env_truthy(
+            "AXROPUS_LMCACHE_FALLBACK", default=False
+        )
+        self._lmcache_config_path = str(
+            os.environ.get("LMCACHE_CONFIG_PATH", "")
+        ).strip() or None
+        self._lmcache_promote_on_hit = _env_truthy(
+            "AXROPUS_PROMOTE_LMCACHE_HITS", default=True
+        )
+        self._lmcache_write_through = _env_truthy(
+            "AXROPUS_LMCACHE_WRITE_THROUGH", default=True
+        )
+        self._lmcache_lookup_timeout_ms = max(
+            10,
+            int(os.environ.get("AXROPUS_LMCACHE_LOOKUP_TIMEOUT_MS", "200") or 200),
+        )
+        if self._lmcache_enabled:
+            logger.info(
+                "KorithDecodeScheduler: LMCache fallback enabled "
+                "(cfg=%s promote=%s write_through=%s timeout_ms=%d)",
+                self._lmcache_config_path or "<env>",
+                self._lmcache_promote_on_hit,
+                self._lmcache_write_through,
+                self._lmcache_lookup_timeout_ms,
+            )
+
         logger.info(
-            "KorithDecodeScheduler enabled decode_first=%s adaptive_budget=%s base_tokens=%d full_budget_on_hit=%s",
+            "KorithDecodeScheduler enabled decode_first=%s adaptive_budget=%s base_tokens=%d full_budget_on_hit=%s lmcache=%s",
             self._korith_decode_first,
             self._korith_adaptive_budget,
             self._korith_base_max_num_scheduled_tokens,
             self._korith_decode_full_budget_on_hit,
+            self._lmcache_enabled,
         )
 
     @staticmethod
