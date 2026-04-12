@@ -1,9 +1,9 @@
 /*
- * int4_decode_attention.cu — INT4 decode attention kernel.
+ * int4_decode_attention.cu — Scalar INT4 decode attention kernel.
  *
- * Replaces the older Triton version referenced in the design doc. On
- * Hopper it produces FP8 tiles from INT4 storage and feeds them into
- * WGMMA tensor cores; on Ampere it promotes to FP16 and uses mma.m16n8k16.
+ * Unpacks INT4 from uint8, dequantizes via per-block scale, computes
+ * attention in FP32. 4x bandwidth reduction vs FP16.
+ * TODO: Rewrite with __byte_perm + WGMMA for Hopper, mma.m16n8k16 for Ampere.
  *
  * Storage layout (matches INT4PerBlockCodec):
  *
@@ -76,6 +76,7 @@ __global__ void int4_decode_attention_kernel(
     for (int i = 0; i < kHeadDim; ++i) out_acc[i] = 0.0f;
 
     __shared__ float scores_tile[kBlockLen];
+    __shared__ float old_max;
 
     const int n_blocks = (num_kv_tokens + kBlockLen - 1) / kBlockLen;
     for (int blk = 0; blk < n_blocks; ++blk) {
@@ -86,12 +87,10 @@ __global__ void int4_decode_attention_kernel(
         const float k_scale = __half2float(K_scales[scale_off + blk]);
         const float v_scale = __half2float(V_scales[scale_off + blk]);
 
-        // Score each KV token in the block.
+        // Step 1: Score each KV token in the block.
         for (int t = lane; t < tile_len; t += kThreads) {
             const int token = token_start + t;
             float acc = 0.0f;
-            // Walk the packed bytes: two dims per byte.
-            // K layout is [T, D] packed along D (last axis). Two int4 per byte.
             const int k_byte_off = kv_off / 2 + token * (kHeadDim / 2);
             #pragma unroll
             for (int d2 = 0; d2 < kHeadDim / 2; ++d2) {
@@ -112,8 +111,9 @@ __global__ void int4_decode_attention_kernel(
         }
         __syncthreads();
 
-        // Update running max/denom (thread 0).
+        // Step 2: Save old max, then update running max/denom (thread 0).
         if (lane == 0) {
+            old_max = smem_max;
             float local_max = smem_max;
             for (int t = 0; t < tile_len; ++t) {
                 local_max = fmaxf(local_max, scores_tile[t]);
@@ -130,20 +130,41 @@ __global__ void int4_decode_attention_kernel(
         }
         __syncthreads();
 
-        // Accumulate probs · V.
-        for (int t = 0; t < tile_len; ++t) {
+        // Step 3: RESCALE previous accumulator by exp(old_max - new_max).
+        // Without this, out_acc from earlier tiles carries weights computed
+        // under the old max, producing incorrect attention output for any
+        // sequence longer than one tile (128 tokens).
+        float rescale_factor = __expf(old_max - smem_max);
+        #pragma unroll
+        for (int i = 0; i < kHeadDim; ++i) {
+            out_acc[i] *= rescale_factor;
+        }
+
+        // Step 4: Accumulate probs · V. Threads cooperate over tokens
+        // and reduce into shared memory.
+        __shared__ float v_accum[kHeadDim];
+        for (int d = lane; d < kHeadDim; d += kThreads) {
+            v_accum[d] = 0.0f;
+        }
+        __syncthreads();
+
+        for (int t = lane; t < tile_len; t += kThreads) {
             const float p = scores_tile[t];
             const int v_byte_off = kv_off / 2 + (token_start + t) * (kHeadDim / 2);
-            #pragma unroll
-            for (int d2 = lane; d2 < kHeadDim / 2; d2 += kThreads) {
+            for (int d2 = 0; d2 < kHeadDim / 2; ++d2) {
                 const uint8_t byte = V_packed[v_byte_off + d2];
                 int lo, hi;
                 unpack_int4(byte, lo, hi);
                 const float v0 = static_cast<float>(lo) * v_scale;
                 const float v1 = static_cast<float>(hi) * v_scale;
-                out_acc[2 * d2]     += p * v0;
-                out_acc[2 * d2 + 1] += p * v1;
+                atomicAdd(&v_accum[2 * d2], p * v0);
+                atomicAdd(&v_accum[2 * d2 + 1], p * v1);
             }
+        }
+        __syncthreads();
+
+        for (int d = lane; d < kHeadDim; d += kThreads) {
+            out_acc[d] += v_accum[d];
         }
         __syncthreads();
     }

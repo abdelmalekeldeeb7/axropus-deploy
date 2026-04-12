@@ -90,3 +90,44 @@ def test_fallback_handles_mask():
     out = fallback_fp16_kernel(q, k, v, mask=mask)
     assert out.shape == (B, H, 1, D)
     assert torch.isfinite(out).all()
+
+
+def test_fallback_multi_tile_correctness():
+    """Regression test for the online softmax rescale bug.
+
+    Sequences longer than one tile (128 tokens in the CUDA kernels) need
+    the output accumulator rescaled when the running softmax max changes
+    across tiles. This test uses 512 tokens (4 tiles worth) and verifies
+    the fallback matches torch SDPA. The CUDA kernels use the same algorithm.
+    """
+    torch.manual_seed(42)
+    B, H, D = 2, 4, 128
+    for T in [256, 512, 1024]:
+        q = torch.randn(B, H, 1, D).half()
+        k = torch.randn(B, H, T, D).half()
+        v = torch.randn(B, H, T, D).half()
+        ref = F.scaled_dot_product_attention(q, k, v)
+        out = fallback_fp16_kernel(q, k, v)
+        err = (out.float() - ref.float()).norm().item() / ref.float().norm().item()
+        assert err < 1e-2, f"T={T}: rel_err={err:.6f}"
+
+
+def test_fallback_online_softmax_rescale_is_numerically_stable():
+    """Ensure attention with extreme score ranges across tiles is stable.
+
+    We construct K so that early tiles have very high scores and late
+    tiles have very low scores. Without proper accumulator rescaling,
+    the early-tile contribution dominates incorrectly.
+    """
+    torch.manual_seed(7)
+    B, H, D = 1, 1, 128
+    T = 512
+    q = torch.randn(B, H, 1, D).half()
+    k = torch.randn(B, H, T, D).half()
+    v = torch.randn(B, H, T, D).half()
+    # Make the first 128 tokens much more aligned with q than the rest.
+    k[:, :, :128, :] = q.expand_as(k[:, :, :128, :]) + 0.01 * torch.randn_like(k[:, :, :128, :])
+    ref = F.scaled_dot_product_attention(q, k, v)
+    out = fallback_fp16_kernel(q, k, v)
+    err = (out.float() - ref.float()).norm().item() / ref.float().norm().item()
+    assert err < 1e-2, f"rel_err={err:.6f}"

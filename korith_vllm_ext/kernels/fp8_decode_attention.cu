@@ -1,13 +1,15 @@
 /*
- * fp8_decode_attention.cu — Hopper FP8 E4M3 decode attention kernel.
+ * fp8_decode_attention.cu — Scalar FP8 decode attention kernel.
  *
- * Targets SM90 (H100, H200). Reads FP8-stored KV blocks from the AMF
- * compressed pool, computes attention against an FP16 query, and writes
- * the output back in FP16. All math is done on native WGMMA FP8 tensor
- * cores with FP32 accumulation for numerical stability.
+ * Reads FP8 E4M3 KV from the AMF compressed pool, computes attention in
+ * FP32, writes FP16 output. One CTA per (batch, head). Uses online softmax
+ * with correct accumulator rescaling across tiles.
  *
- * Kernel contract (matches amf_vllm_hook.inject_blocks and the
- * Python-side fallback_fp16_kernel):
+ * NOT tensor-core-accelerated — this is a bandwidth-reduction kernel that
+ * wins via 2x fewer HBM bytes read, not via MMA throughput.
+ * TODO: WGMMA + TMA rewrite for full Hopper utilisation (requires H200).
+ *
+ * Kernel contract:
  *
  *   Inputs:
  *     Q               [B, H, 1, D]     half
@@ -19,20 +21,9 @@
  *   Output:
  *     O               [B, H, 1, D]     half
  *
- * The kernel assumes one query token per sequence (decode step). Prefill
- * should use a separate batched kernel; we don't ship one because prefill
- * is the *cold* path for AMF — on hits we skip prefill entirely.
- *
  * Build note: This file is compiled by ``torch.utils.cpp_extension.load``
  * via dispatch.py::try_load_cuda_extension. When CUDA is unavailable the
  * kernel is never built and the pure-Python fallback is used instead.
- *
- * Optimisations applied (see §2.2):
- *   1. cp.async.bulk tensor memory loads for KV blocks (TMA).
- *   2. WGMMA m64n256k32 FP8 MMAs overlapping producer warps.
- *   3. Shared-memory double buffering with setmaxnreg for the consumer.
- *   4. Online softmax with FP32 accumulators to avoid renormalization passes.
- *   5. Split-K along the KV axis when T > 2048.
  */
 
 #ifdef __CUDACC__
@@ -133,13 +124,14 @@ __global__ void fp8_decode_attention_kernel(
     // Iterate over KV tiles.
     const int n_tiles = (num_kv_tokens + kKvTileLen - 1) / kKvTileLen;
     __shared__ float scores_tile[kKvTileLen];
+    __shared__ float old_max_smem;
 
     for (int tile = 0; tile < n_tiles; ++tile) {
         const int kv_start = tile * kKvTileLen;
         const int kv_end   = min(kv_start + kKvTileLen, num_kv_tokens);
         const int tile_len = kv_end - kv_start;
 
-        // Compute Q · K^T for this tile.
+        // Step 1: Compute Q · K^T for this tile.
         for (int t = lane; t < tile_len; t += blockDim.x) {
             const int token = kv_start + t;
             const int k_off = kv_base + token * HeadDim;
@@ -158,25 +150,43 @@ __global__ void fp8_decode_attention_kernel(
         }
         __syncthreads();
 
-        // Online softmax update (thread 0 runs the small state update).
+        // Step 2: Save old max, then compute new softmax stats (thread 0).
         if (lane == 0) {
+            old_max_smem = smem_state.m;
             online_softmax_update(smem_state, scores_tile, tile_len);
         }
         __syncthreads();
 
-        // Rescale previous output by exp(old_m - new_m). Computed inline.
-        // For simplicity we fold the rescaling into the next accumulation by
-        // re-reading smem_state.m.
+        // Step 3: RESCALE previous accumulator by exp(old_max - new_max).
+        // Without this, out_acc from earlier tiles carries weights computed
+        // under the old max, producing incorrect attention output for any
+        // sequence longer than one tile (128 tokens).
+        float rescale = expf_fast(old_max_smem - smem_state.m);
+        #pragma unroll
+        for (int d = 0; d < HeadDim; ++d) {
+            out_acc[d] *= rescale;
+        }
 
-        // Accumulate attn(probs) · V.
-        for (int t = 0; t < tile_len; ++t) {
+        // Step 4: Accumulate attn(probs) · V for this tile.
+        // Threads cooperate over tokens, reduce into shared memory.
+        __shared__ float v_accum[kHeadDimMax];
+        for (int d = lane; d < HeadDim; d += blockDim.x) {
+            v_accum[d] = 0.0f;
+        }
+        __syncthreads();
+
+        for (int t = lane; t < tile_len; t += blockDim.x) {
             const float p = scores_tile[t];
             const int v_off = kv_base + (kv_start + t) * HeadDim;
-            #pragma unroll
-            for (int d = lane; d < HeadDim; d += blockDim.x) {
+            for (int d = 0; d < HeadDim; ++d) {
                 const float v_val = static_cast<float>(V[v_off + d]) * v_scale;
-                out_acc[d] += p * v_val;
+                atomicAdd(&v_accum[d], p * v_val);
             }
+        }
+        __syncthreads();
+
+        for (int d = lane; d < HeadDim; d += blockDim.x) {
+            out_acc[d] += v_accum[d];
         }
         __syncthreads();
     }

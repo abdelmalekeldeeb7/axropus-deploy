@@ -44,11 +44,34 @@ import torch
 
 from .codecs import (
     FMT_FP16,
+    FMT_FP8_E4M3,
     Codec,
     CompressedKV,
     get_codec,
     list_codecs,
 )
+
+
+# ── Auto-detect compressed dtype ──────────────────────────────────────────────
+
+
+def _is_already_compressed(dtype: torch.dtype) -> bool:
+    """Return True if the dtype is already 1-byte (FP8, INT8, uint8).
+
+    When KV cache is already quantized by vLLM (e.g. FP8 models served
+    with ``kv_cache_dtype=fp8``), double-quantizing to INT4 destroys
+    quality. Store raw instead.
+    """
+    _fp8_types: set = set()
+    if hasattr(torch, "float8_e4m3fn"):
+        _fp8_types.add(torch.float8_e4m3fn)
+    if hasattr(torch, "float8_e5m2"):
+        _fp8_types.add(torch.float8_e5m2)
+    return (
+        dtype in _fp8_types
+        or dtype == torch.int8
+        or dtype == torch.uint8
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -239,30 +262,57 @@ class CompressedVRAMPool:
     ) -> bool:
         """Insert a raw FP16/BF16 KV tensor into the pool.
 
-        Expected ``raw_kv`` shape:
-            ``[num_layers, 2, num_tokens, num_heads, head_dim]``
-        (K on dim 1 index 0, V on index 1). If the caller passes a
-        different layout we try to detect it and fall back; shapes
-        outside of that family raise ``ValueError``.
+        Accepted shapes (layout inference):
+
+            * ``[L, 2, T, H, D]``       standard stacked layout
+            * ``[L, 2, nb, bs, H, D]``  LMCache block layout (nb * bs = T)
+            * ``[nb, bs, H, D]``         single-layer probe (duplicated to L layers)
 
         Returns True on success, False if eviction could not free
         enough blocks to accept this insertion.
         """
         fmt = format or self.default_format
-        codec = get_codec(fmt)
 
-        if raw_kv.dim() != 5 or raw_kv.shape[0] != self.num_layers or raw_kv.shape[1] != 2:
+        # Move to pool device if needed.
+        if raw_kv.device != self.device:
+            raw_kv = raw_kv.to(self.device)
+
+        # Auto-detect compressed dtype — don't double-quantize.
+        if _is_already_compressed(raw_kv.dtype):
+            fmt = FMT_FP8_E4M3  # store raw FP8 directly
+
+        # ── Layout inference (3 accepted shapes) ──
+        if raw_kv.dim() == 5 and raw_kv.shape[1] == 2:
+            # [L, 2, T, H, D] — standard stacked layout.
+            pass
+
+        elif raw_kv.dim() == 6 and raw_kv.shape[1] == 2:
+            # [L, 2, nb, bs, H, D] — LMCache block layout.
+            L, _, nb, bs, H, D = raw_kv.shape
+            raw_kv = raw_kv.reshape(L, 2, nb * bs, H, D)
+
+        elif raw_kv.dim() == 4:
+            # [nb, bs, H, D] — single-layer probe.
+            nb, bs, H, D = raw_kv.shape
+            single = raw_kv.reshape(1, nb * bs, H, D)
+            raw_kv = torch.stack([single, single], dim=1)  # [1, 2, T, H, D]
+
+        else:
             raise ValueError(
-                f"put_from_raw: expected shape [num_layers={self.num_layers}, 2, n_tokens, n_heads, head_dim], got {tuple(raw_kv.shape)}"
+                f"put_from_raw: unsupported shape {tuple(raw_kv.shape)}. "
+                f"Expected [L,2,T,H,D], [L,2,nb,bs,H,D], or [nb,bs,H,D]."
             )
 
+        codec = get_codec(fmt)
+
+        actual_layers = int(raw_kv.shape[0])
         num_tokens = int(raw_kv.shape[2])
         num_heads = int(raw_kv.shape[3])
         head_dim = int(raw_kv.shape[4])
 
         # Compress layer by layer. Each layer blob packs K and V together.
         compressed_layers: List[CompressedKV] = []
-        for layer_id in range(self.num_layers):
+        for layer_id in range(actual_layers):
             layer_kv = raw_kv[layer_id]  # [2, n_tokens, n_heads, head_dim]
             blob = codec.compress(layer_kv)
             compressed_layers.append(blob)
@@ -310,7 +360,7 @@ class CompressedVRAMPool:
 
             entry = PoolEntry(
                 prefix_hash=prefix_hash,
-                num_layers=self.num_layers,
+                num_layers=actual_layers,
                 num_tokens=num_tokens,
                 format=fmt,
                 blocks=blocks,
@@ -378,6 +428,184 @@ class CompressedVRAMPool:
     ) -> bool:
         """Alias for ``put_from_raw``; exists so callers can signal intent."""
         return self.put_from_raw(prefix_hash, raw_kv, format=format)
+
+    # ── vLLM-native save / restore (matches original amf_kv_manager) ──────
+
+    def put_from_vllm(
+        self,
+        prefix_hash: str,
+        gpu_cache: list,
+        block_table: List[int],
+        n_tokens: int,
+        *,
+        format: Optional[str] = None,
+        savings_ms: float = 0.0,
+    ) -> bool:
+        """Save KV directly from vLLM's live block table.
+
+        This is the hot path for cold-prefill-then-save. It gathers
+        blocks from vLLM's gpu_cache in chunks to avoid OOM, auto-detects
+        already-compressed dtypes, and feeds the gathered data through
+        the codec before inserting into the slab.
+
+        Args:
+            prefix_hash:   Content-addressed key.
+            gpu_cache:     vLLM gpu_cache — list of per-layer tensors.
+                           Stacked: ``[2, num_blocks, block_size, H, D]``
+                           or split: ``[num_blocks, block_size, H, D]``.
+            block_table:   Physical block IDs for this sequence.
+            n_tokens:      Number of prompt tokens to save.
+            format:        Codec format (default: ``self.default_format``).
+            savings_ms:    Estimated prefill time saved (for ROI tracking).
+
+        Returns True on success, False if insertion failed.
+        """
+        fmt = format or self.default_format
+        n_layers = len(gpu_cache)
+        if n_layers == 0:
+            return False
+
+        block_ids = torch.tensor(block_table, device=self.device, dtype=torch.long)
+        n_blocks = len(block_table)
+        CHUNK = 512
+
+        # Detect dtype of the first layer to auto-skip double-quantization.
+        layer0 = gpu_cache[0]
+        orig_dtype = layer0.dtype
+        if _is_already_compressed(orig_dtype):
+            fmt = FMT_FP8_E4M3  # store raw
+
+        codec = get_codec(fmt)
+        compressed_layers: List[CompressedKV] = []
+
+        for layer_cache in gpu_cache:
+            # Split K/V from stacked or single layout.
+            if layer_cache.dim() == 5 and layer_cache.shape[0] == 2:
+                k_all, v_all = layer_cache[0], layer_cache[1]
+            else:
+                k_all = v_all = layer_cache
+
+            # Chunked gather to avoid OOM on large contexts.
+            k_chunks: List[torch.Tensor] = []
+            v_chunks: List[torch.Tensor] = []
+            for start in range(0, n_blocks, CHUNK):
+                end = min(start + CHUNK, n_blocks)
+                chunk_ids = block_ids[start:end]
+                k_chunks.append(k_all[chunk_ids])
+                v_chunks.append(v_all[chunk_ids])
+                if self.device.type == "cuda":
+                    torch.cuda.current_stream().synchronize()
+
+            k_seq = torch.cat(k_chunks) if len(k_chunks) > 1 else k_chunks[0]
+            v_seq = torch.cat(v_chunks) if len(v_chunks) > 1 else v_chunks[0]
+            del k_chunks, v_chunks
+
+            # Stack K,V into [2, n_blocks, block_size, heads, dim].
+            layer_kv = torch.stack([k_seq, v_seq], dim=0)
+            del k_seq, v_seq
+
+            blob = codec.compress(layer_kv)
+            compressed_layers.append(blob)
+
+        total_bytes = sum(blob.nbytes() for blob in compressed_layers)
+
+        with self._lock:
+            if prefix_hash in self._index:
+                self._release_entry(self._index.pop(prefix_hash))
+
+            allocation = self._allocate(compressed_layers)
+            if allocation is None:
+                return False
+
+            self._write_slabs(allocation, compressed_layers)
+
+            blocks: List[CompressedBlock] = []
+            for layer_id, (block_id, data_off, scale_off) in enumerate(allocation):
+                blob = compressed_layers[layer_id]
+                # Infer head count / dim from the blob shape.
+                num_heads = blob.shape[-2] if len(blob.shape) > 2 else 1
+                head_dim = blob.shape[-1] if len(blob.shape) > 1 else 1
+                blocks.append(
+                    CompressedBlock(
+                        layer_id=layer_id,
+                        block_id=block_id,
+                        format=fmt,
+                        num_tokens=n_tokens,
+                        num_heads=num_heads,
+                        head_dim=head_dim,
+                        data_offset=data_off,
+                        data_bytes=blob.data.numel() * blob.data.element_size(),
+                        scale_offset=scale_off,
+                        scale_bytes=blob.scales.numel() * blob.scales.element_size() if blob.scales is not None else 0,
+                        tensor_scale=blob.tensor_scale,
+                        meta=blob.meta,
+                    )
+                )
+
+            entry = PoolEntry(
+                prefix_hash=prefix_hash,
+                num_layers=n_layers,
+                num_tokens=n_tokens,
+                format=fmt,
+                blocks=blocks,
+                blobs=compressed_layers,
+                created_ns=time.monotonic_ns(),
+                last_hit_ns=time.monotonic_ns(),
+                hit_count=0,
+                avg_savings_ms=savings_ms,
+            )
+            self._index[prefix_hash] = entry
+            self._stat_inserts += 1
+            self._stat_bytes_stored += total_bytes
+            return True
+
+    def restore_to_vllm(
+        self,
+        prefix_hash: str,
+        gpu_cache: list,
+        block_table: List[int],
+    ) -> int:
+        """Decompress and scatter KV from pool back into vLLM's block table.
+
+        Returns the number of tokens restored, or 0 on miss.
+        """
+        entry = self.get(prefix_hash)
+        if entry is None:
+            return 0
+
+        block_ids = torch.tensor(block_table, device=self.device, dtype=torch.long)
+        CHUNK = 512
+
+        for layer_idx, blob in enumerate(entry.blobs):
+            if layer_idx >= len(gpu_cache):
+                break
+            layer_cache = gpu_cache[layer_idx]
+            codec = get_codec(blob.format)
+            layer_kv = codec.decompress_to(blob, target_dtype=layer_cache.dtype)
+
+            # layer_kv is [2, ...] from stacked compress. Split into K, V.
+            if layer_kv.dim() >= 2 and layer_kv.shape[0] == 2:
+                k_src = layer_kv[0]
+                v_src = layer_kv[1]
+            else:
+                k_src = v_src = layer_kv
+
+            # Determine target K, V views.
+            if layer_cache.dim() == 5 and layer_cache.shape[0] == 2:
+                k_all, v_all = layer_cache[0], layer_cache[1]
+            else:
+                k_all = v_all = layer_cache
+
+            n_blocks = min(len(block_table), k_src.shape[0])
+
+            # Chunked scatter to avoid OOM.
+            for start in range(0, n_blocks, CHUNK):
+                end = min(start + CHUNK, n_blocks)
+                chunk_ids = block_ids[start:end]
+                k_all[chunk_ids] = k_src[start:end].to(k_all.dtype)
+                v_all[chunk_ids] = v_src[start:end].to(v_all.dtype)
+
+        return entry.num_tokens
 
     # ── Eviction policy ────────────────────────────────────────────────────
 
@@ -531,11 +759,64 @@ class CompressedVRAMPool:
     def _release_entry(self, entry: PoolEntry) -> None:
         """Free every slab block an entry holds."""
         for block in entry.blocks:
-            needed = 1
-            # Recover the block span from the underlying blob size.
             total_bytes = block.data_bytes + block.scale_bytes
             needed = max(1, math.ceil(total_bytes / self.block_bytes))
             self._free_span(block.layer_id, block.block_id, needed)
+
+    # ── Slab compaction ───────────────────────────────────────────────────
+
+    def _allocate_with_compaction(
+        self,
+        blobs: List[CompressedKV],
+    ) -> Optional[List[Tuple[int, int, int]]]:
+        """Allocate blocks, with compaction as a last resort.
+
+        If normal allocation (including eviction) fails due to
+        fragmentation, compact all live entries to the front of each slab
+        and retry.
+        """
+        allocation = self._allocate(blobs)
+        if allocation is not None:
+            return allocation
+
+        logger.info("CompressedVRAMPool: compacting slabs to defragment")
+        self._compact_slabs()
+        return self._allocate(blobs)
+
+    def _compact_slabs(self) -> None:
+        """Move all live entries to the front of each slab, defragmenting.
+
+        After compaction every free block is contiguous at the tail of
+        each layer slab, eliminating fragmentation.
+        """
+        for layer_id in range(self.num_layers):
+            live_blocks: List[CompressedBlock] = []
+            for entry in self._index.values():
+                for block in entry.blocks:
+                    if block.layer_id == layer_id:
+                        live_blocks.append(block)
+
+            live_blocks.sort(key=lambda b: b.block_id)
+            next_free = 0
+            for block in live_blocks:
+                total_bytes = block.data_bytes + block.scale_bytes
+                needed = max(1, math.ceil(total_bytes / self.block_bytes))
+                if block.block_id != next_free:
+                    old_off = block.block_id * self.block_bytes
+                    new_off = next_free * self.block_bytes
+                    span_bytes = needed * self.block_bytes
+                    slab = self._slabs[layer_id]
+                    slab[new_off:new_off + span_bytes].copy_(
+                        slab[old_off:old_off + span_bytes]
+                    )
+                    block.block_id = next_free
+                    block.data_offset = new_off
+                    block.scale_offset = new_off + block.data_bytes
+                next_free += needed
+
+            self._free_lists[layer_id] = list(
+                range(next_free, self._blocks_per_layer)
+            )
 
     # ── vLLM block-table mapping ───────────────────────────────────────────
 

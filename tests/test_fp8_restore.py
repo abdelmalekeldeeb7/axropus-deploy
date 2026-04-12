@@ -19,6 +19,7 @@ next decode step.
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from korith_vllm_ext.codecs import (
@@ -32,20 +33,21 @@ from korith_vllm_ext.compressed_vram_pool import CompressedVRAMPool
 
 
 def _mock_vllm_model():
-    """Build a fake model whose attention modules resemble vLLM's layout."""
+    """Build a fake model whose attention modules resemble vLLM's layout.
 
-    class Attention:
-        __class__ = type("Attention", (), {})
+    Uses attribute-based detection: the module has ``_k_scale`` so
+    ``apply_fp8_scales`` will find it regardless of class name.
+    """
 
-    attn = Attention()
+    class SomeAttention:
+        pass
+
+    attn = SomeAttention()
     attn._k_scale = 999.0
     attn._v_scale = 999.0
     attn._q_scale = 999.0
     attn._prob_scale = 999.0
     attn.calculate_kv_scales = True
-
-    # Make isinstance check work via class name
-    Attention.__name__ = "Attention"
 
     class Model:
         def __init__(self, attn):
@@ -142,3 +144,54 @@ def test_bug_reproducer_without_fix_shows_drift():
     # drifted path should be noticeably worse. The exact gap depends on
     # the FP8 quantization noise, but the ratio must be > 1.1.
     assert correct_err <= drifted_err + 1e-6
+
+
+def test_apply_scales_attribute_based():
+    """Verify scale application works regardless of module class name."""
+
+    class WeirdNameAttention(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self._k_scale = torch.tensor(1.0)
+            self._v_scale = torch.tensor(1.0)
+            self.calculate_kv_scales = True
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attn = WeirdNameAttention()
+
+    model = Model()
+    sidecar = FP8ScaleSidecar(k_scale=0.5, v_scale=0.25)
+    apply_fp8_scales(model, sidecar)
+
+    assert float(model.attn._k_scale) == pytest.approx(0.5)
+    assert float(model.attn._v_scale) == pytest.approx(0.25)
+    assert model.attn.calculate_kv_scales is False
+
+
+def test_apply_scales_tensor_fill_inplace():
+    """Verify tensor attributes are mutated in-place via fill_(), not setattr."""
+
+    class TensorScaleAttention(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self._k_scale = torch.nn.Parameter(torch.tensor(1.0))
+            self._v_scale = torch.nn.Parameter(torch.tensor(1.0))
+            self.enable_kv_scales_calculation = True
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attn = TensorScaleAttention()
+
+    model = Model()
+    original_param = model.attn._k_scale
+    sidecar = FP8ScaleSidecar(k_scale=0.123, v_scale=0.456)
+    apply_fp8_scales(model, sidecar)
+
+    # The same tensor object should be mutated in-place.
+    assert model.attn._k_scale is original_param
+    assert float(model.attn._k_scale) == pytest.approx(0.123)
+    assert float(model.attn._v_scale) == pytest.approx(0.456)
+    assert model.attn.enable_kv_scales_calculation is False

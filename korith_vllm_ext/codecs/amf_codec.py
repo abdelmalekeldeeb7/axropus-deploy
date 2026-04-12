@@ -99,56 +99,73 @@ def apply_fp8_scales(model: Any, sidecar: FP8ScaleSidecar) -> None:
 
     This is the critical half of the scale-drift fix. Call this from the
     restore path *before* the next decode step runs. The function walks
-    the model's attention modules and (a) overrides k_scale/v_scale and
-    (b) flips ``calculate_kv_scales`` to False so vLLM does not clobber
-    the values we just set.
+    the model's modules, detects attention layers by *attribute presence*
+    (not class name), sets the stored scales, and forces scale
+    recomputation off.
+
+    Attribute-based detection works across all vLLM versions/forks:
+
+        - vLLM 0.6.x: ``PagedAttention``, ``FlashAttentionImpl``
+        - vLLM 0.7.x: ``Attention``, ``FlashAttentionBackend``
+        - Forks: ``XFormersAttention``, ``FlashInferAttention``
+
+    Tensor attributes (``nn.Parameter`` / buffer) are mutated in-place
+    via ``fill_()`` instead of ``setattr``, which avoids shadowing a
+    registered buffer with a plain Python float.
     """
     visited = 0
-    attn_mods: list = []
-
-    # Try vLLM attention module path first.
     try:
         for module in model.modules():
-            name = type(module).__name__
-            if name in ("Attention", "MultiHeadAttention", "FlashAttention"):
-                attn_mods.append(module)
-    except AttributeError:
-        attn_mods = []
+            # Detect attention modules by attribute presence, not class name.
+            has_scale_attr = any(
+                hasattr(module, a)
+                for a in ("_k_scale", "k_scale", "_kv_scale")
+            )
+            if not has_scale_attr:
+                continue
 
-    for attn in attn_mods:
-        for attr, val in (
-            ("_k_scale", sidecar.k_scale),
-            ("_v_scale", sidecar.v_scale),
-            ("_q_scale", sidecar.q_scale),
-            ("_prob_scale", sidecar.prob_scale),
-            ("k_scale", sidecar.k_scale),
-            ("v_scale", sidecar.v_scale),
-            ("q_scale", sidecar.q_scale),
-            ("prob_scale", sidecar.prob_scale),
-        ):
-            if hasattr(attn, attr):
-                try:
-                    setattr(attn, attr, val)
-                    visited += 1
-                except (AttributeError, TypeError):
-                    pass
-        # Force scale recomputation off for the warm path.
-        for flag in ("calculate_kv_scales", "_calculate_kv_scales"):
-            if hasattr(attn, flag):
-                try:
-                    setattr(attn, flag, False)
-                except (AttributeError, TypeError):
-                    pass
+            for attr, val in (
+                ("_k_scale", sidecar.k_scale),
+                ("_v_scale", sidecar.v_scale),
+                ("_q_scale", sidecar.q_scale),
+                ("_prob_scale", sidecar.prob_scale),
+                ("k_scale", sidecar.k_scale),
+                ("v_scale", sidecar.v_scale),
+                ("q_scale", sidecar.q_scale),
+                ("prob_scale", sidecar.prob_scale),
+                ("_k_scale_float", sidecar.k_scale),
+                ("_v_scale_float", sidecar.v_scale),
+            ):
+                if hasattr(module, attr):
+                    try:
+                        old_val = getattr(module, attr)
+                        if isinstance(old_val, torch.Tensor):
+                            # Use .data.fill_() to avoid autograd errors on
+                            # leaf Parameters with requires_grad=True.
+                            old_val.data.fill_(val)
+                        else:
+                            setattr(module, attr, val)
+                        visited += 1
+                    except (AttributeError, TypeError, RuntimeError):
+                        pass
 
-    if visited == 0:
-        logger.debug("apply_fp8_scales: no attention modules found on %r", model)
-    else:
-        logger.debug(
-            "apply_fp8_scales: wrote scales to %d attributes (k=%.4g v=%.4g)",
-            visited,
-            sidecar.k_scale,
-            sidecar.v_scale,
-        )
+            # Force scale recomputation OFF.
+            for flag in ("calculate_kv_scales", "_calculate_kv_scales",
+                         "enable_kv_scales_calculation"):
+                if hasattr(module, flag):
+                    try:
+                        setattr(module, flag, False)
+                    except (AttributeError, TypeError):
+                        pass
+    except Exception as exc:
+        logger.warning("apply_fp8_scales: model traversal failed: %s", exc)
+
+    logger.debug(
+        "apply_fp8_scales: set %d attributes (k=%.4g v=%.4g)",
+        visited,
+        sidecar.k_scale,
+        sidecar.v_scale,
+    )
 
 
 # ── FP8 E4M3 codec ────────────────────────────────────────────────────────────
