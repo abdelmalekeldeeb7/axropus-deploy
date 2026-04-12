@@ -1,0 +1,36 @@
+# Standard benchmark profile for `axropus bench`.
+#
+# This file configures the sweep the CLI runs via
+# ``axropus bench --config benchmarks/standard.yaml``. The individual
+# benchmark modules read their own environment variables; this file is
+# here as the canonical description of the workload AMF is tuned for.
+
+name: axropus_standard
+
+workload:
+  n_requests:       500
+  shared_prefixes:  10
+  tokens_per_prefix: 2048
+  suffix_len:       64
+  seed:             7
+
+pool:
+  num_layers:      80
+  bytes_per_layer: 1073741824   # 1 GB
+  default_format:  int4_sym_block
+
+codecs:
+  - fp8_e4m3
+  - int4_sym
+  - int4_sym_block
+  - nvfp4
+  - turboquant
+
+kernels:
+  head_dim: 128
+  num_heads: 8
+  sequence_lengths:
+    - 1024
+    - 4096
+    - 16384
+    - 65536
