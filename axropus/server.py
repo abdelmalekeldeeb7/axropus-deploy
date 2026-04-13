@@ -107,7 +107,7 @@ def _try_build_vllm(cfg: AxropusConfig):
     """
     try:
         from vllm import LLM, SamplingParams  # type: ignore
-        engine = LLM(model=cfg.model, tensor_parallel_size=1)
+        engine = LLM(model=cfg.model, tensor_parallel_size=1, gpu_memory_utilization=0.80, max_model_len=4096)
         logger.info("vLLM engine created for model %s", cfg.model)
         return engine
     except Exception as exc:
