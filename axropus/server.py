@@ -223,7 +223,7 @@ def _handle_chat(state: ServerState, body: Dict[str, Any]) -> Dict[str, Any]:
     # Store-after-prefill simulation. In production this hook is called by
     # vLLM's worker with the actual KV tensor; we don't have one here so we
     # emit a synthetic small tensor for stub mode.
-    if state.vllm_engine is None and decision.action.value == "cold_prefill":
+    if decision.action.value == "cold_prefill":
         try:
             import torch
 
