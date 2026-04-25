@@ -1,0 +1,75 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "axropus"
+version = "0.1.0"
+description = "Axropus AMF — compressed multi-prefix KV cache for vLLM"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+authors = [
+    { name = "Axropus" },
+]
+keywords = ["vllm", "kv-cache", "llm", "inference", "fp8", "int4", "nvfp4"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.1",
+    "numpy",
+]
+
+[project.optional-dependencies]
+server = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "prometheus_client>=0.20",
+    "PyYAML>=6",
+]
+lmcache = [
+    "lmcache>=0.2",
+]
+bench = [
+    "tabulate>=0.9",
+]
+dev = [
+    "pytest>=7",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.4",
+    "mypy>=1.8",
+]
+
+[project.scripts]
+axropus = "axropus.cli:main"
+
+[project.urls]
+Homepage   = "https://axropus.ai"
+Repository = "https://github.com/abdelmalekeldeeb7/axropus-deploy"
+
+[tool.setuptools]
+packages = [
+    "axropus",
+    "korith_vllm_ext",
+    "korith_vllm_ext.codecs",
+    "korith_vllm_ext.kernels",
+]
+include-package-data = true
+
+[tool.setuptools.package-data]
+"korith_vllm_ext.kernels" = ["*.cu", "*.cpp", "*.h"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]

@@ -1,0 +1,187 @@
+{
+  "annotations": { "list": [] },
+  "description": "Axropus AMF — compressed multi-prefix KV cache dashboard",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "id": 1,
+      "title": "Cost saved per hour (USD)",
+      "type": "stat",
+      "gridPos": { "x": 0, "y": 0, "w": 8, "h": 4 },
+      "targets": [
+        {
+          "expr": "rate(axropus_compute_cost_saved_usd[1h]) * 3600",
+          "legendFormat": "USD/hour"
+        }
+      ],
+      "options": {
+        "reduceOptions": { "values": false, "calcs": ["lastNotNull"], "fields": "" },
+        "colorMode": "value",
+        "graphMode": "area"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 0.01 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 2,
+      "title": "Cache hit rate by tier",
+      "type": "timeseries",
+      "gridPos": { "x": 8, "y": 0, "w": 16, "h": 8 },
+      "targets": [
+        {
+          "expr": "sum by (tier) (rate(axropus_cache_hits_total[5m]))",
+          "legendFormat": "{{tier}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps" }
+      }
+    },
+    {
+      "id": 3,
+      "title": "Pool residency (prefixes)",
+      "type": "stat",
+      "gridPos": { "x": 0, "y": 4, "w": 8, "h": 4 },
+      "targets": [
+        {
+          "expr": "axropus_pool_prefixes_resident",
+          "legendFormat": "prefixes"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Pool bytes used",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 8, "w": 12, "h": 6 },
+      "targets": [
+        {
+          "expr": "axropus_pool_bytes_used",
+          "legendFormat": "bytes"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "bytes" }
+      }
+    },
+    {
+      "id": 5,
+      "title": "Pool evictions (rate)",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 8, "w": 12, "h": 6 },
+      "targets": [
+        {
+          "expr": "rate(axropus_pool_evictions_total[5m])",
+          "legendFormat": "evictions/s"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Cache lookup latency p50/p95/p99 by tier",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 14, "w": 24, "h": 8 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (tier, le) (rate(axropus_cache_latency_ms_bucket[5m])))",
+          "legendFormat": "{{tier}} p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (tier, le) (rate(axropus_cache_latency_ms_bucket[5m])))",
+          "legendFormat": "{{tier}} p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (tier, le) (rate(axropus_cache_latency_ms_bucket[5m])))",
+          "legendFormat": "{{tier}} p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "ms" }
+      }
+    },
+    {
+      "id": 7,
+      "title": "Miss reasons",
+      "type": "bargauge",
+      "gridPos": { "x": 0, "y": 22, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "sum by (reason) (rate(axropus_miss_reason_total[5m]))",
+          "legendFormat": "{{reason}}"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Compression ratio by codec",
+      "type": "bargauge",
+      "gridPos": { "x": 12, "y": 22, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "axropus_compression_ratio",
+          "legendFormat": "{{codec}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "percentunit" }
+      }
+    },
+    {
+      "id": 9,
+      "title": "Kernel latency p95 (microseconds)",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 30, "w": 24, "h": 6 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (kernel, le) (rate(axropus_kernel_latency_us_bucket[5m])))",
+          "legendFormat": "{{kernel}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "µs" }
+      }
+    },
+    {
+      "id": 10,
+      "title": "Tokens saved (cumulative)",
+      "type": "stat",
+      "gridPos": { "x": 0, "y": 36, "w": 8, "h": 4 },
+      "targets": [
+        {
+          "expr": "axropus_tokens_saved_total",
+          "legendFormat": "tokens"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short" }
+      }
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["axropus", "amf", "kv-cache"],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "",
+  "title": "Axropus AMF",
+  "uid": "axropus-amf",
+  "version": 1,
+  "weekStart": ""
+}
