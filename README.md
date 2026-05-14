@@ -62,9 +62,7 @@ AMF is a categorical change: *"a shared prefix's KV state is a materialized arti
 
 | Workload | Approach | Per-request wall-clock | Speedup |
 |---|---|---:|---:|
-| 32-token output | Cold baseline | ~60,000 ms | 1.0× |
-| 32-token output | AMF (INT4 VRAM pool) | ~360 ms | **166×** |
-| 256-token output | Cold baseline | ~60,000 ms | 1.0× |
+| 32-token output | Cold baseline | ~60,000 ms | 1.0× | INT8| 256-token output | Cold baseline | ~60,000 ms | 1.0× |
 | 256-token output | vLLM `--enable-prefix-caching` | ~54,000 ms | 1.1× |
 | 256-token output | AMF (FP8 VRAM pool, scale fix applied) | ~441 ms | **136×** |
 
