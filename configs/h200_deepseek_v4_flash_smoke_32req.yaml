@@ -35,7 +35,8 @@ runtime:
   max_model_len: 24576
   gpu_memory_utilization: 0.88
   enforce_eager: true
-  kv_cache_dtype: auto
+  # DeepSeek V4 currently requires fp8 KV cache in vLLM.
+  kv_cache_dtype: fp8
   gpu_dollars_per_hour: 3.0
 
 cache:
