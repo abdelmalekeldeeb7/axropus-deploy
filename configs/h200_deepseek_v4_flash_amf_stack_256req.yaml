@@ -1,0 +1,101 @@
+# H200 DeepSeek V4 Flash production-realistic AMF stack benchmark.
+#
+# Same hardware, same synthetic traffic, four arms:
+#   1. vLLM APC only
+#   2. vLLM + LMCache only
+#   3. vLLM + AMF only
+#   4. vLLM + AMF + LMCache fallback
+#
+# This config is intentionally a fair same-total-GPU-memory comparison:
+#   APC:          24 GB vLLM KV
+#   LMCache:       8 GB vLLM KV + 64 GB CPU backend
+#   AMF:           8 GB vLLM KV + 16 GB AMF raw VRAM tier
+#   AMF+LMCache:   8 GB vLLM KV + 16 GB AMF raw VRAM tier + 64 GB CPU fallback
+#
+# All traffic is synthetic.  Do not cite without the per-regime breakdown.
+
+model: /home/jovyan/models/DeepSeek-V4-Flash
+requests: 256
+seed: 20260602
+output_dir: benchmark_results/h200_deepseek_v4_flash_amf_stack_256req
+
+traffic:
+  reusable_prefixes: 64
+  unique_fraction: 0.20
+  zipf_alpha: 1.15
+  hot_rank_cutoff: 8
+  suffix_tokens: 64
+  prefix_length_mix:
+    - name: short
+      weight: 0.20
+      min_tokens: 4096
+      max_tokens: 8192
+    - name: medium
+      weight: 0.60
+      min_tokens: 16384
+      max_tokens: 32768
+    - name: long
+      weight: 0.20
+      min_tokens: 49152
+      max_tokens: 65536
+
+runtime:
+  max_tokens: 1
+  temperature: 0.0
+  max_model_len: 65536
+  gpu_memory_utilization: 0.90
+  enforce_eager: true
+  kv_cache_dtype: auto
+  gpu_dollars_per_hour: 3.0
+
+cache:
+  budget_fractions: [1.0]
+  kv_bytes_per_token: null
+  min_kv_cache_memory_mb: 8192
+  arm_kv_cache_memory_mb:
+    apc: 24576
+    lmcache: 8192
+    amf: 8192
+    amf_lmcache: 8192
+
+lmcache:
+  local_cpu_gb: 64
+  chunk_size: 256
+  save_unfull_chunk: true
+  discard_partial_chunks: false
+  skip_last_n_tokens: 0
+  role: kv_both
+
+amf:
+  path_root: /tmp/korith-h200-deepseek-v4-flash-amf-stack
+  vram_cache_gb: 16
+  compressed_pool_gb: 0
+  compressed_quant: int4
+  sync_save: true
+  save_unique_prefixes: true
+
+correctness:
+  sample_fraction: 0.10
+  max_checks: 16
+  fail_on_mismatch: true
+
+disruptions:
+  restart:
+    enabled: true
+    interval_requests: 64
+    recovery_window_requests: 12
+  eviction_to_zero:
+    enabled: true
+    interval_requests: 32
+    recovery_window_requests: 8
+    flood_multiplier: 1.5
+  cold_routing:
+    enabled: true
+    fleet_size: 8
+    recovery_window_requests: 1
+
+verify:
+  enabled: true
+  speedup_threshold: 1.3
+  max_recomputed_fraction: 0.10
+  fail_on_verify_fail: true

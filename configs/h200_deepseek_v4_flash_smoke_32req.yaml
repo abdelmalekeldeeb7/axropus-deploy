@@ -1,0 +1,94 @@
+# H200 DeepSeek V4 Flash smoke test.
+#
+# Purpose: validate that the downloaded DeepSeek model, vLLM, LMCache, and AMF
+# can all run together before spending time on the larger proof benchmark.
+# All traffic is synthetic.
+
+model: /home/jovyan/models/DeepSeek-V4-Flash
+requests: 32
+seed: 20260602
+output_dir: benchmark_results/h200_deepseek_v4_flash_smoke_32req
+
+traffic:
+  reusable_prefixes: 8
+  unique_fraction: 0.20
+  zipf_alpha: 1.15
+  hot_rank_cutoff: 3
+  suffix_tokens: 48
+  prefix_length_mix:
+    - name: short
+      weight: 0.25
+      min_tokens: 2048
+      max_tokens: 4096
+    - name: medium
+      weight: 0.60
+      min_tokens: 8192
+      max_tokens: 12288
+    - name: long
+      weight: 0.15
+      min_tokens: 16384
+      max_tokens: 20480
+
+runtime:
+  max_tokens: 1
+  temperature: 0.0
+  max_model_len: 24576
+  gpu_memory_utilization: 0.88
+  enforce_eager: true
+  kv_cache_dtype: auto
+  gpu_dollars_per_hour: 3.0
+
+cache:
+  budget_fractions: [1.0]
+  kv_bytes_per_token: null
+  min_kv_cache_memory_mb: 4096
+  # Same-total-GPU-memory smoke:
+  # APC/LMCache get 12 GB vLLM KV.
+  # AMF gets 4 GB vLLM KV + 8 GB AMF raw VRAM tier.
+  arm_kv_cache_memory_mb:
+    apc: 12288
+    lmcache: 4096
+    amf: 4096
+    amf_lmcache: 4096
+
+lmcache:
+  local_cpu_gb: 32
+  chunk_size: 256
+  save_unfull_chunk: true
+  discard_partial_chunks: false
+  skip_last_n_tokens: 0
+  role: kv_both
+
+amf:
+  path_root: /tmp/korith-h200-deepseek-v4-flash-smoke-amf
+  vram_cache_gb: 8
+  compressed_pool_gb: 0
+  compressed_quant: int4
+  sync_save: true
+  save_unique_prefixes: true
+
+correctness:
+  sample_fraction: 0.10
+  max_checks: 3
+  fail_on_mismatch: true
+
+disruptions:
+  restart:
+    enabled: true
+    interval_requests: 16
+    recovery_window_requests: 4
+  eviction_to_zero:
+    enabled: true
+    interval_requests: 12
+    recovery_window_requests: 3
+    flood_multiplier: 1.25
+  cold_routing:
+    enabled: true
+    fleet_size: 8
+    recovery_window_requests: 1
+
+verify:
+  enabled: true
+  speedup_threshold: 1.3
+  max_recomputed_fraction: 0.10
+  fail_on_verify_fail: true
