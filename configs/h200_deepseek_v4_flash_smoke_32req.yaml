@@ -34,6 +34,8 @@ runtime:
   temperature: 0.0
   max_model_len: 24576
   gpu_memory_utilization: 0.88
+  # Single-H200 DeepSeek V4 Flash is tight; offload reserves GPU room for KV/AMF.
+  cpu_offload_gb: 24
   enforce_eager: true
   # DeepSeek V4 currently requires fp8 KV cache in vLLM.
   kv_cache_dtype: fp8
@@ -44,13 +46,13 @@ cache:
   kv_bytes_per_token: null
   min_kv_cache_memory_mb: 4096
   # Same-total-GPU-memory smoke:
-  # APC/LMCache get 12 GB vLLM KV.
-  # AMF gets 4 GB vLLM KV + 8 GB AMF raw VRAM tier.
+  # APC/LMCache get 8 GB vLLM KV.
+  # AMF gets 2 GB vLLM KV + 6 GB AMF raw VRAM tier.
   arm_kv_cache_memory_mb:
-    apc: 12288
-    lmcache: 4096
-    amf: 4096
-    amf_lmcache: 4096
+    apc: 8192
+    lmcache: 2048
+    amf: 2048
+    amf_lmcache: 2048
 
 lmcache:
   local_cpu_gb: 32
@@ -62,7 +64,7 @@ lmcache:
 
 amf:
   path_root: /tmp/korith-h200-deepseek-v4-flash-smoke-amf
-  vram_cache_gb: 8
+  vram_cache_gb: 6
   compressed_pool_gb: 0
   compressed_quant: int4
   sync_save: true

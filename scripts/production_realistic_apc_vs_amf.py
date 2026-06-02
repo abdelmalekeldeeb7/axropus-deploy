@@ -479,6 +479,8 @@ def _new_llm(cfg: dict[str, Any], kv_cache_memory_mb: int, with_amf: bool) -> LL
         "max_model_len": int(runtime.get("max_model_len", 131072)),
         "kv_cache_dtype": runtime.get("kv_cache_dtype", "auto"),
     }
+    if float(runtime.get("cpu_offload_gb", 0) or 0) > 0:
+        kwargs["cpu_offload_gb"] = float(runtime.get("cpu_offload_gb", 0))
     if with_amf:
         kwargs["worker_extension_cls"] = "korith_vllm_ext.amf_worker_ext.AmfWorkerExtension"
     return LLM(**kwargs)
@@ -519,6 +521,8 @@ def _new_lmcache_llm(
             },
         ),
     }
+    if float(runtime.get("cpu_offload_gb", 0) or 0) > 0:
+        kwargs["cpu_offload_gb"] = float(runtime.get("cpu_offload_gb", 0))
     if with_amf:
         kwargs["worker_extension_cls"] = "korith_vllm_ext.amf_worker_ext.AmfWorkerExtension"
     return LLM(**kwargs)
