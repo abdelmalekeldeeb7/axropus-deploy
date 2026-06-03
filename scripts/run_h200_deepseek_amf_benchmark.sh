@@ -22,8 +22,11 @@ case "$MODE" in
   proof)
     CONFIG="configs/h200_deepseek_v4_flash_amf_stack_256req.yaml"
     ;;
+  qwen27)
+    CONFIG="configs/h200_qwen36_27b_amf_smoke_64req.yaml"
+    ;;
   *)
-    echo "usage: $0 [smoke|proof] [all|apc|lmcache|amf|amf_lmcache]" >&2
+    echo "usage: $0 [smoke|proof|qwen27] [all|apc|lmcache|amf|amf_lmcache]" >&2
     exit 2
     ;;
 esac
