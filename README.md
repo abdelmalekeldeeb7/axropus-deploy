@@ -248,6 +248,32 @@ benchmark_results/lmcache_reliability_1plus4cpu_1k/
 benchmark_results/amf_reliability_fp8_1k/
 ```
 
+## Running AMF As A vLLM Stack
+
+For serving, use the packaged stack config and launcher:
+
+```bash
+cp configs/amf_stack.env.example configs/amf_stack.env
+./scripts/verify_amf_stack.sh configs/amf_stack.env
+./scripts/start_vllm_amf_stack.sh configs/amf_stack.env
+```
+
+The quickstart is in `docs/amf_stack_quickstart.md`.
+
+The launcher starts an OpenAI-compatible vLLM server with:
+
+- vLLM prefix caching enabled
+- AMF worker extension enabled
+- Korith scheduler enabled
+- AMF hot VRAM tier configured from `configs/amf_stack.env`
+- optional LMCache transfer config when `AXROPUS_ENABLE_LMCACHE=1`
+
+Before claiming AMF+LMCache on a new machine, run:
+
+```bash
+RUN_AMF_LMCACHE_SMOKE=1 ./scripts/verify_amf_stack.sh configs/amf_stack.env
+```
+
 ## H200 Larger-Model Path
 
 The repo also includes H200-oriented configs and a runner:

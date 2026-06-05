@@ -30,6 +30,7 @@ Environment variables (matching korith_dynamic):
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import sys
@@ -392,27 +393,10 @@ def run_benchmark(args: argparse.Namespace) -> None:
 
 def run_server(args: argparse.Namespace) -> None:
     """Launch an OpenAI-compatible vLLM server with AMF hooks."""
-    try:
-        import uvicorn  # type: ignore[import]
-        from vllm.entrypoints.openai.api_server import app  # type: ignore[import]
-    except ImportError as exc:
-        print(f"[ERROR] missing dependency: {exc}", file=sys.stderr)
-        sys.exit(1)
-
     model_path = args.model or os.environ.get("KORITH_MODEL", "")
     if not model_path:
         print("[ERROR] --model or KORITH_MODEL required", file=sys.stderr)
         sys.exit(1)
-
-    # Add /amf/stats monitoring endpoint.
-    try:
-        from fastapi.responses import JSONResponse  # type: ignore[import]
-
-        @app.get("/amf/stats")  # type: ignore[attr-defined]
-        async def amf_stats() -> JSONResponse:
-            return JSONResponse({"status": "ok", "backend": "vllm", "amf": True})
-    except Exception:
-        pass
 
     host = args.host or "0.0.0.0"
     port = args.port or 8000
@@ -423,19 +407,53 @@ def run_server(args: argparse.Namespace) -> None:
         flush=True,
     )
 
-    sys.argv = [
-        "vllm.entrypoints.openai.api_server",
-        "--model", model_path,
+    cmd = [
+        "vllm",
+        "serve",
+        model_path,
         "--host", host,
         "--port", str(port),
         "--trust-remote-code",
+        "--enable-prefix-caching",
+        "--worker-extension-cls",
+        "korith_vllm_ext.amf_worker_ext.AmfWorkerExtension",
+        "--scheduler-cls",
+        "korith_vllm_ext.decode_scheduler.KorithDecodeScheduler",
     ]
+    if args.enforce_eager:
+        cmd.append("--enforce-eager")
+    if args.kv_cache_dtype:
+        cmd.extend(["--kv-cache-dtype", args.kv_cache_dtype])
+    if args.max_model_len:
+        cmd.extend(["--max-model-len", str(args.max_model_len)])
+    if args.gpu_memory_utilization:
+        cmd.extend(["--gpu-memory-utilization", str(args.gpu_memory_utilization)])
+    if args.kv_cache_memory_gb:
+        kv_bytes = int(float(args.kv_cache_memory_gb) * (1024 ** 3))
+        cmd.extend(["--kv-cache-memory-bytes", str(kv_bytes)])
+    if args.tensor_parallel_size:
+        cmd.extend(["--tensor-parallel-size", str(args.tensor_parallel_size)])
+    if args.max_num_seqs:
+        cmd.extend(["--max-num-seqs", str(args.max_num_seqs)])
+    if args.cpu_offload_gb:
+        cmd.extend(["--cpu-offload-gb", str(args.cpu_offload_gb)])
 
-    try:
-        from vllm.entrypoints.openai.api_server import main as vllm_main  # type: ignore[import]
-        vllm_main()
-    except ImportError:
-        uvicorn.run(app, host=host, port=port)
+    if _env_truthy("AXROPUS_ENABLE_LMCACHE", default=False):
+        lmcache_cfg = {
+            "kv_connector": os.environ.get("AXROPUS_LMCACHE_CONNECTOR", "LMCacheConnectorV1"),
+            "kv_role": os.environ.get("AXROPUS_LMCACHE_ROLE", "kv_both"),
+            "kv_connector_extra_config": {
+                "discard_partial_chunks": _env_truthy(
+                    "AXROPUS_LMCACHE_DISCARD_PARTIAL_CHUNKS", default=False
+                ),
+                "skip_last_n_tokens": int(
+                    os.environ.get("AXROPUS_LMCACHE_SKIP_LAST_N_TOKENS", "0") or 0
+                ),
+            },
+        }
+        cmd.extend(["--kv-transfer-config", json.dumps(lmcache_cfg)])
+
+    os.execvp(cmd[0], cmd)
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -450,6 +468,12 @@ def main() -> None:
     parser.add_argument("--max-tokens", type=int, default=32,    help="Max output tokens")
     parser.add_argument("--enforce-eager", action="store_true",  help="Disable CUDAGraphs/compile")
     parser.add_argument("--kv-cache-dtype", type=str, default="auto", help="KV cache dtype (auto/fp8)")
+    parser.add_argument("--max-model-len", type=int, default=0, help="vLLM max model length")
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.0, help="vLLM GPU memory utilization")
+    parser.add_argument("--kv-cache-memory-gb", type=float, default=0.0, help="Fixed vLLM KV cache memory in GB")
+    parser.add_argument("--tensor-parallel-size", type=int, default=0, help="vLLM tensor parallel size")
+    parser.add_argument("--max-num-seqs", type=int, default=0, help="vLLM max concurrent sequences")
+    parser.add_argument("--cpu-offload-gb", type=float, default=0.0, help="vLLM CPU offload in GB")
     parser.add_argument("--serve",      action="store_true",     help="Run in server mode")
     parser.add_argument("--host",       type=str, default="0.0.0.0", help="Server host")
     parser.add_argument("--port",       type=int, default=8000,  help="Server port")
