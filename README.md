@@ -1,11 +1,11 @@
 # Axropus AMF
 
 Axropus AMF is a persistent KV materialization layer for vLLM. It captures
-prefilled KV state, keeps it in a controlled AMF tier, then restores and
-registers it back into vLLM so repeated long-context requests can skip prefill.
+prefilled KV state, keeps it in an AMF tier, then restores and registers it back
+into vLLM so repeated long-context requests can skip prefill.
 
-The project is focused on agentic and long-context inference workloads where the
-same expensive context appears repeatedly:
+AMF is built for agentic and long-context inference workloads where expensive
+context repeats:
 
 - system prompts
 - tool definitions
@@ -14,12 +14,158 @@ same expensive context appears repeatedly:
 - workflow state
 - long agent traces
 
-AMF is not a replacement for vLLM Automatic Prefix Caching or LMCache. It is a
-hot recovery/materialization layer that can sit beside them.
+AMF is not a replacement for vLLM APC or LMCache. It is a hot
+restore/materialization layer that can sit beside them.
 
-## Core Idea
+## Quick Start: AMF With vLLM
 
-vLLM APC reuses prefix KV while the matching blocks are still alive inside the
+Before running vLLM, your NVIDIA driver must work:
+
+```bash
+nvidia-smi
+
+python3 - <<'PY'
+import torch
+print("cuda available", torch.cuda.is_available())
+if torch.cuda.is_available():
+    print(torch.cuda.get_device_name(0))
+PY
+```
+
+From the repo root:
+
+```bash
+cd /path/to/axropus-deploy
+export PYTHONPATH="$PWD"
+
+export KORITH_ENABLE_AMF=1
+export KORITH_AMF_PATH=/tmp/axropus-amf
+
+export KORITH_AMF_VRAM_FIRST=1
+export KORITH_AMF_SYNC_SAVE=1
+export KORITH_AMF_MIN_TOKENS=64
+export KORITH_TENANT_ID=__shared__
+
+export KORITH_VRAM_CACHE_DEVICE=cuda:0
+```
+
+Choose one AMF memory mode.
+
+Raw VRAM AMF, fastest restore:
+
+```bash
+export KORITH_VRAM_CACHE_GB=8
+export KORITH_VRAM_POOL_GB=0
+```
+
+Compressed FP8 AMF pool, better memory efficiency:
+
+```bash
+export KORITH_VRAM_CACHE_GB=0
+export KORITH_VRAM_POOL_GB=8
+export KORITH_VRAM_POOL_QUANT=fp8
+```
+
+Compressed INT4 AMF pool:
+
+```bash
+export KORITH_VRAM_CACHE_GB=0
+export KORITH_VRAM_POOL_GB=8
+export KORITH_VRAM_POOL_QUANT=int4
+```
+
+Start vLLM with AMF:
+
+```bash
+vllm serve /path/to/model \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --trust-remote-code \
+  --enable-prefix-caching \
+  --worker-extension-cls korith_vllm_ext.amf_worker_ext.AmfWorkerExtension \
+  --scheduler-cls korith_vllm_ext.decode_scheduler.KorithDecodeScheduler \
+  --gpu-memory-utilization 0.85 \
+  --max-model-len 8192 \
+  --kv-cache-dtype auto
+```
+
+Test:
+
+```bash
+curl http://127.0.0.1:8000/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "/path/to/model",
+    "prompt": "System: cache test. User: say ok",
+    "max_tokens": 8,
+    "temperature": 0
+  }'
+```
+
+## AMF + LMCache
+
+LMCache can be used as a lower CPU/NVMe/remote tier while AMF remains the hot
+GPU restore tier.
+
+```bash
+export PYTHONPATH="$PWD"
+
+export KORITH_ENABLE_AMF=1
+export KORITH_AMF_PATH=/tmp/axropus-amf
+export KORITH_AMF_VRAM_FIRST=1
+export KORITH_AMF_SYNC_SAVE=1
+export KORITH_VRAM_CACHE_DEVICE=cuda:0
+export KORITH_VRAM_CACHE_GB=0
+export KORITH_VRAM_POOL_GB=8
+export KORITH_VRAM_POOL_QUANT=fp8
+
+export LMCACHE_TRACK_USAGE=false
+export LMCACHE_LOCAL_CPU=true
+export LMCACHE_MAX_LOCAL_CPU_SIZE=32
+export LMCACHE_CHUNK_SIZE=256
+export LMCACHE_SAVE_UNFULL_CHUNK=true
+
+export AXROPUS_LMCACHE_FALLBACK=1
+export AXROPUS_PROMOTE_LMCACHE_HITS=1
+export AXROPUS_LMCACHE_WRITE_THROUGH=1
+export AXROPUS_LMCACHE_LOOKUP_TIMEOUT_MS=200
+```
+
+```bash
+vllm serve /path/to/model \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --trust-remote-code \
+  --enable-prefix-caching \
+  --worker-extension-cls korith_vllm_ext.amf_worker_ext.AmfWorkerExtension \
+  --scheduler-cls korith_vllm_ext.decode_scheduler.KorithDecodeScheduler \
+  --gpu-memory-utilization 0.85 \
+  --max-model-len 8192 \
+  --kv-cache-dtype auto \
+  --kv-transfer-config '{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_both","kv_connector_extra_config":{"discard_partial_chunks":false,"skip_last_n_tokens":0}}'
+```
+
+## Operational Wrapper
+
+If you prefer config files instead of raw commands:
+
+```bash
+cp configs/amf_stack.env.example configs/amf_stack.env
+./scripts/verify_amf_stack.sh configs/amf_stack.env
+./scripts/start_vllm_amf_stack.sh configs/amf_stack.env
+```
+
+Before claiming AMF+LMCache works on a new machine:
+
+```bash
+RUN_AMF_LMCACHE_SMOKE=1 ./scripts/verify_amf_stack.sh configs/amf_stack.env
+```
+
+Detailed guide: `docs/amf_stack_quickstart.md`.
+
+## How AMF Works
+
+vLLM APC reuses prefix KV while matching blocks are still alive inside the
 engine. That is fast, but fragile under eviction, restarts, multi-tenant
 rotation, and routing to a worker that never saw the prefix.
 
@@ -33,15 +179,11 @@ AMF separates reusable KV state from vLLM's live block lifetime:
 5. AMF registers the restored blocks as valid prefix cache state.
 6. vLLM decodes without recomputing the prefix.
 
-In short:
-
 ```text
 cold prefill once -> materialize KV -> restore/register -> skip future prefill
 ```
 
 ## Stack Position
-
-AMF is designed as a tier in a larger KV cache stack:
 
 ```text
 G1: AMF hot GPU tier              raw or compressed VRAM materialization
@@ -51,49 +193,44 @@ G4: LMCache NVMe / disk tier      optional fallback
 G5: LMCache remote tier           optional fallback
 ```
 
-The intended lookup flow is:
+Lookup flow:
 
 ```text
 1. vLLM APC live hit      -> use APC
 2. AMF hot hit           -> restore/register into vLLM
-3. LMCache hit           -> retrieve, promote into AMF, then future hits are hot
+3. LMCache hit           -> retrieve, promote into AMF, future hits are hot
 4. miss everywhere       -> cold prefill
 ```
 
-## Implemented Components
-
-Important files:
+## Important Files
 
 - `korith_vllm_ext/amf_worker_ext.py`  
-  vLLM worker extension exposing `amf_save_kv` and `amf_restore_kv` through
-  `llm.collective_rpc(...)`.
+  vLLM worker extension exposing `amf_save_kv` and `amf_restore_kv`.
 
 - `korith_vllm_ext/amf_kv_manager.py`  
   Direct save/restore of vLLM KV blocks, AMF keying, VRAM snapshot cache,
   disk persistence, and restore into physical KV blocks.
 
-- `korith_vllm_ext/amf_scheduler_hook.py`  
-  Scheduler-level prefill skip hook for AMF-aware vLLM paths.
+- `korith_vllm_ext/decode_scheduler.py`  
+  vLLM scheduler extension with AMF hook support.
 
 - `korith_vllm_ext/lmcache_adapter.py`  
-  Optional import-guarded LMCache adapter. AMF runs without LMCache installed.
+  Optional import-guarded LMCache adapter.
 
 - `korith_vllm_ext/tiered_router.py`  
-  AMF + LMCache tier router. LMCache misses fall back cold; LMCache hits can be
-  promoted into AMF.
+  AMF + LMCache tier router.
 
 - `scripts/production_realistic_apc_vs_amf.py`  
-  Re-runnable synthetic benchmark comparing APC, LMCache, AMF, and AMF+LMCache
-  under steady state and cache disruption events.
+  Synthetic benchmark comparing APC, LMCache, AMF, and AMF+LMCache.
 
 ## Benchmark: 1K Reliability Run
 
-These are saved local results under `benchmark_results/*_1k/`.
+Saved results are under `benchmark_results/*_1k/`.
 
 This was a synthetic 1,000-request stream, not a 1,000-concurrent throughput
-run. The harness calls `llm.generate([prompt])` one request at a time. It is
-intended to measure cache coverage, disruption recovery, latency, and GPU-second
-proxy cost.
+run. The harness calls `llm.generate([prompt])` one request at a time. It
+measures cache coverage, disruption recovery, latency, and GPU-second proxy
+cost.
 
 Configuration:
 
@@ -162,7 +299,7 @@ LMCache: 406.26
 AMF:     260.00
 ```
 
-On this run AMF used:
+On this synthetic run AMF used:
 
 ```text
 2.80x fewer GPU-seconds than APC
@@ -177,42 +314,20 @@ Mismatches: 0
 Correctness pass: true
 ```
 
-All data above is synthetic and should be treated as benchmark evidence, not a
-claim about every production workload.
-
 ## Why AMF Wins In Disruptions
 
 APC is tied to live vLLM block state. If a reset, eviction flood, or cold worker
 routing event removes those blocks, APC must prefill again.
 
-AMF keeps a separate materialized KV state. In the disruption benchmark, the
-vLLM/APC state is reset, while AMF's materialized tier is preserved. AMF then
-restores the KV blocks and registers them back into vLLM. That is why AMF can
-retain high full-hit coverage after reset-like events.
+AMF keeps separate materialized KV state. In the disruption benchmark, vLLM/APC
+state is reset while AMF's materialized tier is preserved. AMF restores the KV
+blocks and registers them back into vLLM.
 
 Important limitation: raw VRAM AMF state survives vLLM cache reset inside a live
 process. If the whole process dies, raw VRAM state dies too. For process-level
 survival, use AMF disk/NVMe persistence or an LMCache lower tier.
 
-## AMF And LMCache
-
-AMF and LMCache are complementary:
-
-- LMCache is strong as a lower-tier KV storage and movement layer across CPU,
-  NVMe, and remote storage.
-- AMF is the hot GPU materialization and vLLM rehydration layer.
-- CacheBlend-style work increases what text patterns are reusable.
-- AMF focuses on making known KV state executable again inside vLLM quickly.
-
-The combined stack is:
-
-```text
-CacheBlend / LMCache expands reusable KV coverage
-LMCache stores and moves KV across workers or lower tiers
-AMF restores/registers hot KV into vLLM for fast prefill elimination
-```
-
-## Reproducing Local 1K Results
+## Reproduce The 1K Runs
 
 APC:
 
@@ -240,43 +355,9 @@ python3 scripts/production_realistic_apc_vs_amf.py \
   --only-arm amf
 ```
 
-Outputs are written to:
-
-```text
-benchmark_results/apc_reliability_4gb_1k/
-benchmark_results/lmcache_reliability_1plus4cpu_1k/
-benchmark_results/amf_reliability_fp8_1k/
-```
-
-## Running AMF As A vLLM Stack
-
-For serving, use the packaged stack config and launcher:
-
-```bash
-cp configs/amf_stack.env.example configs/amf_stack.env
-./scripts/verify_amf_stack.sh configs/amf_stack.env
-./scripts/start_vllm_amf_stack.sh configs/amf_stack.env
-```
-
-The quickstart is in `docs/amf_stack_quickstart.md`.
-
-The launcher starts an OpenAI-compatible vLLM server with:
-
-- vLLM prefix caching enabled
-- AMF worker extension enabled
-- Korith scheduler enabled
-- AMF hot VRAM tier configured from `configs/amf_stack.env`
-- optional LMCache transfer config when `AXROPUS_ENABLE_LMCACHE=1`
-
-Before claiming AMF+LMCache on a new machine, run:
-
-```bash
-RUN_AMF_LMCACHE_SMOKE=1 ./scripts/verify_amf_stack.sh configs/amf_stack.env
-```
-
 ## H200 Larger-Model Path
 
-The repo also includes H200-oriented configs and a runner:
+H200-oriented configs:
 
 ```text
 configs/h200_qwen36_27b_amf_smoke_64req.yaml
@@ -295,44 +376,13 @@ export PYTHONPATH="$PWD"
 ./scripts/run_h200_deepseek_amf_benchmark.sh qwen27 all
 ```
 
-Run individual arms if model reload time is high:
+Individual arms:
 
 ```bash
 ./scripts/run_h200_deepseek_amf_benchmark.sh qwen27 apc
 ./scripts/run_h200_deepseek_amf_benchmark.sh qwen27 lmcache
 ./scripts/run_h200_deepseek_amf_benchmark.sh qwen27 amf
 ./scripts/run_h200_deepseek_amf_benchmark.sh qwen27 amf_lmcache
-```
-
-## Key Environment Variables
-
-AMF:
-
-```bash
-export KORITH_ENABLE_AMF=1
-export KORITH_AMF_PATH=/tmp/korith-amf
-export KORITH_AMF_VRAM_FIRST=1
-export KORITH_AMF_SYNC_SAVE=1
-export KORITH_VRAM_CACHE_GB=0
-export KORITH_VRAM_CACHE_DEVICE=cuda:0
-export KORITH_VRAM_POOL_GB=3
-export KORITH_VRAM_POOL_QUANT=fp8
-```
-
-LMCache:
-
-```bash
-export LMCACHE_LOCAL_CPU=true
-export LMCACHE_MAX_LOCAL_CPU_SIZE=4
-export LMCACHE_CHUNK_SIZE=256
-```
-
-AMF + LMCache fallback:
-
-```bash
-export AXROPUS_LMCACHE_FALLBACK=true
-export AXROPUS_PROMOTE_LMCACHE_HITS=true
-export AXROPUS_LMCACHE_WRITE_THROUGH=true
 ```
 
 ## Status
@@ -342,6 +392,6 @@ working locally and on H200-oriented configs, but the code should still be
 treated as experimental until tested under your exact model, vLLM version,
 traffic pattern, and failure model.
 
-The benchmark harness intentionally labels synthetic traffic as synthetic and
-includes correctness checks for AMF restored outputs. Fast-but-wrong restore is
-treated as a failed benchmark.
+The benchmark harness labels synthetic traffic as synthetic and includes
+correctness checks for AMF restored outputs. Fast-but-wrong restore is treated
+as a failed benchmark.
